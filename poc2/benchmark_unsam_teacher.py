@@ -3,6 +3,7 @@ import os
 import sys
 import time
 from pathlib import Path
+import torch
 
 import numpy as np
 from PIL import Image
@@ -10,7 +11,7 @@ from PIL import Image
 
 # --- BENCH CONFIG ---
 SCENE_DIR = "scene0000_00"
-DEVICE = "cuda:1"
+DEVICE = "cuda:0"
 GRANULARITY = float(os.environ.get("BENCH_GRANULARITY", "0.8"))
 FRAME_SKIP = int(os.environ.get("BENCH_FRAME_SKIP", "10"))
 NUM_BENCH_FRAMES = int(os.environ.get("BENCH_NUM_FRAMES", "50"))
@@ -34,15 +35,16 @@ MODEL_CFG = os.environ.get("UNSAMV2_CFG", "configs/unsamv2_small.yaml")
 if str(SAM2_PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(SAM2_PYTHON_ROOT))
 
-from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator  # noqa: E402
-from sam2.build_sam import build_sam2  # noqa: E402
+from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+from sam2.build_sam import build_sam2
 
 
-def build_generator(model):
+def _build_mask_generator(model):
+    # Matches the project's whole-image notebook settings.
     return SAM2AutomaticMaskGenerator(
         model=model,
-        points_per_side=64,
-        points_per_batch=128,
+        points_per_side=32,
+        points_per_batch=256,
         mask_threshold=-1,
         pred_iou_thresh=0.77,
         stability_score_thresh=0.9,
@@ -55,6 +57,23 @@ def build_generator(model):
         output_mode="binary_mask",
     )
 
+def _build_relaxed_mask_generator(model):
+    # Fallback for difficult frames where strict filtering returns empty output.
+    return SAM2AutomaticMaskGenerator(
+        model=model,
+        points_per_side=32,
+        points_per_batch=256,
+        mask_threshold=-1,
+        pred_iou_thresh=0.0,
+        stability_score_thresh=0.0,
+        stability_score_offset=0.7,
+        crop_n_layers=0,
+        box_nms_thresh=0.7,
+        crop_n_points_downscale_factor=1,
+        min_mask_region_area=0,
+        use_m2m=True,
+        output_mode="binary_mask",
+    )
 
 def fmt_duration(seconds: float) -> str:
     s = int(round(seconds))
@@ -90,7 +109,8 @@ def main() -> None:
 
     print(f"Loading UnSAMv2 on {DEVICE}...")
     model = build_sam2(MODEL_CFG, str(CHECKPOINT_PATH), device=DEVICE, apply_postprocessing=True)
-    generator = build_generator(model)
+    mask_generator = _build_mask_generator(model)
+    relaxed_mask_generator = _build_relaxed_mask_generator(model)
 
     print(
         f"Benchmarking {len(bench_frames)} frames "
@@ -105,7 +125,14 @@ def main() -> None:
         image = np.array(Image.open(img_path).convert("RGB"))
 
         t0 = time.perf_counter()
-        masks_data = generator.generate(image, gra=GRANULARITY)
+        # Ensure PyTorch is using the tensor cores properly and not calculating gradients
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            masks_data = mask_generator.generate(image, gra=GRANULARITY)
+            used_fallback = False
+
+            if len(masks_data) == 0:
+                masks_data = relaxed_mask_generator.generate(image, gra=GRANULARITY)
+                used_fallback = True
         dt = time.perf_counter() - t0
 
         # Use same painting rule as teacher to estimate effective mask count.
@@ -143,7 +170,7 @@ def main() -> None:
     total_scannet_frames = scene_sampled_frames * SCANNET_NUM_SCENES
     proj_seconds = total_scannet_frames * per_frame_mean
 
-    print("\n--- Benchmark Summary ---")
+    print("--- Benchmark Summary ---")
     print(f"Checkpoint: {CHECKPOINT_PATH}")
     print(f"Model cfg: {MODEL_CFG}")
     print(f"Scene frames total: {scene_total_frames}")
@@ -154,7 +181,7 @@ def main() -> None:
     print(f"sec/frame p95    : {per_frame_p95:.3f}")
     print(f"avg effective masks/frame: {float(np.mean(saved_masks)):.2f}")
 
-    print("\n--- ScanNet Projection ---")
+    print("--- ScanNet Projection ---")
     print(f"Assumed #scenes: {SCANNET_NUM_SCENES}")
     print(f"Total sampled frames: {total_scannet_frames}")
     print(f"Projected wall-clock (1 GPU): {fmt_duration(proj_seconds)}")
