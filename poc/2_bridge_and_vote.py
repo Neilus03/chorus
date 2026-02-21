@@ -5,7 +5,7 @@ import cv2
 
 # --- CHORUS PoC CONFIG ---
 SCENE_DIR = "scene0000_00"
-FRAME_SKIP = 10
+FRAME_SKIP = 50
 # The official ScanNet20 classes and their corresponding NYUv40 IDs
 SCANNET20_MAPPING = {
     "wall": 1, "floor": 2, "cabinet": 3, "bed": 4, "chair": 5,

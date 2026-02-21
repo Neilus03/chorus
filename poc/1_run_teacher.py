@@ -6,7 +6,7 @@ from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection, Sam
 
 # --- CHORUS PoC CONFIG ---
 SCENE_DIR = "scene0000_00"
-FRAME_SKIP = 10 # 5578 total frames -> ~111 frames to process
+FRAME_SKIP = 50 # 5578 total frames
 DEVICE = "cuda:0"
 OUTPUT_DIR = os.path.join(SCENE_DIR, "sam_masks")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
