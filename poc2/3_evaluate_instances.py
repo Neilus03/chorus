@@ -10,7 +10,7 @@ from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 # --- CONFIG ---
 SCENE_DIR = "scene0000_00"
 GRANULARITY = 0.8
-PRED_PATH = os.path.join(SCENE_DIR, f"naive_instance_labels_g{GRANULARITY}.npy")
+PRED_PATH = os.path.join(SCENE_DIR, f"chorus_instance_labels_g{GRANULARITY}.npy")
 
 
 def _load_instance_ids_from_ply(labels_ply: Path) -> np.ndarray | None:

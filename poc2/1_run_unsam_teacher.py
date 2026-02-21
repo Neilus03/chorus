@@ -8,10 +8,10 @@ from PIL import Image
 
 # --- CONFIG ---
 SCENE_DIR = "scene0000_00"
-FRAME_SKIP = 50
+FRAME_SKIP = 10
 DEVICE = "cuda:1"
-GRANULARITY = 0.5 # 0.8=whole objects, 0.2=parts
-DEBUG_FIRST_N_FRAMES = 5
+GRANULARITY = 0.8 # 0.8=whole objects, 0.2=parts
+DEBUG_FIRST_N_FRAMES = 10
 
 # UnSAMv2 local checkout root
 UNSAM_ROOT = Path(__file__).resolve().parent / "UnSAMv2"

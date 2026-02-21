@@ -16,7 +16,7 @@ except Exception:  # pragma: no cover
 
 # --- CONFIG ---
 SCENE_DIR = "scene0000_00"
-FRAME_SKIP = 10
+FRAME_SKIP = 50
 GRANULARITY = 0.8
 MASK_DIR = os.path.join(SCENE_DIR, f"unsam_masks_g{GRANULARITY}")
 SVD_COMPONENTS = 32
