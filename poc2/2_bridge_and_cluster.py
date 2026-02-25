@@ -16,7 +16,7 @@ except Exception:  # pragma: no cover
 
 # --- CONFIG ---
 SCENE_DIR = "scene0000_00"
-FRAME_SKIP = 50
+FRAME_SKIP = 10
 GRANULARITY = 0.8
 MASK_DIR = os.path.join(SCENE_DIR, f"unsam_masks_g{GRANULARITY}")
 SVD_COMPONENTS = 32
@@ -130,8 +130,8 @@ def main() -> None:
 
     print("Clustering points into 3D objects (HDBSCAN)...")
     clusterer = HDBSCAN(
-        min_cluster_size=100,            # Force it to look for furniture-sized objects, not tennis balls
-        min_samples=5,                   # KEEP THIS EXPLICITLY LOW to drop noise back to ~5-10%
+        min_cluster_size=100,
+        min_samples=5,
         cluster_selection_epsilon=0.1,
         )
     explicit_pseudo_labels = clusterer.fit_predict(point_features)
