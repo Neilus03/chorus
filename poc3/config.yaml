@@ -1,0 +1,38 @@
+project:
+  poc3_dirname: "poc3"
+
+storage:
+  scannet_root: "/scratch2/nedela/chorus_poc"
+  scans_subdir: "scans"
+  reports_subdir: "reports_poc3"
+  scene_list_default_from_dir: "/scratch2/nedela/scannet_processed/train"
+
+external:
+  scannet_downloader: "/scratch2/nedela/chorus_poc/tools/download-scannet.py"
+  litept_scannet_pair: "/home/nedela/projects/LitePT/datasets/preprocessing/scannet/scannet_pair"
+
+scripts:
+  chorus_teacher: "chorus_teacher.py"
+  chorus_project_cluster: "chorus_project_cluster.py"
+  chorus_oracle_eval: "chorus_oracle_eval.py"
+
+defaults:
+  granularities: ["0.2", "0.5", "0.8"]
+  frame_skip: 10
+  keep_full_modulo: 100
+  delete_intermediate: true
+  continue_on_error: true
+
+wandb:
+  enabled: true
+  project: "chorus-poc3"
+  entity: null
+  job_type: "streaming-scannet"
+  tags: ["poc3", "streaming", "scannet"]
+  mode: "online"         # online | offline | disabled
+  resume: "allow"        # allow | must | never | auto
+  save_code: true
+  log_artifacts: true
+  log_manifest_artifact_per_scene: true
+  log_report_artifact: true
+  notes: "PoC3 streaming pseudo-labeling pipeline"
