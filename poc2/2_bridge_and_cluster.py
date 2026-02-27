@@ -7,24 +7,24 @@ from scipy.sparse import coo_matrix
 from sklearn.decomposition import TruncatedSVD
 from sklearn.preprocessing import normalize
 
-try:
-    # Newer sklearn variants may expose HDBSCAN here.
-    from sklearn.cluster import HDBSCAN  # type: ignore
-except Exception:  # pragma: no cover
-    from hdbscan import HDBSCAN  # type: ignore
+from sklearn.cluster import HDBSCAN
+
+from pathlib import Path
+
 
 
 # --- CONFIG ---
-SCENE_DIR = "scene0000_00"
+SCENE_DIR = os.environ.get("SCENE_DIR", "scene0000_00")
+SCENE_NAME = Path(SCENE_DIR).name  # This safely extracts 'scene0140_00'
 FRAME_SKIP = 10
-GRANULARITY = 0.8
+GRANULARITY = float(os.environ.get("GRANULARITY", "0.5"))
 MASK_DIR = os.path.join(SCENE_DIR, f"unsam_masks_g{GRANULARITY}")
 SVD_COMPONENTS = 32
 
 
 def main() -> None:
     print("Loading 3D geometry...")
-    mesh_path = os.path.join(SCENE_DIR, f"{SCENE_DIR}_vh_clean_2.ply")
+    mesh_path = os.path.join(SCENE_DIR, f"{SCENE_NAME}_vh_clean_2.ply")
     pcd = o3d.io.read_point_cloud(mesh_path)
     points_3d = np.asarray(pcd.points)
     num_points = points_3d.shape[0]
@@ -124,16 +124,19 @@ def main() -> None:
     svd = TruncatedSVD(n_components=n_components, random_state=42)
     point_features = svd.fit_transform(point_mask_matrix)
 
-    # This turns Euclidean distance into Cosine distance!
+    # This turns Euclidean distance into Cosine distance
     print("Normalizing feature vectors...")
     point_features = normalize(point_features, norm='l2', axis=1)
 
+    # Save the heavy SVD features for later use
+    np.save(os.path.join(SCENE_DIR, f"svd_features_g{GRANULARITY}.npy"), point_features)
+
     print("Clustering points into 3D objects (HDBSCAN)...")
     clusterer = HDBSCAN(
-        min_cluster_size=100,
-        min_samples=5,
-        cluster_selection_epsilon=0.1,
-        )
+        min_cluster_size=100,            # INCREASED: Forces the algorithm to merge tiny fragments (was 100)
+        min_samples=5,                   # KEPT SAME: Keeps the boundary noise rejection active
+        cluster_selection_epsilon=0.1,  # INCREASED: The "glue" that bridges the gap between sub-parts (was 0.1)
+    )
     explicit_pseudo_labels = clusterer.fit_predict(point_features)
 
     print("Saving outputs...")

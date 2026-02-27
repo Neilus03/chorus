@@ -4,13 +4,15 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-
+import torch
 
 # --- CONFIG ---
-SCENE_DIR = "scene0000_00"
+SCENE_DIR = os.environ.get("SCENE_DIR", "scene0000_00")
+SCENE_NAME = Path(SCENE_DIR).name  # This safely extracts 'scene0140_00'
 FRAME_SKIP = 10
 DEVICE = "cuda:1"
-GRANULARITY = 0.8 # 0.8=whole objects, 0.2=parts
+# FIX: Now the master script can actually change this!
+GRANULARITY = float(os.environ.get("GRANULARITY", "0.8"))
 DEBUG_FIRST_N_FRAMES = 10
 
 # UnSAMv2 local checkout root
@@ -48,8 +50,8 @@ def _build_mask_generator(model):
     # Matches the project's whole-image notebook settings.
     return SAM2AutomaticMaskGenerator(
         model=model,
-        points_per_side=64,
-        points_per_batch=128,
+        points_per_side=32,
+        points_per_batch=256,
         mask_threshold=-1,
         pred_iou_thresh=0.77,
         stability_score_thresh=0.9,
@@ -68,7 +70,7 @@ def _build_relaxed_mask_generator(model):
     return SAM2AutomaticMaskGenerator(
         model=model,
         points_per_side=32,
-        points_per_batch=128,
+        points_per_batch=256,
         mask_threshold=-1,
         pred_iou_thresh=0.0,
         stability_score_thresh=0.0,
@@ -112,11 +114,14 @@ def main() -> None:
         img_path = os.path.join(color_dir, frame_name)
         image = np.array(Image.open(img_path).convert("RGB"))
 
-        masks_data = mask_generator.generate(image, gra=GRANULARITY)
-        used_fallback = False
-        if len(masks_data) == 0:
-            masks_data = relaxed_mask_generator.generate(image, gra=GRANULARITY)
-            used_fallback = True
+        # Ensure PyTorch is using the tensor cores properly and not calculating gradients
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            masks_data = mask_generator.generate(image, gra=GRANULARITY)
+            used_fallback = False
+
+            if len(masks_data) == 0:
+                masks_data = relaxed_mask_generator.generate(image, gra=GRANULARITY)
+                used_fallback = True
 
         frame_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.int32)
         local_mask_id = 1
