@@ -14,6 +14,7 @@ def cluster_features(
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
         cluster_selection_epsilon=cluster_selection_epsilon,
+        copy=False,
     )
     labels = clusterer.fit_predict(features)
 

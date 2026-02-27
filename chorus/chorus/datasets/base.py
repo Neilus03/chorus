@@ -11,8 +11,8 @@ from chorus.common.types import FrameRecord, GeometryRecord, VisibilityConfig
 
 class SceneAdapter(ABC):
     def __init__(self, scene_root: Path):
-        self.scene_root = scene_root
-        self.scene_id = scene_root.name
+        self.scene_root = Path(scene_root)
+        self.scene_id = self.scene_root.name
 
     @property
     @abstractmethod

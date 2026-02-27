@@ -15,6 +15,12 @@ def compute_visible_points(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     h, w = depth_map_m.shape
 
+    finite_mask = np.isfinite(u) & np.isfinite(v) & np.isfinite(z)
+    u = u[finite_mask]
+    v = v[finite_mask]
+    z = z[finite_mask]
+    valid_indices = valid_indices[finite_mask]
+
     u_int = u.astype(np.int32)
     v_int = v.astype(np.int32)
 
@@ -27,6 +33,7 @@ def compute_visible_points(
     z_depth = depth_map_m[v_int, u_int]
     is_visible = (
         (z_depth > visibility_cfg.min_depth_m)
+        & np.isfinite(z_depth)
         & (np.abs(z - z_depth) < visibility_cfg.z_tolerance_m)
     )
 

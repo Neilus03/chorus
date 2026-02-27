@@ -44,9 +44,11 @@ def _load_instance_ids_from_aggregation(
         label = group.get("label", "").lower()
         if label in IGNORE_INSTANCE_CLASSES:
             continue
+
         inst_id = int(group.get("objectId", group.get("id", -1)))
         if inst_id < 0:
             continue
+
         for seg_id in group.get("segments", []):
             seg_to_instance[int(seg_id)] = inst_id
 
@@ -59,6 +61,9 @@ def _load_instance_ids_from_aggregation(
 
 def load_scannet_gt_instance_ids(scene_dir: Path, scene_name: str) -> np.ndarray:
     labels_ply = scene_dir / f"{scene_name}_vh_clean_2.labels.ply"
+    if not labels_ply.exists():
+        raise FileNotFoundError(f"Missing ScanNet labels ply: {labels_ply}")
+
     plydata = PlyData.read(str(labels_ply))
     n_vertices = len(plydata.elements[0].data)
 

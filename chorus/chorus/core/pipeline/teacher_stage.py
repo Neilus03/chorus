@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from chorus.datasets.base import SceneAdapter
+from chorus.common.types import TeacherOutput
 from chorus.core.teacher.base import TeacherModel
+from chorus.datasets.base import SceneAdapter
 
 
 def run_teacher_stage(
@@ -9,8 +10,14 @@ def run_teacher_stage(
     teacher: TeacherModel,
     granularities: list[float],
     frame_skip: int,
-) -> list[dict]:
-    outputs = []
-    for g in granularities:
-        outputs.append(teacher.run(adapter=adapter, granularity=g, frame_skip=frame_skip))
+) -> list[TeacherOutput]:
+    outputs: list[TeacherOutput] = []
+    for granularity in granularities:
+        outputs.append(
+            teacher.run(
+                adapter=adapter,
+                granularity=granularity,
+                frame_skip=frame_skip,
+            )
+        )
     return outputs

@@ -32,12 +32,33 @@ class ScanNetSceneAdapter(SceneAdapter):
         pose_dir = self.scene_root / "pose"
         intrinsics_path = self.scene_root / "intrinsic" / "intrinsic_color.txt"
 
+        if not color_dir.is_dir():
+            raise FileNotFoundError(
+                f"Missing color directory at {color_dir}. "
+                "Call adapter.prepare() first."
+            )
+        if not depth_dir.is_dir():
+            raise FileNotFoundError(
+                f"Missing depth directory at {depth_dir}. "
+                "Call adapter.prepare() first."
+            )
+        if not pose_dir.is_dir():
+            raise FileNotFoundError(
+                f"Missing pose directory at {pose_dir}. "
+                "Call adapter.prepare() first."
+            )
+        if not intrinsics_path.exists():
+            raise FileNotFoundError(
+                f"Missing intrinsics file at {intrinsics_path}. "
+                "Call adapter.prepare() first."
+            )
+
         frame_ids = sorted(
             [p.stem for p in color_dir.iterdir() if p.suffix == ".jpg"],
             key=lambda x: int(x),
         )
 
-        return [
+        frames = [
             FrameRecord(
                 frame_id=frame_id,
                 rgb_path=color_dir / f"{frame_id}.jpg",
@@ -48,6 +69,12 @@ class ScanNetSceneAdapter(SceneAdapter):
             for frame_id in frame_ids
         ]
 
+        return [
+            frame
+            for frame in frames
+            if frame.rgb_path.exists() and frame.depth_path.exists() and frame.pose_path.exists()
+        ]
+
     def load_rgb(self, frame: FrameRecord) -> np.ndarray:
         return np.array(Image.open(frame.rgb_path).convert("RGB"))
 
@@ -56,18 +83,30 @@ class ScanNetSceneAdapter(SceneAdapter):
         return depth * DEFAULT_DEPTH_SCALE_TO_M
 
     def load_pose_c2w(self, frame: FrameRecord) -> np.ndarray:
-        return np.loadtxt(frame.pose_path)
+        pose = np.loadtxt(frame.pose_path)
+        if np.isnan(pose).any() or np.isinf(pose).any():
+            raise ValueError(f"Invalid pose matrix in {frame.pose_path}")
+        return pose
 
     def load_intrinsics(self, frame: FrameRecord) -> np.ndarray:
         return np.loadtxt(frame.intrinsics_path)[:3, :3]
 
     def load_geometry_points(self) -> np.ndarray:
         mesh_path = self.scene_root / f"{self.scene_id}{GEOMETRY_SUFFIX}"
-        pcd = o3d.io.read_point_cloud(str(mesh_path))
-        return np.asarray(pcd.points)
+        if not mesh_path.exists():
+            raise FileNotFoundError(f"Missing ScanNet geometry file: {mesh_path}")
 
-    def load_geometry_colors(self):
+        pcd = o3d.io.read_point_cloud(str(mesh_path))
+        points = np.asarray(pcd.points)
+        if points.size == 0:
+            raise RuntimeError(f"Loaded empty point cloud from {mesh_path}")
+        return points
+
+    def load_geometry_colors(self) -> np.ndarray | None:
         mesh_path = self.scene_root / f"{self.scene_id}{GEOMETRY_SUFFIX}"
+        if not mesh_path.exists():
+            raise FileNotFoundError(f"Missing ScanNet geometry file: {mesh_path}")
+
         pcd = o3d.io.read_point_cloud(str(mesh_path))
         colors = np.asarray(pcd.colors)
         return colors if colors.size > 0 else None
