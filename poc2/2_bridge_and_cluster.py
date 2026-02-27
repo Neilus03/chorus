@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 import open3d as o3d
 from scipy.sparse import coo_matrix
+from sklearn.cluster import Birch
 from sklearn.decomposition import TruncatedSVD
 from sklearn.preprocessing import normalize
 
@@ -20,6 +21,22 @@ FRAME_SKIP = 10
 GRANULARITY = float(os.environ.get("GRANULARITY", "0.5"))
 MASK_DIR = os.path.join(SCENE_DIR, f"unsam_masks_g{GRANULARITY}")
 SVD_COMPONENTS = 32
+
+CLUSTER_BACKEND = os.environ.get("CLUSTER_BACKEND", "cpu_hdbscan").strip().lower()
+
+HDBSCAN_MIN_CLUSTER_SIZE = int(os.environ.get("HDBSCAN_MIN_CLUSTER_SIZE", "100"))
+HDBSCAN_MIN_SAMPLES = int(os.environ.get("HDBSCAN_MIN_SAMPLES", "5"))
+HDBSCAN_EPS = float(os.environ.get("HDBSCAN_EPS", "0.1"))
+HDBSCAN_N_JOBS = int(os.environ.get("HDBSCAN_N_JOBS", "-1"))
+
+BIRCH_THRESHOLD = float(os.environ.get("BIRCH_THRESHOLD", "0.7"))
+BIRCH_BRANCHING_FACTOR = int(os.environ.get("BIRCH_BRANCHING_FACTOR", "50"))
+GPU_FALLBACK_TO_CPU = os.environ.get("GPU_FALLBACK_TO_CPU", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+}
 
 
 def main() -> None:
@@ -127,17 +144,84 @@ def main() -> None:
     # This turns Euclidean distance into Cosine distance
     print("Normalizing feature vectors...")
     point_features = normalize(point_features, norm='l2', axis=1)
+    point_features = point_features.astype(np.float32, copy=False)
 
     # Save the heavy SVD features for later use
     np.save(os.path.join(SCENE_DIR, f"svd_features_g{GRANULARITY}.npy"), point_features)
 
-    print("Clustering points into 3D objects (HDBSCAN)...")
-    clusterer = HDBSCAN(
-        min_cluster_size=100,            # INCREASED: Forces the algorithm to merge tiny fragments (was 100)
-        min_samples=5,                   # KEPT SAME: Keeps the boundary noise rejection active
-        cluster_selection_epsilon=0.1,  # INCREASED: The "glue" that bridges the gap between sub-parts (was 0.1)
-    )
-    explicit_pseudo_labels = clusterer.fit_predict(point_features)
+    # Points unseen by any mask are guaranteed low-confidence; skip them for clustering speed.
+    seen_mask = votes_per_point > 0
+    num_seen = int(np.sum(seen_mask))
+    print(f"Clustering backend: {CLUSTER_BACKEND}")
+    print(f"Seen points for clustering: {num_seen}/{num_points} ({num_seen/num_points*100:.1f}%)")
+    if num_seen == 0:
+        raise RuntimeError("No seen points found after bridging. Cannot cluster.")
+
+    seen_features = point_features[seen_mask]
+    seen_features = np.ascontiguousarray(seen_features, dtype=np.float32)
+
+    def _fit_cpu_hdbscan(features: np.ndarray) -> np.ndarray:
+        try:
+            clusterer = HDBSCAN(
+                min_cluster_size=HDBSCAN_MIN_CLUSTER_SIZE,
+                min_samples=HDBSCAN_MIN_SAMPLES,
+                cluster_selection_epsilon=HDBSCAN_EPS,
+                n_jobs=HDBSCAN_N_JOBS,
+            )
+        except TypeError:
+            # Older sklearn builds may not expose n_jobs for HDBSCAN.
+            clusterer = HDBSCAN(
+                min_cluster_size=HDBSCAN_MIN_CLUSTER_SIZE,
+                min_samples=HDBSCAN_MIN_SAMPLES,
+                cluster_selection_epsilon=HDBSCAN_EPS,
+            )
+        return clusterer.fit_predict(features)
+
+    if CLUSTER_BACKEND == "cpu_hdbscan":
+        print("Clustering points into 3D objects (CPU HDBSCAN)...")
+        seen_labels = _fit_cpu_hdbscan(seen_features)
+    elif CLUSTER_BACKEND == "gpu_hdbscan":
+        print("Clustering points into 3D objects (GPU HDBSCAN via cuML)...")
+        try:
+            import cupy as cp
+            from cuml.cluster import HDBSCAN as CuHDBSCAN
+        except ImportError as e:
+            raise RuntimeError(
+                "CLUSTER_BACKEND=gpu_hdbscan requested, but cuML/CuPy is not installed."
+            ) from e
+
+        seen_features_gpu = cp.asarray(seen_features, dtype=cp.float32)
+        gpu_clusterer = CuHDBSCAN(
+            min_cluster_size=HDBSCAN_MIN_CLUSTER_SIZE,
+            min_samples=HDBSCAN_MIN_SAMPLES,
+            cluster_selection_epsilon=HDBSCAN_EPS,
+        )
+        try:
+            seen_labels = cp.asnumpy(gpu_clusterer.fit_predict(seen_features_gpu))
+        except Exception as e:
+            if not GPU_FALLBACK_TO_CPU:
+                raise
+            print(
+                f"WARNING: GPU HDBSCAN failed ({type(e).__name__}: {e}). "
+                "Falling back to CPU HDBSCAN for this scene."
+            )
+            seen_labels = _fit_cpu_hdbscan(seen_features)
+    elif CLUSTER_BACKEND == "birch_fast":
+        print("Clustering points into 3D objects (BIRCH fast approximation)...")
+        birch = Birch(
+            threshold=BIRCH_THRESHOLD,
+            branching_factor=BIRCH_BRANCHING_FACTOR,
+            n_clusters=None,
+        )
+        seen_labels = birch.fit_predict(seen_features)
+    else:
+        raise ValueError(
+            f"Unknown CLUSTER_BACKEND='{CLUSTER_BACKEND}'. "
+            "Expected one of: cpu_hdbscan, gpu_hdbscan, birch_fast."
+        )
+
+    explicit_pseudo_labels = np.full(num_points, -1, dtype=np.int32)
+    explicit_pseudo_labels[seen_mask] = seen_labels.astype(np.int32, copy=False)
 
     print("Saving outputs...")
     labels_path = os.path.join(SCENE_DIR, f"chorus_instance_labels_g{GRANULARITY}.npy")
