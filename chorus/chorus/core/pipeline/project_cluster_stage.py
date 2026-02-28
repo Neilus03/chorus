@@ -12,6 +12,8 @@ from chorus.core.embedding.svd import compute_svd_features
 from chorus.core.lifting.project import project_points_to_image
 from chorus.core.lifting.visibility import compute_visible_points
 from chorus.core.lifting.voting import build_point_mask_matrix
+from chorus.core.quality.diagnostics import save_json
+from chorus.core.quality.intrinsic_metrics import compute_cluster_intrinsic_metrics
 from chorus.datasets.base import SceneAdapter
 
 
@@ -134,16 +136,7 @@ def run_project_cluster_stage(
 
     labels_path = None
     ply_path = None
-
-    if save_outputs:
-        labels_path = adapter.scene_root / f"chorus_instance_labels_g{teacher_output.granularity}.npy"
-        np.save(labels_path, labels)
-
-        features_path = adapter.scene_root / f"svd_features_g{teacher_output.granularity}.npy"
-        np.save(features_path, features)
-
-        ply_path = adapter.scene_root / f"chorus_instance_result_g{teacher_output.granularity}.ply"
-        _save_colored_point_cloud(points_3d=points_3d, labels=labels, out_path=ply_path)
+    diagnostics_path = None
 
     stats = {
         "scene_id": adapter.scene_id,
@@ -158,6 +151,43 @@ def run_project_cluster_stage(
         **svd_stats,
         **clustering_stats,
     }
+
+    cluster_output = ClusterOutput(
+        granularity=teacher_output.granularity,
+        labels=labels,
+        features=features,
+        ply_path=None,
+        labels_path=None,
+        stats=stats,
+    )
+
+    intrinsic_metrics = compute_cluster_intrinsic_metrics(cluster_output)
+
+    if save_outputs:
+        labels_path = adapter.scene_root / f"chorus_instance_labels_g{teacher_output.granularity}.npy"
+        np.save(labels_path, labels)
+
+        features_path = adapter.scene_root / f"svd_features_g{teacher_output.granularity}.npy"
+        np.save(features_path, features)
+
+        ply_path = adapter.scene_root / f"chorus_instance_result_g{teacher_output.granularity}.ply"
+        _save_colored_point_cloud(points_3d=points_3d, labels=labels, out_path=ply_path)
+
+        diagnostics_path = adapter.scene_root / f"diagnostics_g{teacher_output.granularity}.json"
+        save_json(
+            {
+                "stats": stats,
+                "intrinsic_metrics": intrinsic_metrics,
+                "labels_path": str(labels_path),
+                "features_path": str(features_path),
+                "ply_path": str(ply_path),
+            },
+            diagnostics_path,
+        )
+
+    stats["intrinsic_metrics"] = intrinsic_metrics
+    if diagnostics_path is not None:
+        stats["diagnostics_path"] = str(diagnostics_path)
 
     print(
         f"Project+Cluster complete: scene={adapter.scene_id}, granularity={teacher_output.granularity}, "

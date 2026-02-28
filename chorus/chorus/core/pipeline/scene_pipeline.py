@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from chorus.core.pipeline.project_cluster_stage import run_project_cluster_stage
 from chorus.core.pipeline.teacher_stage import run_teacher_stage
+from chorus.core.quality.diagnostics import save_json
+from chorus.core.quality.intrinsic_metrics import compute_scene_intrinsic_metrics
 from chorus.core.teacher.base import TeacherModel
 from chorus.datasets.base import SceneAdapter
 from chorus.eval.scannet_oracle import evaluate_and_save_scannet_oracle
@@ -46,6 +46,8 @@ def run_scene_pipeline(
         )
         cluster_outputs.append(cluster_output)
 
+    scene_intrinsic_metrics = compute_scene_intrinsic_metrics(cluster_outputs)
+
     oracle_summary = None
     if run_oracle_eval and adapter.dataset_name == "scannet":
         oracle_summary = evaluate_and_save_scannet_oracle(
@@ -58,6 +60,12 @@ def run_scene_pipeline(
         litept_pack_dir = export_litept_scene_pack(
             adapter=adapter,
             cluster_outputs=cluster_outputs,
+            teacher_name=teacher.__class__.__name__,
+            projection_type="zbuffer_rgbd",
+            embedding_type="truncated_svd",
+            clustering_type="hdbscan",
+            frame_skip=frame_skip,
+            scene_intrinsic_metrics=scene_intrinsic_metrics,
         )
 
     summary = {
@@ -82,6 +90,7 @@ def run_scene_pipeline(
             }
             for c in cluster_outputs
         ],
+        "scene_intrinsic_metrics": scene_intrinsic_metrics,
         "oracle_summary": {
             "metrics_path": str(oracle_summary["metrics_path"]),
             "labels_path": str(oracle_summary["labels_path"]),
@@ -91,5 +100,9 @@ def run_scene_pipeline(
         else None,
         "litept_pack_dir": str(litept_pack_dir) if litept_pack_dir is not None else None,
     }
+
+    summary_path = adapter.scene_root / "scene_pipeline_summary.json"
+    save_json(summary, summary_path)
+    summary["summary_path"] = str(summary_path)
 
     return summary

@@ -15,7 +15,7 @@ from chorus.datasets.scannet.metadata import (
     DEFAULT_VISIBILITY_Z_TOLERANCE_M,
     GEOMETRY_SUFFIX,
 )
-from chorus.datasets.scannet.prepare import extract_rgbd
+from chorus.datasets.scannet.prepare import extract_rgbd, is_rgbd_prepared
 
 
 class ScanNetSceneAdapter(SceneAdapter):
@@ -24,6 +24,9 @@ class ScanNetSceneAdapter(SceneAdapter):
         return "scannet"
 
     def prepare(self) -> None:
+        if is_rgbd_prepared(self.scene_root):
+            print(f"Scene {self.scene_id} is already prepared.")
+            return
         extract_rgbd(self.scene_root)
 
     def list_frames(self) -> list[FrameRecord]:

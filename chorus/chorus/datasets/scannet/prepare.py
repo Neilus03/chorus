@@ -42,6 +42,39 @@ def _save_mat(matrix: np.ndarray, filename: Path) -> None:
             np.savetxt(f, line[np.newaxis], fmt="%f")
 
 
+def is_rgbd_prepared(scene_dir: Path) -> bool:
+    scene_dir = Path(scene_dir)
+
+    color_dir = scene_dir / "color"
+    depth_dir = scene_dir / "depth"
+    pose_dir = scene_dir / "pose"
+    intrinsic_dir = scene_dir / "intrinsic"
+
+    required_files = [
+        intrinsic_dir / "intrinsic_color.txt",
+        intrinsic_dir / "intrinsic_depth.txt",
+    ]
+
+    if not color_dir.is_dir():
+        return False
+    if not depth_dir.is_dir():
+        return False
+    if not pose_dir.is_dir():
+        return False
+    if not intrinsic_dir.is_dir():
+        return False
+
+    for path in required_files:
+        if not path.exists() or path.stat().st_size == 0:
+            return False
+
+    num_color = len([p for p in color_dir.iterdir() if p.suffix == ".jpg"])
+    num_depth = len([p for p in depth_dir.iterdir() if p.suffix == ".png"])
+    num_pose = len([p for p in pose_dir.iterdir() if p.suffix == ".txt"])
+
+    return num_color > 0 and num_depth > 0 and num_pose > 0
+
+
 def extract_rgbd(scene_dir: Path) -> None:
     try:
         import imageio.v2 as imageio
@@ -51,11 +84,19 @@ def extract_rgbd(scene_dir: Path) -> None:
         ) from exc
 
     scene_dir = Path(scene_dir)
+
+    if is_rgbd_prepared(scene_dir):
+        print(f"RGB-D already prepared for scene {scene_dir.name}, skipping extraction.")
+        return
+
     scene_id = scene_dir.name
     sens_path = scene_dir / f"{scene_id}.sens"
 
     if not sens_path.exists():
-        raise FileNotFoundError(f"Missing ScanNet .sens file: {sens_path}")
+        raise FileNotFoundError(
+            f"Missing ScanNet .sens file: {sens_path}. "
+            "Scene is not prepared and raw ScanNet source is missing."
+        )
 
     SensorData = _load_sensor_data_class()
     sd = SensorData(str(sens_path))
