@@ -56,15 +56,18 @@ class ScanNetSceneAdapter(SceneAdapter):
                 "Call adapter.prepare() first."
             )
 
-        frame_ids = sorted(
-            [p.stem for p in color_dir.iterdir() if p.suffix == ".jpg"],
-            key=lambda x: int(x),
-        )
+        color_files = {
+        p.stem: p
+        for p in color_dir.iterdir()
+        if p.suffix.lower() in {".jpg", ".png"}
+        }
+
+        frame_ids = sorted(color_files.keys(), key=lambda x: int(x))
 
         frames = [
             FrameRecord(
                 frame_id=frame_id,
-                rgb_path=color_dir / f"{frame_id}.jpg",
+                rgb_path=color_files[frame_id],
                 depth_path=depth_dir / f"{frame_id}.png",
                 pose_path=pose_dir / f"{frame_id}.txt",
                 intrinsics_path=intrinsics_path,

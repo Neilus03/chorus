@@ -41,6 +41,8 @@ def export_litept_scene_pack(
     cluster_stats: dict[str, dict] = {}
 
     valid_stack = []
+    seen_stack = []
+
     for cluster_output in cluster_outputs:
         granularity_key = f"g{cluster_output.granularity}"
         labels_file = output_dir / f"labels_{granularity_key}.npy"
@@ -48,15 +50,17 @@ def export_litept_scene_pack(
 
         label_file_map[granularity_key] = labels_file.name
         cluster_stats[granularity_key] = cluster_output.stats
+
         valid_stack.append(cluster_output.labels >= 0)
+        seen_stack.append(cluster_output.seen_mask)
 
     valid_points = np.any(np.stack(valid_stack, axis=0), axis=0)
+    seen_points = np.any(np.stack(seen_stack, axis=0), axis=0)
 
-    # For now, supervision_mask == valid_points.
-    # Later you can make this stricter, for example using confidence thresholds.
     supervision_mask = valid_points.copy()
 
     np.save(output_dir / "valid_points.npy", valid_points.astype(np.uint8))
+    np.save(output_dir / "seen_points.npy", seen_points.astype(np.uint8))
     np.save(output_dir / "supervision_mask.npy", supervision_mask.astype(np.uint8))
 
     num_frames_total = len(frames)
@@ -75,6 +79,7 @@ def export_litept_scene_pack(
         "granularities": [float(c.granularity) for c in cluster_outputs],
         "label_files": label_file_map,
         "valid_points_file": "valid_points.npy",
+        "seen_points_file": "seen_points.npy",
         "supervision_mask_file": "supervision_mask.npy",
         "teacher_name": teacher_name,
         "projection_type": projection_type,

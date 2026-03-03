@@ -309,6 +309,40 @@ def save_oracle_best_ply(
     PlyData([PlyElement.describe(out_vertices, "vertex")]).write(str(out_path))
 
 
+def compute_clustering_metrics(
+    gt_ids: np.ndarray,
+    oracle_labels: np.ndarray,
+) -> dict[str, float]:
+    """
+    Compute clustering-consistency metrics between GT instance ids and oracle labels.
+
+    Notes:
+    - We ignore GT background points (gt_ids <= 0).
+    - We keep oracle noise labels (e.g. -1) as their own cluster.
+    """
+    mask = gt_ids > 0
+    if not np.any(mask):
+        return {"NMI": float("nan"), "ARI": float("nan")}
+
+    try:
+        from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+    except ImportError:
+        print(
+            "Warning: scikit-learn not installed; cannot compute NMI/ARI. "
+            "Install 'scikit-learn' to enable clustering metrics."
+        )
+        return {"NMI": float("nan"), "ARI": float("nan")}
+
+    y_true = gt_ids[mask].astype(np.int64)
+    y_pred = oracle_labels[mask].astype(np.int64)
+
+    # Label-invariant clustering metrics (IDs can be any integers).
+    nmi = normalized_mutual_info_score(y_true, y_pred, average_method="arithmetic")
+    ari = adjusted_rand_score(y_true, y_pred)
+
+    return {"NMI": float(nmi), "ARI": float(ari)}
+
+
 def evaluate_and_save_scannet_oracle(
     adapter: SceneAdapter,
     cluster_outputs: list[ClusterOutput],
@@ -333,6 +367,7 @@ def evaluate_and_save_scannet_oracle(
         proposals,
         min_iou=min_iou_for_ply,
     )
+    clustering_metrics = compute_clustering_metrics(gt_ids, oracle_best_labels)
 
     scene_root = adapter.scene_root
     metrics_path = scene_root / "oracle_metrics.json"
@@ -341,6 +376,7 @@ def evaluate_and_save_scannet_oracle(
 
     results_to_save = dict(oracle_results)
     results_to_save["_extras"] = additional_metrics
+    results_to_save["_clustering"] = clustering_metrics
 
     with metrics_path.open("w", encoding="utf-8") as f:
         json.dump(results_to_save, f, indent=2)
@@ -357,6 +393,10 @@ def evaluate_and_save_scannet_oracle(
     print(f"Saved oracle metrics: {metrics_path}")
     print(f"Saved oracle pooled labels: {labels_path}")
     print(f"Saved oracle pooled ply: {ply_path}")
+    print(
+        "Clustering consistency metrics (GT vs oracle labels on foreground points): "
+        f"NMI={clustering_metrics['NMI']:.4f}, ARI={clustering_metrics['ARI']:.4f}"
+    )
 
     return {
         "metrics_path": metrics_path,
@@ -364,4 +404,5 @@ def evaluate_and_save_scannet_oracle(
         "ply_path": ply_path,
         "oracle_results": oracle_results,
         "additional_metrics": additional_metrics,
+        "clustering_metrics": clustering_metrics,
     }

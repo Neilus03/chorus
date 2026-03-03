@@ -68,7 +68,7 @@ def is_rgbd_prepared(scene_dir: Path) -> bool:
         if not path.exists() or path.stat().st_size == 0:
             return False
 
-    num_color = len([p for p in color_dir.iterdir() if p.suffix == ".jpg"])
+    num_color = len([p for p in color_dir.iterdir() if p.suffix.lower() in {".jpg", ".png"}])
     num_depth = len([p for p in depth_dir.iterdir() if p.suffix == ".png"])
     num_pose = len([p for p in pose_dir.iterdir() if p.suffix == ".txt"])
 
