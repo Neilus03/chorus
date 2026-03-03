@@ -68,41 +68,41 @@ def run_scene_pipeline(
             scene_intrinsic_metrics=scene_intrinsic_metrics,
         )
 
-        summary = {
-            "dataset": adapter.dataset_name,
-            "scene_id": adapter.scene_id,
-            "granularities": granularities,
-            "teacher_outputs": [
-                {
-                    "granularity": float(t.granularity),
-                    "num_mask_files": len(t.frame_mask_paths),
-                    "total_masks": int(t.total_masks),
-                    "output_dir": str(t.frame_mask_paths[0].parent) if len(t.frame_mask_paths) > 0 else None,
-                }
-                for t in teacher_outputs
-            ],
-            "cluster_outputs": [
-                {
-                    "granularity": float(c.granularity),
-                    "labels_path": str(c.labels_path) if c.labels_path is not None else None,
-                    "ply_path": str(c.ply_path) if c.ply_path is not None else None,
-                    "stats": c.stats,
-                }
-                for c in cluster_outputs
-            ],
-            "scene_intrinsic_metrics": scene_intrinsic_metrics,
-            "oracle_summary": {
-                "metrics_path": str(oracle_summary["metrics_path"]),
-                "labels_path": str(oracle_summary["labels_path"]),
-                "ply_path": str(oracle_summary["ply_path"]),
-                "oracle_results": oracle_summary["oracle_results"],
-                "additional_metrics": oracle_summary["additional_metrics"],
-                "clustering_metrics": oracle_summary["clustering_metrics"],
+    summary = {
+        "dataset": adapter.dataset_name,
+        "scene_id": adapter.scene_id,
+        "granularities": granularities,
+        "teacher_outputs": [
+            {
+                "granularity": float(t.granularity),
+                "num_mask_files": len(t.frame_mask_paths),
+                "total_masks": int(t.total_masks),
+                "output_dir": str(t.frame_mask_paths[0].parent) if len(t.frame_mask_paths) > 0 else None,
             }
-            if oracle_summary is not None
-            else None,
-            "litept_pack_dir": str(litept_pack_dir) if litept_pack_dir is not None else None,
+            for t in teacher_outputs
+        ],
+        "cluster_outputs": [
+            {
+                "granularity": float(c.granularity),
+                "labels_path": str(c.labels_path) if c.labels_path is not None else None,
+                "ply_path": str(c.ply_path) if c.ply_path is not None else None,
+                "stats": c.stats,
+            }
+            for c in cluster_outputs
+        ],
+        "scene_intrinsic_metrics": scene_intrinsic_metrics,
+        "oracle_summary": {
+            "metrics_path": str(oracle_summary["metrics_path"]),
+            "labels_path": str(oracle_summary["labels_path"]),
+            "ply_path": str(oracle_summary["ply_path"]),
+            "oracle_results": oracle_summary["oracle_results"],
+            "additional_metrics": oracle_summary["additional_metrics"],
+            "clustering_metrics": oracle_summary["clustering_metrics"],
         }
+        if oracle_summary is not None
+        else None,
+        "litept_pack_dir": str(litept_pack_dir) if litept_pack_dir is not None else None,
+    }
 
     summary_path = adapter.scene_root / "scene_pipeline_summary.json"
     save_json(summary, summary_path)

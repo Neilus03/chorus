@@ -147,6 +147,16 @@ def _ensure_scene_available(
         f"download failed after {max_download_retries} attempts",
     )
 
+def _bucket_key(name: str) -> str | None:
+    lower = str(name).strip().lower()
+    if lower.startswith("small"):
+        return "small"
+    if lower.startswith("medium"):
+        return "medium"
+    if lower.startswith("large"):
+        return "large"
+    return None
+
 def _flatten_scene_quality(scene_summary: dict[str, Any]) -> dict[str, Any]:
     flat: dict[str, Any] = {}
 
@@ -160,6 +170,41 @@ def _flatten_scene_quality(scene_summary: dict[str, Any]) -> dict[str, Any]:
     clustering_metrics = oracle_summary.get("clustering_metrics", {}) or {}
     flat["oracle_nmi"] = clustering_metrics.get("NMI")
     flat["oracle_ari"] = clustering_metrics.get("ARI")
+
+    oracle_results = oracle_summary.get("oracle_results", {}) or {}
+    for bucket_name, bucket_metrics in oracle_results.items():
+        bucket = _bucket_key(bucket_name)
+        if bucket is None or not isinstance(bucket_metrics, dict):
+            continue
+        flat[f"oracle_ap25_{bucket}"] = bucket_metrics.get("AP25")
+        flat[f"oracle_ap50_{bucket}"] = bucket_metrics.get("AP50")
+        flat[f"oracle_count_{bucket}"] = bucket_metrics.get("Count")
+
+    additional_metrics = oracle_summary.get("additional_metrics", {}) or {}
+
+    map_by_bucket = additional_metrics.get("oracle_mAP_25_95_by_bucket", {}) or {}
+    for bucket_name, value in map_by_bucket.items():
+        bucket = _bucket_key(bucket_name)
+        if bucket is None:
+            continue
+        flat[f"oracle_map_25_95_{bucket}"] = value
+
+    topk = additional_metrics.get("topk_proposal_coverage", {}) or {}
+
+    topk_025 = topk.get("iou_0.25", {}) or {}
+    flat["oracle_topk_iou025_r1"] = topk_025.get("R_at_least_1")
+    flat["oracle_topk_iou025_r3"] = topk_025.get("R_at_least_3")
+    flat["oracle_topk_iou025_r5"] = topk_025.get("R_at_least_5")
+
+    topk_050 = topk.get("iou_0.50", {}) or {}
+    flat["oracle_topk_iou050_r1"] = topk_050.get("R_at_least_1")
+    flat["oracle_topk_iou050_r3"] = topk_050.get("R_at_least_3")
+    flat["oracle_topk_iou050_r5"] = topk_050.get("R_at_least_5")
+
+    winner_share = additional_metrics.get("winner_granularity_share", {}) or {}
+    for key, value in winner_share.items():
+        safe_key = str(key).replace(".", "_")
+        flat[f"oracle_winner_share_{safe_key}"] = value
 
     teacher_by_g = {}
     for t in scene_summary.get("teacher_outputs", []) or []:
@@ -193,6 +238,13 @@ def _flatten_scene_quality(scene_summary: dict[str, Any]) -> dict[str, Any]:
 
     flat["total_teacher_masks_across_granularities"] = total_teacher_masks
     return flat
+
+def _safe_mean(values: list[float | None]) -> float | None:
+    vals = [float(v) for v in values if v is not None]
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
+
 
 def run_streaming_scannet(
     scans_root: Path,
@@ -306,6 +358,29 @@ def run_streaming_scannet(
                 _print_scene_result(result)
                 if reporter is not None:
                     reporter.log_scene(result)
+
+                completed = run_summary["scene_results"]
+                done_rows = [r for r in completed if r.get("status") in {"done", "skipped_done"}]
+
+                running_avg_nmi = _safe_mean([r.get("oracle_nmi") for r in done_rows])
+                running_avg_ari = _safe_mean([r.get("oracle_ari") for r in done_rows])
+                running_avg_noise = _safe_mean([r.get("avg_noise_fraction_seen") for r in done_rows])
+                running_avg_unseen = _safe_mean([r.get("avg_unseen_fraction") for r in done_rows])
+
+                if reporter is not None and hasattr(reporter, "log_event"):
+                    reporter.log_event(
+                        {
+                            "summary/running_done": run_summary["done"],
+                            "summary/running_failed": run_summary["failed"],
+                            "summary/running_skipped_done": run_summary["skipped_done"],
+                            "summary/running_avg_oracle_nmi": running_avg_nmi,
+                            "summary/running_avg_oracle_ari": running_avg_ari,
+                            "summary/running_avg_noise_fraction_seen": running_avg_noise,
+                            "summary/running_avg_unseen_fraction": running_avg_unseen,
+                            "progress/heartbeat": time.time(),
+                        }
+                    )
+
                 continue
 
         add_manifest_event(manifest, phase="download", status="running", message="checking scene availability")
@@ -365,6 +440,28 @@ def run_streaming_scannet(
             if reporter is not None:
                 reporter.log_scene(result)
 
+            completed = run_summary["scene_results"]
+            done_rows = [r for r in completed if r.get("status") in {"done", "skipped_done"}]
+
+            running_avg_nmi = _safe_mean([r.get("oracle_nmi") for r in done_rows])
+            running_avg_ari = _safe_mean([r.get("oracle_ari") for r in done_rows])
+            running_avg_noise = _safe_mean([r.get("avg_noise_fraction_seen") for r in done_rows])
+            running_avg_unseen = _safe_mean([r.get("avg_unseen_fraction") for r in done_rows])
+
+            if reporter is not None and hasattr(reporter, "log_event"):
+                reporter.log_event(
+                    {
+                        "summary/running_done": run_summary["done"],
+                        "summary/running_failed": run_summary["failed"],
+                        "summary/running_skipped_done": run_summary["skipped_done"],
+                        "summary/running_avg_oracle_nmi": running_avg_nmi,
+                        "summary/running_avg_oracle_ari": running_avg_ari,
+                        "summary/running_avg_noise_fraction_seen": running_avg_noise,
+                        "summary/running_avg_unseen_fraction": running_avg_unseen,
+                        "progress/heartbeat": time.time(),
+                    }
+                )
+
             if not continue_on_error:
                 break
             continue
@@ -399,6 +496,29 @@ def run_streaming_scannet(
             _print_scene_result(result)
             if reporter is not None:
                 reporter.log_scene(result)
+
+            completed = run_summary["scene_results"]
+            done_rows = [r for r in completed if r.get("status") in {"done", "skipped_done"}]
+
+            running_avg_nmi = _safe_mean([r.get("oracle_nmi") for r in done_rows])
+            running_avg_ari = _safe_mean([r.get("oracle_ari") for r in done_rows])
+            running_avg_noise = _safe_mean([r.get("avg_noise_fraction_seen") for r in done_rows])
+            running_avg_unseen = _safe_mean([r.get("avg_unseen_fraction") for r in done_rows])
+
+            if reporter is not None and hasattr(reporter, "log_event"):
+                reporter.log_event(
+                    {
+                        "summary/running_done": run_summary["done"],
+                        "summary/running_failed": run_summary["failed"],
+                        "summary/running_skipped_done": run_summary["skipped_done"],
+                        "summary/running_avg_oracle_nmi": running_avg_nmi,
+                        "summary/running_avg_oracle_ari": running_avg_ari,
+                        "summary/running_avg_noise_fraction_seen": running_avg_noise,
+                        "summary/running_avg_unseen_fraction": running_avg_unseen,
+                        "progress/heartbeat": time.time(),
+                    }
+                )
+
             continue
 
         quality_summary: dict[str, Any] = {}
@@ -466,6 +586,28 @@ def run_streaming_scannet(
                 if reporter is not None:
                     reporter.log_scene(result)
 
+                completed = run_summary["scene_results"]
+                done_rows = [r for r in completed if r.get("status") in {"done", "skipped_done"}]
+
+                running_avg_nmi = _safe_mean([r.get("oracle_nmi") for r in done_rows])
+                running_avg_ari = _safe_mean([r.get("oracle_ari") for r in done_rows])
+                running_avg_noise = _safe_mean([r.get("avg_noise_fraction_seen") for r in done_rows])
+                running_avg_unseen = _safe_mean([r.get("avg_unseen_fraction") for r in done_rows])
+
+                if reporter is not None and hasattr(reporter, "log_event"):
+                    reporter.log_event(
+                        {
+                            "summary/running_done": run_summary["done"],
+                            "summary/running_failed": run_summary["failed"],
+                            "summary/running_skipped_done": run_summary["skipped_done"],
+                            "summary/running_avg_oracle_nmi": running_avg_nmi,
+                            "summary/running_avg_oracle_ari": running_avg_ari,
+                            "summary/running_avg_noise_fraction_seen": running_avg_noise,
+                            "summary/running_avg_unseen_fraction": running_avg_unseen,
+                            "progress/heartbeat": time.time(),
+                        }
+                    )
+
                 if not continue_on_error:
                     break
                 continue
@@ -530,6 +672,28 @@ def run_streaming_scannet(
                     if reporter is not None:
                         reporter.log_scene(result)
 
+                    completed = run_summary["scene_results"]
+                    done_rows = [r for r in completed if r.get("status") in {"done", "skipped_done"}]
+
+                    running_avg_nmi = _safe_mean([r.get("oracle_nmi") for r in done_rows])
+                    running_avg_ari = _safe_mean([r.get("oracle_ari") for r in done_rows])
+                    running_avg_noise = _safe_mean([r.get("avg_noise_fraction_seen") for r in done_rows])
+                    running_avg_unseen = _safe_mean([r.get("avg_unseen_fraction") for r in done_rows])
+
+                    if reporter is not None and hasattr(reporter, "log_event"):
+                        reporter.log_event(
+                            {
+                                "summary/running_done": run_summary["done"],
+                                "summary/running_failed": run_summary["failed"],
+                                "summary/running_skipped_done": run_summary["skipped_done"],
+                                "summary/running_avg_oracle_nmi": running_avg_nmi,
+                                "summary/running_avg_oracle_ari": running_avg_ari,
+                                "summary/running_avg_noise_fraction_seen": running_avg_noise,
+                                "summary/running_avg_unseen_fraction": running_avg_unseen,
+                                "progress/heartbeat": time.time(),
+                            }
+                        )
+
                     if not continue_on_error:
                         break
                     continue
@@ -564,6 +728,28 @@ def run_streaming_scannet(
             _print_scene_result(result)
             if reporter is not None:
                 reporter.log_scene(result)
+
+            completed = run_summary["scene_results"]
+            done_rows = [r for r in completed if r.get("status") in {"done", "skipped_done"}]
+
+            running_avg_nmi = _safe_mean([r.get("oracle_nmi") for r in done_rows])
+            running_avg_ari = _safe_mean([r.get("oracle_ari") for r in done_rows])
+            running_avg_noise = _safe_mean([r.get("avg_noise_fraction_seen") for r in done_rows])
+            running_avg_unseen = _safe_mean([r.get("avg_unseen_fraction") for r in done_rows])
+
+            if reporter is not None and hasattr(reporter, "log_event"):
+                reporter.log_event(
+                    {
+                        "summary/running_done": run_summary["done"],
+                        "summary/running_failed": run_summary["failed"],
+                        "summary/running_skipped_done": run_summary["skipped_done"],
+                        "summary/running_avg_oracle_nmi": running_avg_nmi,
+                        "summary/running_avg_oracle_ari": running_avg_ari,
+                        "summary/running_avg_noise_fraction_seen": running_avg_noise,
+                        "summary/running_avg_unseen_fraction": running_avg_unseen,
+                        "progress/heartbeat": time.time(),
+                    }
+                )
 
         except Exception as exc:
             add_manifest_event(
@@ -600,10 +786,33 @@ def run_streaming_scannet(
             if reporter is not None:
                 reporter.log_scene(result)
 
+            completed = run_summary["scene_results"]
+            done_rows = [r for r in completed if r.get("status") in {"done", "skipped_done"}]
+
+            running_avg_nmi = _safe_mean([r.get("oracle_nmi") for r in done_rows])
+            running_avg_ari = _safe_mean([r.get("oracle_ari") for r in done_rows])
+            running_avg_noise = _safe_mean([r.get("avg_noise_fraction_seen") for r in done_rows])
+            running_avg_unseen = _safe_mean([r.get("avg_unseen_fraction") for r in done_rows])
+
+            if reporter is not None and hasattr(reporter, "log_event"):
+                reporter.log_event(
+                    {
+                        "summary/running_done": run_summary["done"],
+                        "summary/running_failed": run_summary["failed"],
+                        "summary/running_skipped_done": run_summary["skipped_done"],
+                        "summary/running_avg_oracle_nmi": running_avg_nmi,
+                        "summary/running_avg_oracle_ari": running_avg_ari,
+                        "summary/running_avg_noise_fraction_seen": running_avg_noise,
+                        "summary/running_avg_unseen_fraction": running_avg_unseen,
+                        "progress/heartbeat": time.time(),
+                    }
+                )
+
             if not continue_on_error:
                 break
 
     if reporter is not None:
         reporter.log_summary(run_summary)
 
+        reporter.log_event({"summary": run_summary})
     return run_summary

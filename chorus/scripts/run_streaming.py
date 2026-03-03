@@ -31,6 +31,11 @@ class CombinedReporter:
         for reporter in self.reporters:
             reporter.log_summary(summary)
 
+    def log_event(self, payload):
+        for reporter in self.reporters:
+            if hasattr(reporter, "log_event"):
+                reporter.log_event(payload)
+
     def finish(self):
         for reporter in self.reporters:
             reporter.finish()
