@@ -277,6 +277,10 @@ def run_streaming_scannet(
                 )
                 write_scene_manifest(scene_dir, manifest)
 
+                existing_quality_summary = {}
+                if existing_summary is not None:
+                    existing_quality_summary = _flatten_scene_quality(existing_summary)
+
                 result = {
                     "scene_id": scene_id,
                     "scene_dir": str(scene_dir),
@@ -289,6 +293,7 @@ def run_streaming_scannet(
                     "downloaded": False,
                     "download_attempts": 0,
                     "manifest_path": str(manifest_path),
+                    **existing_quality_summary,
                 }
                 run_summary["done"] += 1
                 run_summary["skipped_done"] += 1
