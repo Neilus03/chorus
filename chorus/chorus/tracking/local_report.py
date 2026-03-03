@@ -1,108 +1,72 @@
-
 from __future__ import annotations
 
+import csv
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 
-def utcnow_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+class LocalTableReporter:
+    def __init__(self, report_dir: Path):
+        self.report_dir = Path(report_dir)
+        self.report_dir.mkdir(parents=True, exist_ok=True)
 
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.scene_csv_path = self.report_dir / f"scene_table_{timestamp}.csv"
+        self.summary_json_path = self.report_dir / "latest_run_summary.json"
 
-def init_scene_manifest(
-    scene_id: str,
-    scene_dir: Path,
-    dataset: str,
-    granularities: list[float],
-    frame_skip: int,
-    run_oracle_eval: bool,
-    export_litept: bool,
-    overwrite_existing: bool,
-    auto_download_missing: bool,
-    cleanup_after_success: bool,
-    download_only: bool,
-) -> dict[str, Any]:
-    return {
-        "scene_id": scene_id,
-        "scene_dir": str(scene_dir),
-        "dataset": dataset,
-        "status": "running",
-        "started_at": utcnow_iso(),
-        "updated_at": utcnow_iso(),
-        "finished_at": None,
-        "config": {
-            "granularities": [float(g) for g in granularities],
-            "frame_skip": int(frame_skip),
-            "run_oracle_eval": bool(run_oracle_eval),
-            "export_litept": bool(export_litept),
-            "overwrite_existing": bool(overwrite_existing),
-            "auto_download_missing": bool(auto_download_missing),
-            "cleanup_after_success": bool(cleanup_after_success),
-            "download_only": bool(download_only),
-        },
-        "download": {
-            "attempts": 0,
-            "downloaded": False,
-            "errors": [],
-            "status": "not_started",
-        },
-        "verification": {
-            "ok": False,
-            "missing_outputs": [],
-        },
-        "cleanup": None,
-        "summary_path": None,
-        "reason": None,
-        "error": None,
-        "events": [],
-    }
+        self._fieldnames = [
+            "scene_id",
+            "status",
+            "duration_seconds",
+            "downloaded",
+            "download_attempts",
+            "cleanup_deleted_count",
+            "reason",
+            "error",
+            "summary_path",
+            "manifest_path",
+        ]
+        self._rows: list[dict[str, Any]] = []
 
+        with self.scene_csv_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self._fieldnames)
+            writer.writeheader()
 
-def add_manifest_event(
-    manifest: dict[str, Any],
-    phase: str,
-    status: str,
-    message: str | None = None,
-    extra: dict[str, Any] | None = None,
-) -> None:
-    event = {
-        "time": utcnow_iso(),
-        "phase": phase,
-        "status": status,
-        "message": message,
-    }
-    if extra:
-        event["extra"] = extra
-    manifest.setdefault("events", []).append(event)
-    manifest["updated_at"] = utcnow_iso()
+    def log_scene(self, result: dict[str, Any]) -> None:
+        cleanup = result.get("cleanup")
+        cleanup_deleted_count = 0
+        if isinstance(cleanup, dict):
+            cleanup_deleted_count = len(cleanup.get("deleted", []))
 
+        row = {
+            "scene_id": result.get("scene_id"),
+            "status": result.get("status"),
+            "duration_seconds": result.get("duration_seconds", 0.0),
+            "downloaded": bool(result.get("downloaded", False)),
+            "download_attempts": int(result.get("download_attempts", 0)),
+            "cleanup_deleted_count": cleanup_deleted_count,
+            "reason": result.get("reason"),
+            "error": result.get("error"),
+            "summary_path": result.get("summary_path"),
+            "manifest_path": result.get("manifest_path"),
+        }
+        self._rows.append(row)
 
-def finalize_scene_manifest(
-    manifest: dict[str, Any],
-    status: str,
-    reason: str | None = None,
-    error: str | None = None,
-    summary_path: str | None = None,
-    cleanup: dict[str, Any] | None = None,
-    verification: dict[str, Any] | None = None,
-) -> None:
-    manifest["status"] = status
-    manifest["reason"] = reason
-    manifest["error"] = error
-    manifest["summary_path"] = summary_path
-    manifest["cleanup"] = cleanup
-    if verification is not None:
-        manifest["verification"] = verification
-    manifest["updated_at"] = utcnow_iso()
-    manifest["finished_at"] = utcnow_iso()
+        with self.scene_csv_path.open("a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self._fieldnames)
+            writer.writerow(row)
 
+    def log_summary(self, summary: dict[str, Any]) -> None:
+        payload = {
+            "summary": summary,
+            "scene_rows": self._rows,
+            "scene_csv_path": str(self.scene_csv_path),
+            "updated_at": datetime.now().isoformat(),
+        }
+        with self.summary_json_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
 
-def write_scene_manifest(scene_dir: Path, manifest: dict[str, Any]) -> Path:
-    scene_dir = Path(scene_dir)
-    scene_dir.mkdir(parents=True, exist_ok=True)
-    path = scene_dir / "scene_manifest.json"
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
-    return path
+    def finish(self) -> None:
+        pass
