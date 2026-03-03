@@ -147,6 +147,47 @@ def _ensure_scene_available(
         f"download failed after {max_download_retries} attempts",
     )
 
+def _flatten_scene_quality(scene_summary: dict[str, Any]) -> dict[str, Any]:
+    flat: dict[str, Any] = {}
+
+    scene_metrics = scene_summary.get("scene_intrinsic_metrics", {}) or {}
+    flat["avg_noise_fraction_seen"] = scene_metrics.get("avg_noise_fraction_seen")
+    flat["avg_unseen_fraction"] = scene_metrics.get("avg_unseen_fraction")
+    flat["avg_labeled_fraction_seen"] = scene_metrics.get("avg_labeled_fraction_seen")
+    flat["total_clusters_across_granularities"] = scene_metrics.get("total_clusters_across_granularities")
+
+    teacher_by_g = {}
+    for t in scene_summary.get("teacher_outputs", []) or []:
+        g = f"g{t.get('granularity')}"
+        teacher_by_g[g] = t
+
+    cluster_by_g = {}
+    for c in scene_summary.get("cluster_outputs", []) or []:
+        g = f"g{c.get('granularity')}"
+        cluster_by_g[g] = c
+
+    by_g = scene_metrics.get("by_granularity", {}) or {}
+    granularities = sorted(set(list(teacher_by_g.keys()) + list(cluster_by_g.keys()) + list(by_g.keys())))
+
+    total_teacher_masks = 0
+    for g in granularities:
+        teacher_total_masks = (teacher_by_g.get(g, {}) or {}).get("total_masks")
+        if teacher_total_masks is not None:
+            total_teacher_masks += int(teacher_total_masks)
+        flat[f"teacher_total_masks_{g}"] = teacher_total_masks
+
+        cluster_stats = (cluster_by_g.get(g, {}) or {}).get("stats", {}) or {}
+        flat[f"clusters_{g}"] = cluster_stats.get("num_clusters")
+        flat[f"used_frames_{g}"] = cluster_stats.get("used_frames")
+        flat[f"num_2d_masks_total_{g}"] = cluster_stats.get("num_2d_masks_total")
+
+        g_metrics = by_g.get(g, {}) or {}
+        flat[f"noise_fraction_seen_{g}"] = g_metrics.get("noise_fraction_seen")
+        flat[f"unseen_fraction_{g}"] = g_metrics.get("unseen_points_fraction")
+        flat[f"labeled_fraction_seen_{g}"] = g_metrics.get("labeled_points_fraction_seen")
+
+    flat["total_teacher_masks_across_granularities"] = total_teacher_masks
+    return flat
 
 def run_streaming_scannet(
     scans_root: Path,
@@ -170,6 +211,8 @@ def run_streaming_scannet(
 ) -> dict[str, Any]:
     scans_root = Path(scans_root)
 
+
+
     run_summary: dict[str, Any] = {
         "scans_root": str(scans_root),
         "num_scenes_requested": len(scene_ids),
@@ -190,6 +233,7 @@ def run_streaming_scannet(
     }
 
     total = len(scene_ids)
+
 
     for idx, scene_id in enumerate(scene_ids, start=1):
         _print_scene_header(idx, total, scene_id)
@@ -347,6 +391,7 @@ def run_streaming_scannet(
                 reporter.log_scene(result)
             continue
 
+        quality_summary: dict[str, Any] = {}
         try:
             add_manifest_event(manifest, phase="pipeline", status="running", message="running CHORUS scene pipeline")
             write_scene_manifest(scene_dir, manifest)
@@ -364,6 +409,8 @@ def run_streaming_scannet(
                 run_oracle_eval=run_oracle_eval,
                 export_litept=export_litept,
             )
+
+            quality_summary = _flatten_scene_quality(scene_summary)
 
             verified_ok, _, missing = verify_scene_completion_from_summary(
                 scene_dir=scene_dir,
@@ -400,6 +447,7 @@ def run_streaming_scannet(
                     "downloaded": downloaded,
                     "download_attempts": download_attempts,
                     "manifest_path": str(manifest_path),
+                    **quality_summary,
                 }
                 run_summary["failed"] += 1
                 run_summary["failed_scenes"].append(scene_id)
@@ -463,6 +511,7 @@ def run_streaming_scannet(
                         "download_attempts": download_attempts,
                         "cleanup": cleanup_info,
                         "manifest_path": str(manifest_path),
+                        **quality_summary,
                     }
                     run_summary["failed"] += 1
                     run_summary["failed_scenes"].append(scene_id)
@@ -498,6 +547,7 @@ def run_streaming_scannet(
                 "download_attempts": download_attempts,
                 "cleanup": cleanup_info,
                 "manifest_path": str(manifest_path),
+                **quality_summary,
             }
             run_summary["done"] += 1
             run_summary["scene_results"].append(result)
@@ -531,6 +581,7 @@ def run_streaming_scannet(
                 "downloaded": downloaded,
                 "download_attempts": download_attempts,
                 "manifest_path": str(manifest_path),
+                **quality_summary,
             }
             run_summary["failed"] += 1
             run_summary["failed_scenes"].append(scene_id)
