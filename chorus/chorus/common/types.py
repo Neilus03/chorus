@@ -42,6 +42,7 @@ class ClusterOutput:
     granularity: float
     labels: np.ndarray
     features: np.ndarray
+    seen_mask: np.ndarray
     ply_path: Optional[Path]
     labels_path: Optional[Path]
     stats: dict

@@ -120,19 +120,35 @@ def run_project_cluster_stage(
     )
 
     votes_per_point = np.asarray(point_mask_matrix.sum(axis=1)).reshape(-1)
-    unseen_points = int(np.sum(votes_per_point == 0))
+    seen_mask = votes_per_point > 0
+    num_seen_points = int(np.sum(seen_mask))
+    unseen_points = int(num_points - num_seen_points)
 
-    features, svd_stats = compute_svd_features(
-        point_mask_matrix=point_mask_matrix,
+    if num_seen_points == 0:
+        raise RuntimeError("No 3D points received any valid 2D mask votes. Check teacher outputs and paths.")
+
+    point_mask_matrix_seen = point_mask_matrix[seen_mask]
+
+    features_seen, svd_stats = compute_svd_features(
+        point_mask_matrix=point_mask_matrix_seen,
         n_components=svd_components,
     )
 
-    labels, clustering_stats = cluster_features(
-        features=features,
+    labels_seen, clustering_stats = cluster_features(
+        features_seen,
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
         cluster_selection_epsilon=cluster_selection_epsilon,
     )
+
+    full_labels = np.full(num_points, -1, dtype=np.int32)
+    full_labels[seen_mask] = labels_seen
+
+    full_features = np.zeros((num_points, features_seen.shape[1]), dtype=features_seen.dtype)
+    full_features[seen_mask] = features_seen
+
+    num_labeled_points = int(np.sum(full_labels >= 0))
+    num_noise_points_seen = int(np.sum(seen_mask & (full_labels < 0)))
 
     labels_path = None
     ply_path = None
@@ -145,8 +161,16 @@ def run_project_cluster_stage(
         "num_points": int(num_points),
         "used_frames": int(used_frames),
         "skipped_frames": int(skipped_frames),
+        "num_seen_points": int(num_seen_points),
+        "seen_points_fraction": float(num_seen_points / max(num_points, 1)),
         "unseen_points": int(unseen_points),
         "unseen_points_fraction": float(unseen_points / max(num_points, 1)),
+        "num_labeled_points": int(num_labeled_points),
+        "labeled_points_fraction": float(num_labeled_points / max(num_points, 1)),
+        "labeled_points_fraction_seen": float(num_labeled_points / max(num_seen_points, 1)),
+        "num_noise_points_seen": int(num_noise_points_seen),
+        "noise_fraction_seen": float(num_noise_points_seen / max(num_seen_points, 1)),
+        "noise_fraction_all_points": float(num_noise_points_seen / max(num_points, 1)),
         **voting_stats,
         **svd_stats,
         **clustering_stats,
@@ -154,8 +178,9 @@ def run_project_cluster_stage(
 
     cluster_output = ClusterOutput(
         granularity=teacher_output.granularity,
-        labels=labels,
-        features=features,
+        labels=full_labels,
+        features=full_features,
+        seen_mask=seen_mask,
         ply_path=None,
         labels_path=None,
         stats=stats,
@@ -165,13 +190,13 @@ def run_project_cluster_stage(
 
     if save_outputs:
         labels_path = adapter.scene_root / f"chorus_instance_labels_g{teacher_output.granularity}.npy"
-        np.save(labels_path, labels)
+        np.save(labels_path, full_labels)
 
         features_path = adapter.scene_root / f"svd_features_g{teacher_output.granularity}.npy"
-        np.save(features_path, features)
+        np.save(features_path, full_features)
 
         ply_path = adapter.scene_root / f"chorus_instance_result_g{teacher_output.granularity}.ply"
-        _save_colored_point_cloud(points_3d=points_3d, labels=labels, out_path=ply_path)
+        _save_colored_point_cloud(points_3d=points_3d, labels=full_labels, out_path=ply_path)
 
         diagnostics_path = adapter.scene_root / f"diagnostics_g{teacher_output.granularity}.json"
         save_json(
@@ -191,14 +216,15 @@ def run_project_cluster_stage(
 
     print(
         f"Project+Cluster complete: scene={adapter.scene_id}, granularity={teacher_output.granularity}, "
-        f"clusters={stats['num_clusters']}, noise_fraction={stats['noise_fraction']:.3f}, "
+        f"clusters={stats['num_clusters']}, noise_fraction_seen={stats['noise_fraction_seen']:.3f}, "
         f"unseen_fraction={stats['unseen_points_fraction']:.3f}"
     )
 
     return ClusterOutput(
         granularity=teacher_output.granularity,
-        labels=labels,
-        features=features,
+        labels=full_labels,
+        features=full_features,
+        seen_mask=seen_mask,
         ply_path=ply_path,
         labels_path=labels_path,
         stats=stats,
