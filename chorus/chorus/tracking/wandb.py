@@ -56,6 +56,8 @@ class WandbReporter:
             "download_attempts": int(result.get("download_attempts", 0)),
             "cleanup_deleted_count": cleanup_deleted_count,
             "reason": result.get("reason"),
+            "oracle_nmi": result.get("oracle_nmi"),
+            "oracle_ari": result.get("oracle_ari"),
         }
         self._scene_rows.append(row)
 
@@ -67,9 +69,11 @@ class WandbReporter:
                 "scene/downloaded": int(bool(result.get("downloaded", False))),
                 "scene/download_attempts": int(result.get("download_attempts", 0)),
                 "scene/cleanup_deleted_count": cleanup_deleted_count,
+                "scene/oracle_nmi": result.get("oracle_nmi"),
+                "scene/oracle_ari": result.get("oracle_ari"),
             }
         )
-
+        
     def log_summary(self, summary: dict[str, Any]) -> None:
         if not self.enabled or self.run is None or self._wandb is None:
             return

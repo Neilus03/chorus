@@ -156,6 +156,11 @@ def _flatten_scene_quality(scene_summary: dict[str, Any]) -> dict[str, Any]:
     flat["avg_labeled_fraction_seen"] = scene_metrics.get("avg_labeled_fraction_seen")
     flat["total_clusters_across_granularities"] = scene_metrics.get("total_clusters_across_granularities")
 
+    oracle_summary = scene_summary.get("oracle_summary", {}) or {}
+    clustering_metrics = oracle_summary.get("clustering_metrics", {}) or {}
+    flat["oracle_nmi"] = clustering_metrics.get("NMI")
+    flat["oracle_ari"] = clustering_metrics.get("ARI")
+
     teacher_by_g = {}
     for t in scene_summary.get("teacher_outputs", []) or []:
         g = f"g{t.get('granularity')}"
