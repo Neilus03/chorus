@@ -56,6 +56,25 @@ class WandbReporter:
             "reason": result.get("reason"),
             "oracle_nmi": result.get("oracle_nmi"),
             "oracle_ari": result.get("oracle_ari"),
+            "oracle_ap25_small": result.get("oracle_ap25_small"),
+            "oracle_ap50_small": result.get("oracle_ap50_small"),
+            "oracle_ap25_medium": result.get("oracle_ap25_medium"),
+            "oracle_ap50_medium": result.get("oracle_ap50_medium"),
+            "oracle_ap25_large": result.get("oracle_ap25_large"),
+            "oracle_ap50_large": result.get("oracle_ap50_large"),
+            "oracle_map_25_95_small": result.get("oracle_map_25_95_small"),
+            "oracle_map_25_95_medium": result.get("oracle_map_25_95_medium"),
+            "oracle_map_25_95_large": result.get("oracle_map_25_95_large"),
+            "oracle_topk_iou025_r1": result.get("oracle_topk_iou025_r1"),
+            "oracle_topk_iou025_r3": result.get("oracle_topk_iou025_r3"),
+            "oracle_topk_iou025_r5": result.get("oracle_topk_iou025_r5"),
+            "oracle_topk_iou050_r1": result.get("oracle_topk_iou050_r1"),
+            "oracle_topk_iou050_r3": result.get("oracle_topk_iou050_r3"),
+            "oracle_topk_iou050_r5": result.get("oracle_topk_iou050_r5"),
+            "oracle_winner_share_g0_2": result.get("oracle_winner_share_g0_2"),
+            "oracle_winner_share_g0_5": result.get("oracle_winner_share_g0_5"),
+            "oracle_winner_share_g0_8": result.get("oracle_winner_share_g0_8"),
+            "oracle_winner_share_no_match": result.get("oracle_winner_share_no_match"),
         }
         self._scene_rows.append(row)
 
@@ -66,6 +85,25 @@ class WandbReporter:
             "scene/downloaded": int(bool(result.get("downloaded", False))),
             "scene/download_attempts": int(result.get("download_attempts", 0)),
             "scene/cleanup_deleted_count": cleanup_deleted_count,
+            "scene/oracle_ap25_small": result.get("oracle_ap25_small"),
+            "scene/oracle_ap50_small": result.get("oracle_ap50_small"),
+            "scene/oracle_ap25_medium": result.get("oracle_ap25_medium"),
+            "scene/oracle_ap50_medium": result.get("oracle_ap50_medium"),
+            "scene/oracle_ap25_large": result.get("oracle_ap25_large"),
+            "scene/oracle_ap50_large": result.get("oracle_ap50_large"),
+            "scene/oracle_map_25_95_small": result.get("oracle_map_25_95_small"),
+            "scene/oracle_map_25_95_medium": result.get("oracle_map_25_95_medium"),
+            "scene/oracle_map_25_95_large": result.get("oracle_map_25_95_large"),
+            "scene/oracle_topk_iou025_r1": result.get("oracle_topk_iou025_r1"),
+            "scene/oracle_topk_iou025_r3": result.get("oracle_topk_iou025_r3"),
+            "scene/oracle_topk_iou025_r5": result.get("oracle_topk_iou025_r5"),
+            "scene/oracle_topk_iou050_r1": result.get("oracle_topk_iou050_r1"),
+            "scene/oracle_topk_iou050_r3": result.get("oracle_topk_iou050_r3"),
+            "scene/oracle_topk_iou050_r5": result.get("oracle_topk_iou050_r5"),
+            "scene/oracle_winner_share_g0_2": result.get("oracle_winner_share_g0_2"),
+            "scene/oracle_winner_share_g0_5": result.get("oracle_winner_share_g0_5"),
+            "scene/oracle_winner_share_g0_8": result.get("oracle_winner_share_g0_8"),
+            "scene/oracle_winner_share_no_match": result.get("oracle_winner_share_no_match"),
         }
 
         for key, value in result.items():
@@ -80,6 +118,25 @@ class WandbReporter:
                 "existing_summary",
                 "cleanup",
                 "missing_outputs",
+                "oracle_ap25_small",
+                "oracle_ap50_small",
+                "oracle_ap25_medium",
+                "oracle_ap50_medium",
+                "oracle_ap25_large",
+                "oracle_ap50_large",
+                "oracle_map_25_95_small",
+                "oracle_map_25_95_medium",
+                "oracle_map_25_95_large",
+                "oracle_topk_iou025_r1",
+                "oracle_topk_iou025_r3",
+                "oracle_topk_iou025_r5",
+                "oracle_topk_iou050_r1",
+                "oracle_topk_iou050_r3",
+                "oracle_topk_iou050_r5",
+                "oracle_winner_share_g0_2",
+                "oracle_winner_share_g0_5",
+                "oracle_winner_share_g0_8",
+                "oracle_winner_share_no_match",
             }:
                 continue
 
@@ -88,7 +145,7 @@ class WandbReporter:
 
         self.run.log(payload)
 
-        
+
     def log_summary(self, summary: dict[str, Any]) -> None:
         if not self.enabled or self.run is None or self._wandb is None:
             return
@@ -104,6 +161,25 @@ class WandbReporter:
                 "reason",
                 "oracle_nmi",
                 "oracle_ari",
+                "oracle_ap25_small",
+                "oracle_ap50_small",
+                "oracle_ap25_medium",
+                "oracle_ap50_medium",
+                "oracle_ap25_large",
+                "oracle_ap50_large",
+                "oracle_map_25_95_small",
+                "oracle_map_25_95_medium",
+                "oracle_map_25_95_large",
+                "oracle_topk_iou025_r1",
+                "oracle_topk_iou025_r3",
+                "oracle_topk_iou025_r5",
+                "oracle_topk_iou050_r1",
+                "oracle_topk_iou050_r3",
+                "oracle_topk_iou050_r5",
+                "oracle_winner_share_g0_2",
+                "oracle_winner_share_g0_5",
+                "oracle_winner_share_g0_8",
+                "oracle_winner_share_no_match",
             ]
         )
 
@@ -118,6 +194,25 @@ class WandbReporter:
                 row["reason"],
                 row["oracle_nmi"],
                 row["oracle_ari"],
+                row["oracle_ap25_small"],
+                row["oracle_ap50_small"],
+                row["oracle_ap25_medium"],
+                row["oracle_ap50_medium"],
+                row["oracle_ap25_large"],
+                row["oracle_ap50_large"],
+                row["oracle_map_25_95_small"],
+                row["oracle_map_25_95_medium"],
+                row["oracle_map_25_95_large"],
+                row["oracle_topk_iou025_r1"],
+                row["oracle_topk_iou025_r3"],
+                row["oracle_topk_iou025_r5"],
+                row["oracle_topk_iou050_r1"],
+                row["oracle_topk_iou050_r3"],
+                row["oracle_topk_iou050_r5"],
+                row["oracle_winner_share_g0_2"],
+                row["oracle_winner_share_g0_5"],
+                row["oracle_winner_share_g0_8"],
+                row["oracle_winner_share_no_match"],
             )
 
         self.run.log({"scene_table": table})
