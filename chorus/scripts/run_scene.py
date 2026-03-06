@@ -13,6 +13,11 @@ import os
 
 from chorus.core.pipeline.scene_pipeline import run_scene_pipeline
 from chorus.core.teacher.unsamv2 import UnSAMv2Teacher
+from chorus.datasets.scannet.benchmark import (
+    DEFAULT_SCANNET_EVAL_BENCHMARKS,
+    parse_scannet_eval_benchmarks,
+    primary_scannet_eval_benchmark,
+)
 from chorus.datasets.scannet.adapter import ScanNetSceneAdapter
 
 def _parse_args() -> argparse.Namespace:
@@ -86,6 +91,15 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable LitePT pack export",
     )
+    parser.add_argument(
+        "--scannet-eval-benchmark",
+        type=str,
+        default=os.environ.get(
+            "CHORUS_SCANNET_EVAL_BENCHMARK",
+            ",".join(DEFAULT_SCANNET_EVAL_BENCHMARKS),
+        ),
+        help="Comma-separated ScanNet oracle benchmarks to run, for example 'scannet20,scannet200'.",
+    )
     return parser.parse_args()
 
 
@@ -93,7 +107,11 @@ def main() -> None:
     args = _parse_args()
 
     granularities = [float(g.strip()) for g in args.granularities.split(",") if g.strip()]
-    adapter = ScanNetSceneAdapter(scene_root=args.scene_dir)
+    scannet_eval_benchmarks = parse_scannet_eval_benchmarks(args.scannet_eval_benchmark)
+    adapter = ScanNetSceneAdapter(
+        scene_root=args.scene_dir,
+        eval_benchmark=primary_scannet_eval_benchmark(scannet_eval_benchmarks),
+    )
 
     teacher = UnSAMv2Teacher(
         device=args.device,
@@ -105,6 +123,7 @@ def main() -> None:
         adapter=adapter,
         teacher=teacher,
         granularities=granularities,
+        scannet_eval_benchmarks=scannet_eval_benchmarks,
         frame_skip=args.frame_skip,
         svd_components=args.svd_components,
         min_cluster_size=args.min_cluster_size,

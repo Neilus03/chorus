@@ -8,6 +8,11 @@ from plyfile import PlyData, PlyElement
 
 from chorus.common.types import ClusterOutput
 from chorus.datasets.base import SceneAdapter
+from chorus.datasets.scannet.benchmark import (
+    SCANNET_EVAL_BENCHMARK_20,
+    normalize_scannet_eval_benchmark,
+)
+from chorus.datasets.scannet.gt import load_scannet_gt_instance_ids
 
 
 def build_proposals_from_cluster_outputs(
@@ -346,11 +351,21 @@ def compute_clustering_metrics(
 def evaluate_and_save_scannet_oracle(
     adapter: SceneAdapter,
     cluster_outputs: list[ClusterOutput],
+    eval_benchmark: str = SCANNET_EVAL_BENCHMARK_20,
     min_iou_for_ply: float = 0.1,
 ) -> dict:
-    gt_ids = adapter.load_gt_instance_ids()
-    if gt_ids is None:
-        raise RuntimeError("ScanNet oracle evaluation requires GT instance ids.")
+    eval_benchmark = normalize_scannet_eval_benchmark(eval_benchmark)
+
+    if adapter.dataset_name != "scannet":
+        gt_ids = adapter.load_gt_instance_ids()
+        if gt_ids is None:
+            raise RuntimeError("ScanNet oracle evaluation requires GT instance ids.")
+    else:
+        gt_ids = load_scannet_gt_instance_ids(
+            adapter.scene_root,
+            adapter.scene_id,
+            eval_benchmark=eval_benchmark,
+        )
 
     proposals, proposal_sources = build_proposals_from_cluster_outputs(cluster_outputs)
     if len(proposals) == 0:
@@ -370,9 +385,10 @@ def evaluate_and_save_scannet_oracle(
     clustering_metrics = compute_clustering_metrics(gt_ids, oracle_best_labels)
 
     scene_root = adapter.scene_root
-    metrics_path = scene_root / "oracle_metrics.json"
-    labels_path = scene_root / "chorus_oracle_best_combined_labels.npy"
-    ply_path = scene_root / "chorus_oracle_best_combined.ply"
+    suffix = "" if eval_benchmark == SCANNET_EVAL_BENCHMARK_20 else f"_{eval_benchmark}"
+    metrics_path = scene_root / f"oracle_metrics{suffix}.json"
+    labels_path = scene_root / f"chorus_oracle_best_combined_labels{suffix}.npy"
+    ply_path = scene_root / f"chorus_oracle_best_combined{suffix}.ply"
 
     results_to_save = dict(oracle_results)
     results_to_save["_extras"] = additional_metrics
@@ -393,12 +409,14 @@ def evaluate_and_save_scannet_oracle(
     print(f"Saved oracle metrics: {metrics_path}")
     print(f"Saved oracle pooled labels: {labels_path}")
     print(f"Saved oracle pooled ply: {ply_path}")
+    print(f"ScanNet oracle benchmark: {eval_benchmark}")
     print(
         "Clustering consistency metrics (GT vs oracle labels on foreground points): "
         f"NMI={clustering_metrics['NMI']:.4f}, ARI={clustering_metrics['ARI']:.4f}"
     )
 
     return {
+        "eval_benchmark": eval_benchmark,
         "metrics_path": metrics_path,
         "labels_path": labels_path,
         "ply_path": ply_path,

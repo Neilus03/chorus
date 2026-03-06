@@ -14,6 +14,7 @@ from chorus.common.manifest import (
 from chorus.core.pipeline.scene_pipeline import run_scene_pipeline
 from chorus.core.teacher.base import TeacherModel
 from chorus.datasets.scannet.adapter import ScanNetSceneAdapter
+from chorus.datasets.scannet.benchmark import parse_scannet_eval_benchmarks
 from chorus.datasets.scannet.download import download_scene, load_release_scene_ids
 from chorus.datasets.scannet.prepare import is_rgbd_prepared
 from chorus.orchestrators.cleanup import cleanup_scene_intermediates
@@ -157,6 +158,59 @@ def _bucket_key(name: str) -> str | None:
         return "large"
     return None
 
+
+def _oracle_metric_suffix(benchmark: str | None) -> str:
+    if benchmark in {None, "", "scannet20"}:
+        return ""
+    return f"_{benchmark}"
+
+
+def _flatten_single_oracle_summary(
+    flat: dict[str, Any],
+    oracle_summary: dict[str, Any],
+    benchmark: str | None,
+) -> None:
+    suffix = _oracle_metric_suffix(benchmark)
+
+    clustering_metrics = oracle_summary.get("clustering_metrics", {}) or {}
+    flat[f"oracle_nmi{suffix}"] = clustering_metrics.get("NMI")
+    flat[f"oracle_ari{suffix}"] = clustering_metrics.get("ARI")
+
+    oracle_results = oracle_summary.get("oracle_results", {}) or {}
+    for bucket_name, bucket_metrics in oracle_results.items():
+        bucket = _bucket_key(bucket_name)
+        if bucket is None or not isinstance(bucket_metrics, dict):
+            continue
+        flat[f"oracle_ap25_{bucket}{suffix}"] = bucket_metrics.get("AP25")
+        flat[f"oracle_ap50_{bucket}{suffix}"] = bucket_metrics.get("AP50")
+        flat[f"oracle_count_{bucket}{suffix}"] = bucket_metrics.get("Count")
+
+    additional_metrics = oracle_summary.get("additional_metrics", {}) or {}
+
+    map_by_bucket = additional_metrics.get("oracle_mAP_25_95_by_bucket", {}) or {}
+    for bucket_name, value in map_by_bucket.items():
+        bucket = _bucket_key(bucket_name)
+        if bucket is None:
+            continue
+        flat[f"oracle_map_25_95_{bucket}{suffix}"] = value
+
+    topk = additional_metrics.get("topk_proposal_coverage", {}) or {}
+
+    topk_025 = topk.get("iou_0.25", {}) or {}
+    flat[f"oracle_topk_iou025_r1{suffix}"] = topk_025.get("R_at_least_1")
+    flat[f"oracle_topk_iou025_r3{suffix}"] = topk_025.get("R_at_least_3")
+    flat[f"oracle_topk_iou025_r5{suffix}"] = topk_025.get("R_at_least_5")
+
+    topk_050 = topk.get("iou_0.50", {}) or {}
+    flat[f"oracle_topk_iou050_r1{suffix}"] = topk_050.get("R_at_least_1")
+    flat[f"oracle_topk_iou050_r3{suffix}"] = topk_050.get("R_at_least_3")
+    flat[f"oracle_topk_iou050_r5{suffix}"] = topk_050.get("R_at_least_5")
+
+    winner_share = additional_metrics.get("winner_granularity_share", {}) or {}
+    for key, value in winner_share.items():
+        safe_key = str(key).replace(".", "_")
+        flat[f"oracle_winner_share_{safe_key}{suffix}"] = value
+
 def _flatten_scene_quality(scene_summary: dict[str, Any]) -> dict[str, Any]:
     flat: dict[str, Any] = {}
 
@@ -166,45 +220,14 @@ def _flatten_scene_quality(scene_summary: dict[str, Any]) -> dict[str, Any]:
     flat["avg_labeled_fraction_seen"] = scene_metrics.get("avg_labeled_fraction_seen")
     flat["total_clusters_across_granularities"] = scene_metrics.get("total_clusters_across_granularities")
 
-    oracle_summary = scene_summary.get("oracle_summary", {}) or {}
-    clustering_metrics = oracle_summary.get("clustering_metrics", {}) or {}
-    flat["oracle_nmi"] = clustering_metrics.get("NMI")
-    flat["oracle_ari"] = clustering_metrics.get("ARI")
-
-    oracle_results = oracle_summary.get("oracle_results", {}) or {}
-    for bucket_name, bucket_metrics in oracle_results.items():
-        bucket = _bucket_key(bucket_name)
-        if bucket is None or not isinstance(bucket_metrics, dict):
-            continue
-        flat[f"oracle_ap25_{bucket}"] = bucket_metrics.get("AP25")
-        flat[f"oracle_ap50_{bucket}"] = bucket_metrics.get("AP50")
-        flat[f"oracle_count_{bucket}"] = bucket_metrics.get("Count")
-
-    additional_metrics = oracle_summary.get("additional_metrics", {}) or {}
-
-    map_by_bucket = additional_metrics.get("oracle_mAP_25_95_by_bucket", {}) or {}
-    for bucket_name, value in map_by_bucket.items():
-        bucket = _bucket_key(bucket_name)
-        if bucket is None:
-            continue
-        flat[f"oracle_map_25_95_{bucket}"] = value
-
-    topk = additional_metrics.get("topk_proposal_coverage", {}) or {}
-
-    topk_025 = topk.get("iou_0.25", {}) or {}
-    flat["oracle_topk_iou025_r1"] = topk_025.get("R_at_least_1")
-    flat["oracle_topk_iou025_r3"] = topk_025.get("R_at_least_3")
-    flat["oracle_topk_iou025_r5"] = topk_025.get("R_at_least_5")
-
-    topk_050 = topk.get("iou_0.50", {}) or {}
-    flat["oracle_topk_iou050_r1"] = topk_050.get("R_at_least_1")
-    flat["oracle_topk_iou050_r3"] = topk_050.get("R_at_least_3")
-    flat["oracle_topk_iou050_r5"] = topk_050.get("R_at_least_5")
-
-    winner_share = additional_metrics.get("winner_granularity_share", {}) or {}
-    for key, value in winner_share.items():
-        safe_key = str(key).replace(".", "_")
-        flat[f"oracle_winner_share_{safe_key}"] = value
+    oracle_summaries = scene_summary.get("oracle_summaries", {}) or {}
+    if oracle_summaries:
+        for benchmark, oracle_summary in oracle_summaries.items():
+            _flatten_single_oracle_summary(flat, oracle_summary, benchmark)
+    else:
+        oracle_summary = scene_summary.get("oracle_summary", {}) or {}
+        if oracle_summary:
+            _flatten_single_oracle_summary(flat, oracle_summary, "scannet20")
 
     teacher_by_g = {}
     for t in scene_summary.get("teacher_outputs", []) or []:
@@ -251,6 +274,7 @@ def run_streaming_scannet(
     scene_ids: list[str],
     teacher: TeacherModel,
     granularities: list[float],
+    scannet_eval_benchmarks: list[str] | tuple[str, ...] | str | None = None,
     frame_skip: int = 10,
     svd_components: int = 32,
     min_cluster_size: int = 100,
@@ -273,6 +297,7 @@ def run_streaming_scannet(
     run_summary: dict[str, Any] = {
         "scans_root": str(scans_root),
         "num_scenes_requested": len(scene_ids),
+        "scannet_eval_benchmarks": list(parse_scannet_eval_benchmarks(scannet_eval_benchmarks)),
         "granularities": [float(g) for g in granularities],
         "frame_skip": int(frame_skip),
         "run_oracle_eval": bool(run_oracle_eval),
@@ -321,6 +346,7 @@ def run_streaming_scannet(
                 granularities=granularities,
                 require_oracle=run_oracle_eval,
                 require_litept=export_litept,
+                expected_eval_benchmarks=scannet_eval_benchmarks,
             )
 
             if is_complete:
@@ -364,6 +390,8 @@ def run_streaming_scannet(
 
                 running_avg_nmi = _safe_mean([r.get("oracle_nmi") for r in done_rows])
                 running_avg_ari = _safe_mean([r.get("oracle_ari") for r in done_rows])
+                running_avg_nmi_scannet200 = _safe_mean([r.get("oracle_nmi_scannet200") for r in done_rows])
+                running_avg_ari_scannet200 = _safe_mean([r.get("oracle_ari_scannet200") for r in done_rows])
                 running_avg_noise = _safe_mean([r.get("avg_noise_fraction_seen") for r in done_rows])
                 running_avg_unseen = _safe_mean([r.get("avg_unseen_fraction") for r in done_rows])
 
@@ -375,6 +403,8 @@ def run_streaming_scannet(
                             "summary/running_skipped_done": run_summary["skipped_done"],
                             "summary/running_avg_oracle_nmi": running_avg_nmi,
                             "summary/running_avg_oracle_ari": running_avg_ari,
+                            "summary/running_avg_oracle_nmi_scannet200": running_avg_nmi_scannet200,
+                            "summary/running_avg_oracle_ari_scannet200": running_avg_ari_scannet200,
                             "summary/running_avg_noise_fraction_seen": running_avg_noise,
                             "summary/running_avg_unseen_fraction": running_avg_unseen,
                             "progress/heartbeat": time.time(),
@@ -445,6 +475,8 @@ def run_streaming_scannet(
 
             running_avg_nmi = _safe_mean([r.get("oracle_nmi") for r in done_rows])
             running_avg_ari = _safe_mean([r.get("oracle_ari") for r in done_rows])
+            running_avg_nmi_scannet200 = _safe_mean([r.get("oracle_nmi_scannet200") for r in done_rows])
+            running_avg_ari_scannet200 = _safe_mean([r.get("oracle_ari_scannet200") for r in done_rows])
             running_avg_noise = _safe_mean([r.get("avg_noise_fraction_seen") for r in done_rows])
             running_avg_unseen = _safe_mean([r.get("avg_unseen_fraction") for r in done_rows])
 
@@ -456,6 +488,8 @@ def run_streaming_scannet(
                         "summary/running_skipped_done": run_summary["skipped_done"],
                         "summary/running_avg_oracle_nmi": running_avg_nmi,
                         "summary/running_avg_oracle_ari": running_avg_ari,
+                        "summary/running_avg_oracle_nmi_scannet200": running_avg_nmi_scannet200,
+                        "summary/running_avg_oracle_ari_scannet200": running_avg_ari_scannet200,
                         "summary/running_avg_noise_fraction_seen": running_avg_noise,
                         "summary/running_avg_unseen_fraction": running_avg_unseen,
                         "progress/heartbeat": time.time(),
@@ -502,6 +536,8 @@ def run_streaming_scannet(
 
             running_avg_nmi = _safe_mean([r.get("oracle_nmi") for r in done_rows])
             running_avg_ari = _safe_mean([r.get("oracle_ari") for r in done_rows])
+            running_avg_nmi_scannet200 = _safe_mean([r.get("oracle_nmi_scannet200") for r in done_rows])
+            running_avg_ari_scannet200 = _safe_mean([r.get("oracle_ari_scannet200") for r in done_rows])
             running_avg_noise = _safe_mean([r.get("avg_noise_fraction_seen") for r in done_rows])
             running_avg_unseen = _safe_mean([r.get("avg_unseen_fraction") for r in done_rows])
 
@@ -513,6 +549,8 @@ def run_streaming_scannet(
                         "summary/running_skipped_done": run_summary["skipped_done"],
                         "summary/running_avg_oracle_nmi": running_avg_nmi,
                         "summary/running_avg_oracle_ari": running_avg_ari,
+                        "summary/running_avg_oracle_nmi_scannet200": running_avg_nmi_scannet200,
+                        "summary/running_avg_oracle_ari_scannet200": running_avg_ari_scannet200,
                         "summary/running_avg_noise_fraction_seen": running_avg_noise,
                         "summary/running_avg_unseen_fraction": running_avg_unseen,
                         "progress/heartbeat": time.time(),
@@ -526,11 +564,15 @@ def run_streaming_scannet(
             add_manifest_event(manifest, phase="pipeline", status="running", message="running CHORUS scene pipeline")
             write_scene_manifest(scene_dir, manifest)
 
-            adapter = ScanNetSceneAdapter(scene_root=scene_dir)
+            adapter = ScanNetSceneAdapter(
+                scene_root=scene_dir,
+                eval_benchmark="scannet20",
+            )
             scene_summary = run_scene_pipeline(
                 adapter=adapter,
                 teacher=teacher,
                 granularities=granularities,
+                scannet_eval_benchmarks=scannet_eval_benchmarks,
                 frame_skip=frame_skip,
                 svd_components=svd_components,
                 min_cluster_size=min_cluster_size,
@@ -547,6 +589,7 @@ def run_streaming_scannet(
                 granularities=granularities,
                 require_oracle=run_oracle_eval,
                 require_litept=export_litept,
+                expected_eval_benchmarks=scannet_eval_benchmarks,
             )
 
             if not verified_ok:
@@ -591,6 +634,8 @@ def run_streaming_scannet(
 
                 running_avg_nmi = _safe_mean([r.get("oracle_nmi") for r in done_rows])
                 running_avg_ari = _safe_mean([r.get("oracle_ari") for r in done_rows])
+                running_avg_nmi_scannet200 = _safe_mean([r.get("oracle_nmi_scannet200") for r in done_rows])
+                running_avg_ari_scannet200 = _safe_mean([r.get("oracle_ari_scannet200") for r in done_rows])
                 running_avg_noise = _safe_mean([r.get("avg_noise_fraction_seen") for r in done_rows])
                 running_avg_unseen = _safe_mean([r.get("avg_unseen_fraction") for r in done_rows])
 
@@ -602,6 +647,8 @@ def run_streaming_scannet(
                             "summary/running_skipped_done": run_summary["skipped_done"],
                             "summary/running_avg_oracle_nmi": running_avg_nmi,
                             "summary/running_avg_oracle_ari": running_avg_ari,
+                            "summary/running_avg_oracle_nmi_scannet200": running_avg_nmi_scannet200,
+                            "summary/running_avg_oracle_ari_scannet200": running_avg_ari_scannet200,
                             "summary/running_avg_noise_fraction_seen": running_avg_noise,
                             "summary/running_avg_unseen_fraction": running_avg_unseen,
                             "progress/heartbeat": time.time(),
@@ -631,6 +678,7 @@ def run_streaming_scannet(
                     granularities=granularities,
                     require_oracle=run_oracle_eval,
                     require_litept=export_litept,
+                    expected_eval_benchmarks=scannet_eval_benchmarks,
                 )
 
                 if not verified_ok_after_cleanup:
@@ -677,6 +725,8 @@ def run_streaming_scannet(
 
                     running_avg_nmi = _safe_mean([r.get("oracle_nmi") for r in done_rows])
                     running_avg_ari = _safe_mean([r.get("oracle_ari") for r in done_rows])
+                    running_avg_nmi_scannet200 = _safe_mean([r.get("oracle_nmi_scannet200") for r in done_rows])
+                    running_avg_ari_scannet200 = _safe_mean([r.get("oracle_ari_scannet200") for r in done_rows])
                     running_avg_noise = _safe_mean([r.get("avg_noise_fraction_seen") for r in done_rows])
                     running_avg_unseen = _safe_mean([r.get("avg_unseen_fraction") for r in done_rows])
 
@@ -688,6 +738,8 @@ def run_streaming_scannet(
                                 "summary/running_skipped_done": run_summary["skipped_done"],
                                 "summary/running_avg_oracle_nmi": running_avg_nmi,
                                 "summary/running_avg_oracle_ari": running_avg_ari,
+                                "summary/running_avg_oracle_nmi_scannet200": running_avg_nmi_scannet200,
+                                "summary/running_avg_oracle_ari_scannet200": running_avg_ari_scannet200,
                                 "summary/running_avg_noise_fraction_seen": running_avg_noise,
                                 "summary/running_avg_unseen_fraction": running_avg_unseen,
                                 "progress/heartbeat": time.time(),
@@ -734,6 +786,8 @@ def run_streaming_scannet(
 
             running_avg_nmi = _safe_mean([r.get("oracle_nmi") for r in done_rows])
             running_avg_ari = _safe_mean([r.get("oracle_ari") for r in done_rows])
+            running_avg_nmi_scannet200 = _safe_mean([r.get("oracle_nmi_scannet200") for r in done_rows])
+            running_avg_ari_scannet200 = _safe_mean([r.get("oracle_ari_scannet200") for r in done_rows])
             running_avg_noise = _safe_mean([r.get("avg_noise_fraction_seen") for r in done_rows])
             running_avg_unseen = _safe_mean([r.get("avg_unseen_fraction") for r in done_rows])
 
@@ -745,6 +799,8 @@ def run_streaming_scannet(
                         "summary/running_skipped_done": run_summary["skipped_done"],
                         "summary/running_avg_oracle_nmi": running_avg_nmi,
                         "summary/running_avg_oracle_ari": running_avg_ari,
+                        "summary/running_avg_oracle_nmi_scannet200": running_avg_nmi_scannet200,
+                        "summary/running_avg_oracle_ari_scannet200": running_avg_ari_scannet200,
                         "summary/running_avg_noise_fraction_seen": running_avg_noise,
                         "summary/running_avg_unseen_fraction": running_avg_unseen,
                         "progress/heartbeat": time.time(),
@@ -791,6 +847,8 @@ def run_streaming_scannet(
 
             running_avg_nmi = _safe_mean([r.get("oracle_nmi") for r in done_rows])
             running_avg_ari = _safe_mean([r.get("oracle_ari") for r in done_rows])
+            running_avg_nmi_scannet200 = _safe_mean([r.get("oracle_nmi_scannet200") for r in done_rows])
+            running_avg_ari_scannet200 = _safe_mean([r.get("oracle_ari_scannet200") for r in done_rows])
             running_avg_noise = _safe_mean([r.get("avg_noise_fraction_seen") for r in done_rows])
             running_avg_unseen = _safe_mean([r.get("avg_unseen_fraction") for r in done_rows])
 
@@ -802,6 +860,8 @@ def run_streaming_scannet(
                         "summary/running_skipped_done": run_summary["skipped_done"],
                         "summary/running_avg_oracle_nmi": running_avg_nmi,
                         "summary/running_avg_oracle_ari": running_avg_ari,
+                        "summary/running_avg_oracle_nmi_scannet200": running_avg_nmi_scannet200,
+                        "summary/running_avg_oracle_ari_scannet200": running_avg_ari_scannet200,
                         "summary/running_avg_noise_fraction_seen": running_avg_noise,
                         "summary/running_avg_unseen_fraction": running_avg_unseen,
                         "progress/heartbeat": time.time(),

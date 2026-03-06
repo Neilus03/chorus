@@ -75,6 +75,14 @@ class WandbReporter:
             "oracle_winner_share_g0_5": result.get("oracle_winner_share_g0_5"),
             "oracle_winner_share_g0_8": result.get("oracle_winner_share_g0_8"),
             "oracle_winner_share_no_match": result.get("oracle_winner_share_no_match"),
+            "oracle_nmi_scannet200": result.get("oracle_nmi_scannet200"),
+            "oracle_ari_scannet200": result.get("oracle_ari_scannet200"),
+            "oracle_ap25_small_scannet200": result.get("oracle_ap25_small_scannet200"),
+            "oracle_ap50_small_scannet200": result.get("oracle_ap50_small_scannet200"),
+            "oracle_ap25_medium_scannet200": result.get("oracle_ap25_medium_scannet200"),
+            "oracle_ap50_medium_scannet200": result.get("oracle_ap50_medium_scannet200"),
+            "oracle_ap25_large_scannet200": result.get("oracle_ap25_large_scannet200"),
+            "oracle_ap50_large_scannet200": result.get("oracle_ap50_large_scannet200"),
         }
         self._scene_rows.append(row)
 
@@ -104,6 +112,14 @@ class WandbReporter:
             "scene/oracle_winner_share_g0_5": result.get("oracle_winner_share_g0_5"),
             "scene/oracle_winner_share_g0_8": result.get("oracle_winner_share_g0_8"),
             "scene/oracle_winner_share_no_match": result.get("oracle_winner_share_no_match"),
+            "scene/oracle_nmi_scannet200": result.get("oracle_nmi_scannet200"),
+            "scene/oracle_ari_scannet200": result.get("oracle_ari_scannet200"),
+            "scene/oracle_ap25_small_scannet200": result.get("oracle_ap25_small_scannet200"),
+            "scene/oracle_ap50_small_scannet200": result.get("oracle_ap50_small_scannet200"),
+            "scene/oracle_ap25_medium_scannet200": result.get("oracle_ap25_medium_scannet200"),
+            "scene/oracle_ap50_medium_scannet200": result.get("oracle_ap50_medium_scannet200"),
+            "scene/oracle_ap25_large_scannet200": result.get("oracle_ap25_large_scannet200"),
+            "scene/oracle_ap50_large_scannet200": result.get("oracle_ap50_large_scannet200"),
         }
 
         for key, value in result.items():
@@ -137,6 +153,14 @@ class WandbReporter:
                 "oracle_winner_share_g0_5",
                 "oracle_winner_share_g0_8",
                 "oracle_winner_share_no_match",
+                "oracle_nmi_scannet200",
+                "oracle_ari_scannet200",
+                "oracle_ap25_small_scannet200",
+                "oracle_ap50_small_scannet200",
+                "oracle_ap25_medium_scannet200",
+                "oracle_ap50_medium_scannet200",
+                "oracle_ap25_large_scannet200",
+                "oracle_ap50_large_scannet200",
             }:
                 continue
 
@@ -180,6 +204,14 @@ class WandbReporter:
                 "oracle_winner_share_g0_5",
                 "oracle_winner_share_g0_8",
                 "oracle_winner_share_no_match",
+                "oracle_nmi_scannet200",
+                "oracle_ari_scannet200",
+                "oracle_ap25_small_scannet200",
+                "oracle_ap50_small_scannet200",
+                "oracle_ap25_medium_scannet200",
+                "oracle_ap50_medium_scannet200",
+                "oracle_ap25_large_scannet200",
+                "oracle_ap50_large_scannet200",
             ]
         )
 
@@ -213,6 +245,14 @@ class WandbReporter:
                 row["oracle_winner_share_g0_5"],
                 row["oracle_winner_share_g0_8"],
                 row["oracle_winner_share_no_match"],
+                row["oracle_nmi_scannet200"],
+                row["oracle_ari_scannet200"],
+                row["oracle_ap25_small_scannet200"],
+                row["oracle_ap50_small_scannet200"],
+                row["oracle_ap25_medium_scannet200"],
+                row["oracle_ap50_medium_scannet200"],
+                row["oracle_ap25_large_scannet200"],
+                row["oracle_ap50_large_scannet200"],
             )
 
         self.run.log({"scene_table": table})

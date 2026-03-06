@@ -8,6 +8,7 @@ from PIL import Image
 
 from chorus.common.types import FrameRecord, GeometryRecord, VisibilityConfig
 from chorus.datasets.base import SceneAdapter
+from chorus.datasets.scannet.benchmark import normalize_scannet_eval_benchmark
 from chorus.datasets.scannet.gt import load_scannet_gt_instance_ids
 from chorus.datasets.scannet.metadata import (
     DEFAULT_DEPTH_SCALE_TO_M,
@@ -19,6 +20,10 @@ from chorus.datasets.scannet.prepare import extract_rgbd, is_rgbd_prepared
 
 
 class ScanNetSceneAdapter(SceneAdapter):
+    def __init__(self, scene_root: Path, eval_benchmark: str | None = None):
+        super().__init__(scene_root=scene_root)
+        self.eval_benchmark = normalize_scannet_eval_benchmark(eval_benchmark)
+
     @property
     def dataset_name(self) -> str:
         return "scannet"
@@ -132,4 +137,8 @@ class ScanNetSceneAdapter(SceneAdapter):
         )
 
     def load_gt_instance_ids(self) -> np.ndarray | None:
-        return load_scannet_gt_instance_ids(self.scene_root, self.scene_id)
+        return load_scannet_gt_instance_ids(
+            self.scene_root,
+            self.scene_id,
+            eval_benchmark=self.eval_benchmark,
+        )
