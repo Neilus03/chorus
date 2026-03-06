@@ -14,6 +14,11 @@ from datetime import datetime
 
 from chorus.core.quality.diagnostics import save_json
 from chorus.core.teacher.unsamv2 import UnSAMv2Teacher
+from chorus.datasets.scannet.benchmark import (
+    DEFAULT_SCANNET_EVAL_BENCHMARKS,
+    parse_scannet_eval_benchmarks,
+)
+from chorus.datasets.scannet.evaluation import ScanNetEvaluationHooks
 from chorus.orchestrators.streaming import read_scene_ids, run_streaming_scannet
 from chorus.tracking.local_report import LocalTableReporter
 from chorus.tracking.wandb import WandbReporter
@@ -39,7 +44,6 @@ class CombinedReporter:
     def finish(self):
         for reporter in self.reporters:
             reporter.finish()
-
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run CHORUS on many ScanNet scenes")
@@ -78,6 +82,15 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help="Use every N-th frame",
+    )
+    parser.add_argument(
+        "--scannet-eval-benchmark",
+        type=str,
+        default=os.environ.get(
+            "CHORUS_SCANNET_EVAL_BENCHMARK",
+            ",".join(DEFAULT_SCANNET_EVAL_BENCHMARKS),
+        ),
+        help="Comma-separated ScanNet oracle benchmarks to run, for example 'scannet20,scannet200'.",
     )
     parser.add_argument(
         "--device",
@@ -199,6 +212,8 @@ def main() -> None:
 
     scans_root = args.scans_root.resolve()
     granularities = [float(g.strip()) for g in args.granularities.split(",") if g.strip()]
+    scannet_eval_benchmarks = parse_scannet_eval_benchmarks(args.scannet_eval_benchmark)
+    evaluation_hooks = ScanNetEvaluationHooks(scannet_eval_benchmarks)
 
     scene_ids = read_scene_ids(
         scans_root=scans_root,
@@ -216,6 +231,7 @@ def main() -> None:
     print(f"num_scenes_selected={len(scene_ids)}")
     print(f"granularities={granularities}")
     print(f"frame_skip={args.frame_skip}")
+    print(f"scannet_eval_benchmarks={scannet_eval_benchmarks}")
     print(f"overwrite_existing={args.overwrite_existing}")
     print(f"continue_on_error={args.continue_on_error}")
     print(f"auto_download_missing={not args.no_auto_download_missing}")
@@ -234,7 +250,10 @@ def main() -> None:
     )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    local_reporter = LocalTableReporter(report_dir=report_dir)
+    local_reporter = LocalTableReporter(
+        report_dir=report_dir,
+        extra_fieldnames=evaluation_hooks.scene_metric_fieldnames(),
+    )
     wandb_reporter = WandbReporter(
         enabled=args.wandb,
         project=args.wandb_project,
@@ -245,9 +264,11 @@ def main() -> None:
             "scans_root": str(scans_root),
             "granularities": granularities,
             "frame_skip": args.frame_skip,
+            "scannet_eval_benchmarks": scannet_eval_benchmarks,
             "download_only": args.download_only,
             "max_download_retries": args.max_download_retries,
         },
+        extra_metric_fields=evaluation_hooks.scene_metric_fieldnames(),
     )
     reporter = CombinedReporter([local_reporter, wandb_reporter])
 
@@ -257,6 +278,7 @@ def main() -> None:
             scene_ids=scene_ids,
             teacher=teacher,
             granularities=granularities,
+            scannet_eval_benchmarks=scannet_eval_benchmarks,
             frame_skip=args.frame_skip,
             svd_components=args.svd_components,
             min_cluster_size=args.min_cluster_size,
@@ -283,6 +305,9 @@ def main() -> None:
         print(f"\nSaved run summary to: {report_path}")
         print(f"Local scene table CSV: {local_reporter.scene_csv_path}")
         print(f"Latest run summary JSON: {local_reporter.summary_json_path}")
+        if not args.no_oracle_eval:
+            for line in evaluation_hooks.render_run_summary(run_summary, granularities):
+                print(line)
 
     finally:
         reporter.finish()

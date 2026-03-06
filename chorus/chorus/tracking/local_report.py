@@ -8,7 +8,7 @@ from typing import Any
 
 
 class LocalTableReporter:
-    def __init__(self, report_dir: Path):
+    def __init__(self, report_dir: Path, extra_fieldnames: list[str] | None = None):
         self.report_dir = Path(report_dir)
         self.report_dir.mkdir(parents=True, exist_ok=True)
 
@@ -16,7 +16,8 @@ class LocalTableReporter:
         self.scene_csv_path = self.report_dir / f"scene_table_{timestamp}.csv"
         self.summary_json_path = self.report_dir / "latest_run_summary.json"
 
-        self._fieldnames = [
+        self._extra_fieldnames = list(extra_fieldnames or [])
+        base_fieldnames = [
             "scene_id",
             "status",
             "duration_seconds",
@@ -28,35 +29,6 @@ class LocalTableReporter:
             "avg_labeled_fraction_seen",
             "total_clusters_across_granularities",
             "total_teacher_masks_across_granularities",
-            "oracle_nmi",
-            "oracle_ari",
-            "oracle_ap25_small",
-            "oracle_ap50_small",
-            "oracle_ap25_medium",
-            "oracle_ap50_medium",
-            "oracle_ap25_large",
-            "oracle_ap50_large",
-            "oracle_map_25_95_small",
-            "oracle_map_25_95_medium",
-            "oracle_map_25_95_large",
-            "oracle_topk_iou025_r1",
-            "oracle_topk_iou025_r3",
-            "oracle_topk_iou025_r5",
-            "oracle_topk_iou050_r1",
-            "oracle_topk_iou050_r3",
-            "oracle_topk_iou050_r5",
-            "oracle_winner_share_g0_2",
-            "oracle_winner_share_g0_5",
-            "oracle_winner_share_g0_8",
-            "oracle_winner_share_no_match",
-            "oracle_nmi_scannet200",
-            "oracle_ari_scannet200",
-            "oracle_ap25_small_scannet200",
-            "oracle_ap50_small_scannet200",
-            "oracle_ap25_medium_scannet200",
-            "oracle_ap50_medium_scannet200",
-            "oracle_ap25_large_scannet200",
-            "oracle_ap50_large_scannet200",
             "teacher_total_masks_g0.2",
             "teacher_total_masks_g0.5",
             "teacher_total_masks_g0.8",
@@ -83,6 +55,9 @@ class LocalTableReporter:
             "summary_path",
             "manifest_path",
         ]
+        self._fieldnames = base_fieldnames + [
+            field for field in self._extra_fieldnames if field not in base_fieldnames
+        ]
         self._rows: list[dict[str, Any]] = []
 
         with self.scene_csv_path.open("w", encoding="utf-8", newline="") as f:
@@ -107,35 +82,6 @@ class LocalTableReporter:
             "avg_labeled_fraction_seen": result.get("avg_labeled_fraction_seen"),
             "total_clusters_across_granularities": result.get("total_clusters_across_granularities"),
             "total_teacher_masks_across_granularities": result.get("total_teacher_masks_across_granularities"),
-            "oracle_nmi": result.get("oracle_nmi"),
-            "oracle_ari": result.get("oracle_ari"),
-            "oracle_ap25_small" : result.get("oracle_ap25_small"),
-            "oracle_ap50_small" : result.get("oracle_ap50_small"),
-            "oracle_ap25_medium": result.get("oracle_ap25_medium"),
-            "oracle_ap50_medium": result.get("oracle_ap50_medium"),
-            "oracle_ap25_large": result.get("oracle_ap25_large"),
-            "oracle_ap50_large": result.get("oracle_ap50_large"),
-            "oracle_map_25_95_small": result.get("oracle_map_25_95_small"),
-            "oracle_map_25_95_medium": result.get("oracle_map_25_95_medium"),
-            "oracle_map_25_95_large": result.get("oracle_map_25_95_large"),
-            "oracle_topk_iou025_r1": result.get("oracle_topk_iou025_r1"),
-            "oracle_topk_iou025_r3": result.get("oracle_topk_iou025_r3"),
-            "oracle_topk_iou025_r5": result.get("oracle_topk_iou025_r5"),
-            "oracle_topk_iou050_r1": result.get("oracle_topk_iou050_r1"),
-            "oracle_topk_iou050_r3": result.get("oracle_topk_iou050_r3"),
-            "oracle_topk_iou050_r5": result.get("oracle_topk_iou050_r5"),
-            "oracle_winner_share_g0_2": result.get("oracle_winner_share_g0_2"),
-            "oracle_winner_share_g0_5": result.get("oracle_winner_share_g0_5"),
-            "oracle_winner_share_g0_8": result.get("oracle_winner_share_g0_8"),
-            "oracle_winner_share_no_match": result.get("oracle_winner_share_no_match"),
-            "oracle_nmi_scannet200": result.get("oracle_nmi_scannet200"),
-            "oracle_ari_scannet200": result.get("oracle_ari_scannet200"),
-            "oracle_ap25_small_scannet200": result.get("oracle_ap25_small_scannet200"),
-            "oracle_ap50_small_scannet200": result.get("oracle_ap50_small_scannet200"),
-            "oracle_ap25_medium_scannet200": result.get("oracle_ap25_medium_scannet200"),
-            "oracle_ap50_medium_scannet200": result.get("oracle_ap50_medium_scannet200"),
-            "oracle_ap25_large_scannet200": result.get("oracle_ap25_large_scannet200"),
-            "oracle_ap50_large_scannet200": result.get("oracle_ap50_large_scannet200"),
             "teacher_total_masks_g0.2": result.get("teacher_total_masks_g0.2"),
             "teacher_total_masks_g0.5": result.get("teacher_total_masks_g0.5"),
             "teacher_total_masks_g0.8": result.get("teacher_total_masks_g0.8"),
@@ -162,6 +108,8 @@ class LocalTableReporter:
             "summary_path": result.get("summary_path"),
             "manifest_path": result.get("manifest_path"),
         }
+        for field in self._extra_fieldnames:
+            row[field] = result.get(field)
         self._rows.append(row)
 
         with self.scene_csv_path.open("a", encoding="utf-8", newline="") as f:

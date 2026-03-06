@@ -8,7 +8,11 @@ from PIL import Image
 
 from chorus.common.types import FrameRecord, GeometryRecord, VisibilityConfig
 from chorus.datasets.base import SceneAdapter
-from chorus.datasets.scannet.benchmark import normalize_scannet_eval_benchmark
+from chorus.datasets.scannet.benchmark import (
+    parse_scannet_eval_benchmarks,
+    primary_scannet_eval_benchmark,
+)
+from chorus.datasets.scannet.evaluation import ScanNetEvaluationHooks
 from chorus.datasets.scannet.gt import load_scannet_gt_instance_ids
 from chorus.datasets.scannet.metadata import (
     DEFAULT_DEPTH_SCALE_TO_M,
@@ -20,9 +24,14 @@ from chorus.datasets.scannet.prepare import extract_rgbd, is_rgbd_prepared
 
 
 class ScanNetSceneAdapter(SceneAdapter):
-    def __init__(self, scene_root: Path, eval_benchmark: str | None = None):
+    def __init__(
+        self,
+        scene_root: Path,
+        eval_benchmarks: list[str] | tuple[str, ...] | str | None = None,
+    ):
         super().__init__(scene_root=scene_root)
-        self.eval_benchmark = normalize_scannet_eval_benchmark(eval_benchmark)
+        self.eval_benchmarks = parse_scannet_eval_benchmarks(eval_benchmarks)
+        self.eval_benchmark = primary_scannet_eval_benchmark(self.eval_benchmarks)
 
     @property
     def dataset_name(self) -> str:
@@ -142,3 +151,6 @@ class ScanNetSceneAdapter(SceneAdapter):
             self.scene_id,
             eval_benchmark=self.eval_benchmark,
         )
+
+    def get_evaluation_hooks(self) -> ScanNetEvaluationHooks:
+        return ScanNetEvaluationHooks(self.eval_benchmarks)

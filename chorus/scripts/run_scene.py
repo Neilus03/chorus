@@ -16,7 +16,6 @@ from chorus.core.teacher.unsamv2 import UnSAMv2Teacher
 from chorus.datasets.scannet.benchmark import (
     DEFAULT_SCANNET_EVAL_BENCHMARKS,
     parse_scannet_eval_benchmarks,
-    primary_scannet_eval_benchmark,
 )
 from chorus.datasets.scannet.adapter import ScanNetSceneAdapter
 
@@ -110,7 +109,7 @@ def main() -> None:
     scannet_eval_benchmarks = parse_scannet_eval_benchmarks(args.scannet_eval_benchmark)
     adapter = ScanNetSceneAdapter(
         scene_root=args.scene_dir,
-        eval_benchmark=primary_scannet_eval_benchmark(scannet_eval_benchmarks),
+        eval_benchmarks=scannet_eval_benchmarks,
     )
 
     teacher = UnSAMv2Teacher(
@@ -123,7 +122,6 @@ def main() -> None:
         adapter=adapter,
         teacher=teacher,
         granularities=granularities,
-        scannet_eval_benchmarks=scannet_eval_benchmarks,
         frame_skip=args.frame_skip,
         svd_components=args.svd_components,
         min_cluster_size=args.min_cluster_size,

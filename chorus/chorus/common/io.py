@@ -4,10 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from chorus.datasets.scannet.benchmark import (
-    SCANNET_EVAL_BENCHMARK_20,
-    parse_scannet_eval_benchmarks,
-)
+from chorus.eval.base import DatasetEvaluationHooks
 
 
 def load_json_if_exists(path: Path) -> dict[str, Any] | None:
@@ -36,7 +33,7 @@ def expected_scene_output_paths(
     granularities: list[float],
     require_oracle: bool = True,
     require_litept: bool = True,
-    oracle_eval_benchmarks: list[str] | tuple[str, ...] | str | None = None,
+    evaluation_hooks: DatasetEvaluationHooks | None = None,
 ) -> list[Path]:
     scene_dir = Path(scene_dir)
     expected: list[Path] = []
@@ -53,16 +50,15 @@ def expected_scene_output_paths(
             ]
         )
 
-    if require_oracle:
-        for benchmark in parse_scannet_eval_benchmarks(oracle_eval_benchmarks):
-            suffix = "" if benchmark == SCANNET_EVAL_BENCHMARK_20 else f"_{benchmark}"
-            expected.extend(
-                [
-                    scene_dir / f"oracle_metrics{suffix}.json",
-                    scene_dir / f"chorus_oracle_best_combined_labels{suffix}.npy",
-                    scene_dir / f"chorus_oracle_best_combined{suffix}.ply",
-                ]
+    if evaluation_hooks is not None:
+        expected.extend(
+            evaluation_hooks.expected_output_paths(
+                scene_dir=scene_dir,
+                granularities=granularities,
+                require_oracle=require_oracle,
+                require_litept=require_litept,
             )
+        )
 
     if require_litept:
         litept_dir = scene_dir / "litept_pack"
@@ -85,7 +81,7 @@ def verify_existing_scene_outputs(
     granularities: list[float],
     require_oracle: bool = True,
     require_litept: bool = True,
-    oracle_eval_benchmarks: list[str] | tuple[str, ...] | str | None = None,
+    evaluation_hooks: DatasetEvaluationHooks | None = None,
 ) -> tuple[bool, list[str]]:
     missing_or_empty: list[str] = []
 
@@ -94,7 +90,7 @@ def verify_existing_scene_outputs(
         granularities=granularities,
         require_oracle=require_oracle,
         require_litept=require_litept,
-        oracle_eval_benchmarks=oracle_eval_benchmarks,
+        evaluation_hooks=evaluation_hooks,
     ):
         if not path.exists():
             missing_or_empty.append(str(path))
@@ -111,7 +107,7 @@ def verify_scene_completion_from_summary(
     granularities: list[float],
     require_oracle: bool = True,
     require_litept: bool = True,
-    expected_eval_benchmarks: list[str] | tuple[str, ...] | str | None = None,
+    evaluation_hooks: DatasetEvaluationHooks | None = None,
 ) -> tuple[bool, dict[str, Any] | None, list[str]]:
     scene_dir = Path(scene_dir)
     summary_path = scene_dir / "scene_pipeline_summary.json"
@@ -141,44 +137,26 @@ def verify_scene_completion_from_summary(
         except Exception:
             missing_reasons.append("summary granularities could not be parsed")
 
-    if require_oracle and summary.get("oracle_summary") is None:
-        missing_reasons.append("summary missing oracle_summary")
-
-    parsed_eval_benchmarks = parse_scannet_eval_benchmarks(expected_eval_benchmarks)
-
     if require_litept and summary.get("litept_pack_dir") is None:
         missing_reasons.append("summary missing litept_pack_dir")
 
-    actual_eval_benchmarks = summary.get("eval_benchmarks")
-    if actual_eval_benchmarks is None:
-        actual_eval_benchmarks = [summary.get("eval_benchmark")]
-    try:
-        actual_eval_benchmarks = parse_scannet_eval_benchmarks(actual_eval_benchmarks)
-    except Exception:
-        actual_eval_benchmarks = None
-
-    if actual_eval_benchmarks != parsed_eval_benchmarks:
-        missing_reasons.append(
-            "summary eval_benchmarks mismatch: "
-            f"expected {parsed_eval_benchmarks}, found {actual_eval_benchmarks}"
-        )
-
-    if require_oracle:
-        oracle_summaries = summary.get("oracle_summaries") or {}
-        missing_benchmarks = [
-            benchmark for benchmark in parsed_eval_benchmarks if benchmark not in oracle_summaries
-        ]
-        if missing_benchmarks:
-            missing_reasons.append(
-                f"summary missing oracle_summaries for benchmarks: {missing_benchmarks}"
+    if evaluation_hooks is not None:
+        missing_reasons.extend(
+            evaluation_hooks.verify_summary(
+                scene_dir=scene_dir,
+                summary=summary,
+                granularities=granularities,
+                require_oracle=require_oracle,
+                require_litept=require_litept,
             )
+        )
 
     outputs_ok, missing_outputs = verify_existing_scene_outputs(
         scene_dir=scene_dir,
         granularities=granularities,
         require_oracle=require_oracle,
         require_litept=require_litept,
-        oracle_eval_benchmarks=parsed_eval_benchmarks,
+        evaluation_hooks=evaluation_hooks,
     )
     if not outputs_ok:
         missing_reasons.extend(missing_outputs)

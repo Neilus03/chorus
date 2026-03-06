@@ -6,12 +6,6 @@ from chorus.core.quality.diagnostics import save_json
 from chorus.core.quality.intrinsic_metrics import compute_scene_intrinsic_metrics
 from chorus.core.teacher.base import TeacherModel
 from chorus.datasets.base import SceneAdapter
-from chorus.datasets.scannet.benchmark import (
-    SCANNET_EVAL_BENCHMARK_20,
-    parse_scannet_eval_benchmarks,
-    primary_scannet_eval_benchmark,
-)
-from chorus.eval.scannet_oracle import evaluate_and_save_scannet_oracle
 from chorus.export.litept_pack import export_litept_scene_pack
 
 
@@ -19,7 +13,6 @@ def run_scene_pipeline(
     adapter: SceneAdapter,
     teacher: TeacherModel,
     granularities: list[float],
-    scannet_eval_benchmarks: list[str] | tuple[str, ...] | str | None = None,
     frame_skip: int = 10,
     svd_components: int = 32,
     min_cluster_size: int = 100,
@@ -54,25 +47,13 @@ def run_scene_pipeline(
 
     scene_intrinsic_metrics = compute_scene_intrinsic_metrics(cluster_outputs)
 
-    oracle_summaries = None
-    if run_oracle_eval and adapter.dataset_name == "scannet":
-        benchmarks = parse_scannet_eval_benchmarks(scannet_eval_benchmarks)
-        oracle_summaries = {}
-        for eval_benchmark in benchmarks:
-            oracle_summaries[eval_benchmark] = evaluate_and_save_scannet_oracle(
-                adapter=adapter,
-                cluster_outputs=cluster_outputs,
-                eval_benchmark=eval_benchmark,
-            )
-
-    primary_eval_benchmark = primary_scannet_eval_benchmark(scannet_eval_benchmarks)
-    primary_oracle_summary = None
-    if oracle_summaries is not None:
-        primary_oracle_summary = oracle_summaries.get(primary_eval_benchmark)
-        if primary_oracle_summary is None and SCANNET_EVAL_BENCHMARK_20 in oracle_summaries:
-            primary_oracle_summary = oracle_summaries[SCANNET_EVAL_BENCHMARK_20]
-        if primary_oracle_summary is None and oracle_summaries:
-            primary_oracle_summary = next(iter(oracle_summaries.values()))
+    evaluation_hooks = adapter.get_evaluation_hooks()
+    evaluation_summary = None
+    if run_oracle_eval:
+        evaluation_summary = evaluation_hooks.evaluate_scene(
+            adapter=adapter,
+            cluster_outputs=cluster_outputs,
+        )
 
     litept_pack_dir = None
     if export_litept:
@@ -90,8 +71,6 @@ def run_scene_pipeline(
     summary = {
         "dataset": adapter.dataset_name,
         "scene_id": adapter.scene_id,
-        "eval_benchmark": primary_eval_benchmark,
-        "eval_benchmarks": parse_scannet_eval_benchmarks(scannet_eval_benchmarks),
         "granularities": granularities,
         "teacher_outputs": [
             {
@@ -112,33 +91,10 @@ def run_scene_pipeline(
             for c in cluster_outputs
         ],
         "scene_intrinsic_metrics": scene_intrinsic_metrics,
-        "oracle_summary": {
-            "eval_benchmark": primary_oracle_summary["eval_benchmark"],
-            "metrics_path": str(primary_oracle_summary["metrics_path"]),
-            "labels_path": str(primary_oracle_summary["labels_path"]),
-            "ply_path": str(primary_oracle_summary["ply_path"]),
-            "oracle_results": primary_oracle_summary["oracle_results"],
-            "additional_metrics": primary_oracle_summary["additional_metrics"],
-            "clustering_metrics": primary_oracle_summary["clustering_metrics"],
-        }
-        if primary_oracle_summary is not None
-        else None,
-        "oracle_summaries": {
-            benchmark: {
-                "eval_benchmark": summary["eval_benchmark"],
-                "metrics_path": str(summary["metrics_path"]),
-                "labels_path": str(summary["labels_path"]),
-                "ply_path": str(summary["ply_path"]),
-                "oracle_results": summary["oracle_results"],
-                "additional_metrics": summary["additional_metrics"],
-                "clustering_metrics": summary["clustering_metrics"],
-            }
-            for benchmark, summary in (oracle_summaries or {}).items()
-        }
-        if oracle_summaries is not None
-        else None,
         "litept_pack_dir": str(litept_pack_dir) if litept_pack_dir is not None else None,
     }
+    if evaluation_summary is not None:
+        summary.update(evaluation_summary)
 
     summary_path = adapter.scene_root / "scene_pipeline_summary.json"
     save_json(summary, summary_path)

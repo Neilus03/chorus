@@ -7,6 +7,7 @@ from typing import Optional
 import numpy as np
 
 from chorus.common.types import FrameRecord, GeometryRecord, VisibilityConfig
+from chorus.eval.base import DatasetEvaluationHooks
 
 
 class SceneAdapter(ABC):
@@ -60,3 +61,6 @@ class SceneAdapter(ABC):
 
     def load_gt_instance_ids(self) -> Optional[np.ndarray]:
         return None
+
+    def get_evaluation_hooks(self) -> DatasetEvaluationHooks:
+        return DatasetEvaluationHooks()
