@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sys
 
@@ -9,7 +10,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-    
+
 
 from chorus.common.types import (
     ClusterOutput,
@@ -304,6 +305,20 @@ def test_export_training_scene_pack_excludes_unseen_points_from_valid_points(
     assert not valid_points[3]
     assert seen_points[2]
     assert not seen_points[3]
+
+    with (output_dir / "scene_meta.json").open("r", encoding="utf-8") as f:
+        scene_meta = json.load(f)
+
+    assert scene_meta["pack_name"] == "training_pack"
+    assert scene_meta["pack_version"] == "1.0"
+    assert scene_meta["coordinate_units"] == "meters"
+    assert scene_meta["coordinate_frame"] == "scene-level geometry coordinates from the dataset adapter"
+    assert scene_meta["point_source"] == "mesh_vertices"
+    assert scene_meta["label_convention"]["ignore_unlabeled"] == -1
+    assert scene_meta["optional_files_present"]["colors.npy"] is False
+    assert "valid_points" in scene_meta["supervision_mask_definition"]
+    assert "label >= 0" in scene_meta["valid_points_definition"]
+    assert "processed frame" in scene_meta["seen_points_definition"]
 
 if __name__ == "__main__":
     pytest.main([__file__])

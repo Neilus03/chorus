@@ -9,6 +9,8 @@ import numpy as np
 from chorus.common.types import ClusterOutput
 from chorus.datasets.base import SceneAdapter
 
+TRAINING_PACK_VERSION = "1.0"
+
 
 def export_training_scene_pack(
     adapter: SceneAdapter,
@@ -67,8 +69,31 @@ def export_training_scene_pack(
     num_frames_used = len(frames[::frame_skip]) if frame_skip is not None and frame_skip > 0 else num_frames_total
 
     scene_meta = {
+        "pack_name": "training_pack",
+        "pack_version": TRAINING_PACK_VERSION,
         "dataset": adapter.dataset_name,
         "scene_id": adapter.scene_id,
+        "coordinate_units": "meters",
+        "coordinate_frame": "scene-level geometry coordinates from the dataset adapter",
+        "point_source": geometry_record.geometry_type,
+        "label_convention": {
+            "ignore_unlabeled": -1,
+            "non_negative_labels": "instance ids within each per-granularity labels_g*.npy file",
+        },
+        "valid_points_definition": (
+            "Binary mask where 1 marks points with label >= 0 in at least one exported granularity."
+        ),
+        "seen_points_definition": (
+            "Binary mask where 1 marks points observed in at least one processed frame across "
+            "the exported granularities."
+        ),
+        "supervision_mask_definition": (
+            "Binary mask of points included for student supervision. In pack_version 1.0 this is "
+            "identical to valid_points.npy."
+        ),
+        "optional_files_present": {
+            "colors.npy": colors is not None,
+        },
         "geometry_type": geometry_record.geometry_type,
         "geometry_source": geometry_record.geometry_path.name,
         "geometry_path_name": geometry_record.geometry_path.name,
