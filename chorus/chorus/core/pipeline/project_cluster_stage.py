@@ -4,7 +4,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import open3d as o3d
 
 from chorus.common.types import ClusterOutput, TeacherOutput
 from chorus.core.clustering.hdbscan_cluster import cluster_features
@@ -15,6 +14,7 @@ from chorus.core.lifting.voting import build_point_mask_matrix
 from chorus.core.quality.diagnostics import save_json
 from chorus.core.quality.intrinsic_metrics import compute_cluster_intrinsic_metrics
 from chorus.datasets.base import SceneAdapter
+from chorus.export.visualization import save_labeled_mesh_ply
 
 
 def _resize_depth_to_mask_shape(depth_map_m: np.ndarray, mask_shape: tuple[int, int]) -> np.ndarray:
@@ -22,25 +22,6 @@ def _resize_depth_to_mask_shape(depth_map_m: np.ndarray, mask_shape: tuple[int, 
     if depth_map_m.shape == (target_h, target_w):
         return depth_map_m
     return cv2.resize(depth_map_m, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
-
-
-def _save_colored_point_cloud(points_3d: np.ndarray, labels: np.ndarray, out_path: Path) -> None:
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points_3d)
-
-    point_colors = np.zeros((points_3d.shape[0], 3), dtype=np.float64)
-    valid_mask = labels >= 0
-
-    if np.any(valid_mask):
-        max_label = int(labels[valid_mask].max())
-        rng = np.random.default_rng(42)
-        colors = rng.random((max_label + 1, 3))
-        point_colors[valid_mask] = colors[labels[valid_mask]]
-
-    point_colors[~valid_mask] = np.array([0.5, 0.5, 0.5], dtype=np.float64)
-    pcd.colors = o3d.utility.Vector3dVector(point_colors)
-
-    o3d.io.write_point_cloud(str(out_path), pcd)
 
 
 def run_project_cluster_stage(
@@ -196,7 +177,12 @@ def run_project_cluster_stage(
         np.save(features_path, full_features)
 
         ply_path = adapter.scene_root / f"chorus_instance_result_g{teacher_output.granularity}.ply"
-        _save_colored_point_cloud(points_3d=points_3d, labels=full_labels, out_path=ply_path)
+        geometry_record = adapter.get_geometry_record()
+        save_labeled_mesh_ply(
+            source_ply_path=geometry_record.geometry_path,
+            labels=full_labels,
+            out_path=ply_path,
+        )
 
         diagnostics_path = adapter.scene_root / f"diagnostics_g{teacher_output.granularity}.json"
         save_json(

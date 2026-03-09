@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 import numpy as np
-from plyfile import PlyData, PlyElement
 
 from chorus.common.types import ClusterOutput
 from chorus.datasets.base import SceneAdapter
@@ -13,6 +12,7 @@ from chorus.datasets.scannet.benchmark import (
     normalize_scannet_eval_benchmark,
 )
 from chorus.datasets.scannet.gt import load_scannet_gt_instance_ids
+from chorus.export.visualization import save_labeled_mesh_ply
 
 
 def build_proposals_from_cluster_outputs(
@@ -281,37 +281,11 @@ def save_oracle_best_ply(
     out_path: Path,
     oracle_labels: np.ndarray,
 ) -> None:
-    plydata = PlyData.read(str(geometry_path))
-    vertices = plydata["vertex"]
-
-    max_id = int(max(0, np.max(oracle_labels)))
-    rng = np.random.default_rng(42)
-    colors = rng.integers(0, 255, size=(max_id + 1, 3), dtype=np.uint8)
-
-    display_ids = np.where(oracle_labels >= 0, oracle_labels, 0)
-    vertex_colors = colors[display_ids]
-    vertex_colors[oracle_labels < 0] = np.array([80, 80, 80], dtype=np.uint8)
-
-    out_vertices = np.empty(
-        len(vertices),
-        dtype=[
-            ("x", "f4"),
-            ("y", "f4"),
-            ("z", "f4"),
-            ("red", "u1"),
-            ("green", "u1"),
-            ("blue", "u1"),
-        ],
+    save_labeled_mesh_ply(
+        source_ply_path=geometry_path,
+        labels=oracle_labels,
+        out_path=out_path,
     )
-
-    out_vertices["x"] = vertices["x"]
-    out_vertices["y"] = vertices["y"]
-    out_vertices["z"] = vertices["z"]
-    out_vertices["red"] = vertex_colors[:, 0]
-    out_vertices["green"] = vertex_colors[:, 1]
-    out_vertices["blue"] = vertex_colors[:, 2]
-
-    PlyData([PlyElement.describe(out_vertices, "vertex")]).write(str(out_path))
 
 
 def compute_clustering_metrics(

@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-import open3d as o3d
 from PIL import Image
+from plyfile import PlyData
 
 from chorus.common.types import FrameRecord, GeometryRecord, VisibilityConfig
 from chorus.datasets.base import SceneAdapter
@@ -111,25 +111,53 @@ class ScanNetSceneAdapter(SceneAdapter):
     def load_intrinsics(self, frame: FrameRecord) -> np.ndarray:
         return np.loadtxt(frame.intrinsics_path)[:3, :3]
 
-    def load_geometry_points(self) -> np.ndarray:
+    def _load_geometry_vertex_data(self):
         mesh_path = self.scene_root / f"{self.scene_id}{GEOMETRY_SUFFIX}"
         if not mesh_path.exists():
             raise FileNotFoundError(f"Missing ScanNet geometry file: {mesh_path}")
 
-        pcd = o3d.io.read_point_cloud(str(mesh_path))
-        points = np.asarray(pcd.points)
-        if points.size == 0:
-            raise RuntimeError(f"Loaded empty point cloud from {mesh_path}")
+        plydata = PlyData.read(str(mesh_path))
+        if "vertex" not in plydata:
+            raise RuntimeError(f"PLY file has no vertex element: {mesh_path}")
+
+        vertex_data = plydata["vertex"].data
+        if len(vertex_data) == 0:
+            raise RuntimeError(f"Loaded empty geometry from {mesh_path}")
+
+        return vertex_data
+
+    def load_geometry_points(self) -> np.ndarray:
+        vertex_data = self._load_geometry_vertex_data()
+        points = np.stack(
+            [
+                np.asarray(vertex_data["x"], dtype=np.float32),
+                np.asarray(vertex_data["y"], dtype=np.float32),
+                np.asarray(vertex_data["z"], dtype=np.float32),
+            ],
+            axis=1,
+        )
         return points
 
     def load_geometry_colors(self) -> np.ndarray | None:
-        mesh_path = self.scene_root / f"{self.scene_id}{GEOMETRY_SUFFIX}"
-        if not mesh_path.exists():
-            raise FileNotFoundError(f"Missing ScanNet geometry file: {mesh_path}")
+        vertex_data = self._load_geometry_vertex_data()
+        names = set(vertex_data.dtype.names or [])
 
-        pcd = o3d.io.read_point_cloud(str(mesh_path))
-        colors = np.asarray(pcd.colors)
-        return colors if colors.size > 0 else None
+        if not {"red", "green", "blue"}.issubset(names):
+            return None
+
+        colors = np.stack(
+            [
+                np.asarray(vertex_data["red"], dtype=np.float32),
+                np.asarray(vertex_data["green"], dtype=np.float32),
+                np.asarray(vertex_data["blue"], dtype=np.float32),
+            ],
+            axis=1,
+        )
+
+        if colors.max() > 1.0:
+            colors = colors / 255.0
+
+        return colors
 
     def get_geometry_record(self) -> GeometryRecord:
         return GeometryRecord(
