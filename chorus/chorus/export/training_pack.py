@@ -10,7 +10,7 @@ from chorus.common.types import ClusterOutput
 from chorus.datasets.base import SceneAdapter
 
 
-def export_litept_scene_pack(
+def export_training_scene_pack(
     adapter: SceneAdapter,
     cluster_outputs: list[ClusterOutput],
     output_dir: Path | None = None,
@@ -22,9 +22,9 @@ def export_litept_scene_pack(
     scene_intrinsic_metrics: dict[str, Any] | None = None,
 ) -> Path:
     if len(cluster_outputs) == 0:
-        raise RuntimeError("Cannot export LitePT pack with zero cluster outputs.")
+        raise RuntimeError("Cannot export training pack with zero cluster outputs.")
 
-    output_dir = Path(output_dir) if output_dir is not None else (adapter.scene_root / "litept_pack")
+    output_dir = Path(output_dir) if output_dir is not None else (adapter.scene_root / "training_pack")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     points = adapter.load_geometry_points()
@@ -92,5 +92,5 @@ def export_litept_scene_pack(
     with (output_dir / "scene_meta.json").open("w", encoding="utf-8") as f:
         json.dump(scene_meta, f, indent=2)
 
-    print(f"Exported LitePT scene pack: {output_dir}")
+    print(f"Exported training scene pack: {output_dir}")
     return output_dir

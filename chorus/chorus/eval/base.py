@@ -27,7 +27,7 @@ class DatasetEvaluationHooks:
         scene_dir: Path,
         granularities: list[float],
         require_oracle: bool = True,
-        require_litept: bool = True,
+        require_training_pack: bool = True,
     ) -> list[Path]:
         return []
 
@@ -37,7 +37,7 @@ class DatasetEvaluationHooks:
         summary: dict[str, Any],
         granularities: list[float],
         require_oracle: bool = True,
-        require_litept: bool = True,
+        require_training_pack: bool = True,
     ) -> list[str]:
         return []
 

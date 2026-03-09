@@ -149,9 +149,9 @@ def _parse_args() -> argparse.Namespace:
         help="Disable ScanNet oracle evaluation",
     )
     parser.add_argument(
-        "--no-export-litept",
+        "--no-export-training-pack",
         action="store_true",
-        help="Disable LitePT pack export",
+        help="Disable training pack export",
     )
     parser.add_argument(
         "--no-auto-download-missing",
@@ -285,7 +285,7 @@ def main() -> None:
             min_samples=args.min_samples,
             cluster_selection_epsilon=args.cluster_selection_epsilon,
             run_oracle_eval=not args.no_oracle_eval,
-            export_litept=not args.no_export_litept,
+            export_training_pack=not args.no_export_training_pack,
             overwrite_existing=args.overwrite_existing,
             continue_on_error=args.continue_on_error,
             auto_download_missing=not args.no_auto_download_missing,

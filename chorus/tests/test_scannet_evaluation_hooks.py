@@ -12,7 +12,7 @@ def test_expected_output_paths_include_both_scannet_benchmarks(tmp_path: Path) -
         scene_dir=tmp_path,
         granularities=[0.2, 0.5, 0.8],
         require_oracle=True,
-        require_litept=True,
+        require_training_pack=True,
     )
 
     path_strings = {str(path) for path in paths}
@@ -35,7 +35,7 @@ def test_verify_summary_checks_requested_benchmarks(tmp_path: Path) -> None:
             "scannet20": {"eval_benchmark": "scannet20"},
         },
         "eval_benchmarks": ["scannet20"],
-        "litept_pack_dir": str(tmp_path / "litept_pack"),
+        "training_pack_dir": str(tmp_path / "training_pack"),
     }
 
     errors = hooks.verify_summary(
@@ -43,7 +43,7 @@ def test_verify_summary_checks_requested_benchmarks(tmp_path: Path) -> None:
         summary=summary,
         granularities=[0.2, 0.5, 0.8],
         require_oracle=True,
-        require_litept=True,
+        require_training_pack=True,
     )
 
     assert any("eval_benchmarks mismatch" in error for error in errors)

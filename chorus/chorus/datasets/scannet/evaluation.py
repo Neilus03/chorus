@@ -205,7 +205,7 @@ class ScanNetEvaluationHooks(DatasetEvaluationHooks):
         scene_dir: Path,
         granularities: list[float],
         require_oracle: bool = True,
-        require_litept: bool = True,
+        require_training_pack: bool = True,
     ) -> list[Path]:
         if not require_oracle:
             return []
@@ -228,7 +228,7 @@ class ScanNetEvaluationHooks(DatasetEvaluationHooks):
         summary: dict[str, Any],
         granularities: list[float],
         require_oracle: bool = True,
-        require_litept: bool = True,
+        require_training_pack: bool = True,
     ) -> list[str]:
         missing_reasons: list[str] = []
         if not require_oracle:

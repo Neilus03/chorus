@@ -28,11 +28,23 @@ def _granularity_tag(granularity: float) -> str:
     return f"g{granularity}"
 
 
+def _resolve_training_pack_dir(scene_dir: Path) -> Path:
+    training_pack_dir = scene_dir / "training_pack"
+    if training_pack_dir.exists():
+        return training_pack_dir
+
+    legacy_litept_dir = scene_dir / "litept_pack"
+    if legacy_litept_dir.exists():
+        return legacy_litept_dir
+
+    return training_pack_dir
+
+
 def expected_scene_output_paths(
     scene_dir: Path,
     granularities: list[float],
     require_oracle: bool = True,
-    require_litept: bool = True,
+    require_training_pack: bool = True,
     evaluation_hooks: DatasetEvaluationHooks | None = None,
 ) -> list[Path]:
     scene_dir = Path(scene_dir)
@@ -56,22 +68,22 @@ def expected_scene_output_paths(
                 scene_dir=scene_dir,
                 granularities=granularities,
                 require_oracle=require_oracle,
-                require_litept=require_litept,
+                require_training_pack=require_training_pack,
             )
         )
 
-    if require_litept:
-        litept_dir = scene_dir / "litept_pack"
+    if require_training_pack:
+        training_pack_dir = _resolve_training_pack_dir(scene_dir)
         expected.extend(
             [
-                litept_dir / "points.npy",
-                litept_dir / "valid_points.npy",
-                litept_dir / "supervision_mask.npy",
-                litept_dir / "scene_meta.json",
+                training_pack_dir / "points.npy",
+                training_pack_dir / "valid_points.npy",
+                training_pack_dir / "supervision_mask.npy",
+                training_pack_dir / "scene_meta.json",
             ]
         )
         for granularity in granularities:
-            expected.append(litept_dir / f"labels_{_granularity_tag(granularity)}.npy")
+            expected.append(training_pack_dir / f"labels_{_granularity_tag(granularity)}.npy")
 
     return expected
 
@@ -80,7 +92,7 @@ def verify_existing_scene_outputs(
     scene_dir: Path,
     granularities: list[float],
     require_oracle: bool = True,
-    require_litept: bool = True,
+    require_training_pack: bool = True,
     evaluation_hooks: DatasetEvaluationHooks | None = None,
 ) -> tuple[bool, list[str]]:
     missing_or_empty: list[str] = []
@@ -89,7 +101,7 @@ def verify_existing_scene_outputs(
         scene_dir=scene_dir,
         granularities=granularities,
         require_oracle=require_oracle,
-        require_litept=require_litept,
+        require_training_pack=require_training_pack,
         evaluation_hooks=evaluation_hooks,
     ):
         if not path.exists():
@@ -106,7 +118,7 @@ def verify_scene_completion_from_summary(
     scene_dir: Path,
     granularities: list[float],
     require_oracle: bool = True,
-    require_litept: bool = True,
+    require_training_pack: bool = True,
     evaluation_hooks: DatasetEvaluationHooks | None = None,
 ) -> tuple[bool, dict[str, Any] | None, list[str]]:
     scene_dir = Path(scene_dir)
@@ -137,8 +149,10 @@ def verify_scene_completion_from_summary(
         except Exception:
             missing_reasons.append("summary granularities could not be parsed")
 
-    if require_litept and summary.get("litept_pack_dir") is None:
-        missing_reasons.append("summary missing litept_pack_dir")
+    if require_training_pack:
+        training_pack_dir = summary.get("training_pack_dir") or summary.get("litept_pack_dir")
+        if training_pack_dir is None:
+            missing_reasons.append("summary missing training_pack_dir")
 
     if evaluation_hooks is not None:
         missing_reasons.extend(
@@ -147,7 +161,7 @@ def verify_scene_completion_from_summary(
                 summary=summary,
                 granularities=granularities,
                 require_oracle=require_oracle,
-                require_litept=require_litept,
+                require_training_pack=require_training_pack,
             )
         )
 
@@ -155,7 +169,7 @@ def verify_scene_completion_from_summary(
         scene_dir=scene_dir,
         granularities=granularities,
         require_oracle=require_oracle,
-        require_litept=require_litept,
+        require_training_pack=require_training_pack,
         evaluation_hooks=evaluation_hooks,
     )
     if not outputs_ok:

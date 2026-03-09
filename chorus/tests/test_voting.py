@@ -21,7 +21,7 @@ from chorus.common.types import (
 from chorus.core.lifting.voting import build_point_mask_matrix
 import chorus.core.pipeline.project_cluster_stage as project_cluster_stage
 from chorus.datasets.base import SceneAdapter
-from chorus.export.litept_pack import export_litept_scene_pack
+from chorus.export.training_pack import export_training_scene_pack
 
 
 class DummySceneAdapter(SceneAdapter):
@@ -248,7 +248,7 @@ def test_run_project_cluster_stage_keeps_zero_vote_points_unseen_and_unlabeled(
     assert result.stats["num_noise_points_seen"] == 0
 
 
-def test_export_litept_scene_pack_excludes_unseen_points_from_valid_points(
+def test_export_training_scene_pack_excludes_unseen_points_from_valid_points(
     tmp_path: Path,
 ) -> None:
     points = np.array(
@@ -279,10 +279,10 @@ def test_export_litept_scene_pack_excludes_unseen_points_from_valid_points(
         ),
     ]
 
-    output_dir = export_litept_scene_pack(
+    output_dir = export_training_scene_pack(
         adapter=adapter,
         cluster_outputs=cluster_outputs,
-        output_dir=tmp_path / "litept_pack",
+        output_dir=tmp_path / "training_pack",
         frame_skip=1,
     )
 

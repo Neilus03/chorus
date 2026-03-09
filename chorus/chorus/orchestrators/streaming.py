@@ -209,7 +209,7 @@ def run_streaming_scannet(
     min_samples: int = 5,
     cluster_selection_epsilon: float = 0.1,
     run_oracle_eval: bool = True,
-    export_litept: bool = True,
+    export_training_pack: bool = True,
     overwrite_existing: bool = False,
     continue_on_error: bool = True,
     auto_download_missing: bool = True,
@@ -229,7 +229,7 @@ def run_streaming_scannet(
         "granularities": [float(g) for g in granularities],
         "frame_skip": int(frame_skip),
         "run_oracle_eval": bool(run_oracle_eval),
-        "export_litept": bool(export_litept),
+        "export_training_pack": bool(export_training_pack),
         "overwrite_existing": bool(overwrite_existing),
         "auto_download_missing": bool(auto_download_missing),
         "cleanup_after_success": bool(cleanup_after_success),
@@ -264,7 +264,7 @@ def run_streaming_scannet(
             granularities=granularities,
             frame_skip=frame_skip,
             run_oracle_eval=run_oracle_eval,
-            export_litept=export_litept,
+            export_training_pack=export_training_pack,
             overwrite_existing=overwrite_existing,
             auto_download_missing=auto_download_missing,
             cleanup_after_success=cleanup_after_success,
@@ -278,7 +278,7 @@ def run_streaming_scannet(
                 scene_dir=scene_dir,
                 granularities=granularities,
                 require_oracle=run_oracle_eval,
-                require_litept=export_litept,
+                require_training_pack=export_training_pack,
                 evaluation_hooks=evaluation_hooks,
             )
 
@@ -510,7 +510,7 @@ def run_streaming_scannet(
                 min_samples=min_samples,
                 cluster_selection_epsilon=cluster_selection_epsilon,
                 run_oracle_eval=run_oracle_eval,
-                export_litept=export_litept,
+                export_training_pack=export_training_pack,
             )
 
             quality_summary = {
@@ -522,7 +522,7 @@ def run_streaming_scannet(
                 scene_dir=scene_dir,
                 granularities=granularities,
                 require_oracle=run_oracle_eval,
-                require_litept=export_litept,
+                require_training_pack=export_training_pack,
                 evaluation_hooks=evaluation_hooks,
             )
 
@@ -611,7 +611,7 @@ def run_streaming_scannet(
                     scene_dir=scene_dir,
                     granularities=granularities,
                     require_oracle=run_oracle_eval,
-                    require_litept=export_litept,
+                    require_training_pack=export_training_pack,
                     evaluation_hooks=evaluation_hooks,
                 )
 

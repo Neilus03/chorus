@@ -6,7 +6,7 @@ from chorus.core.quality.diagnostics import save_json
 from chorus.core.quality.intrinsic_metrics import compute_scene_intrinsic_metrics
 from chorus.core.teacher.base import TeacherModel
 from chorus.datasets.base import SceneAdapter
-from chorus.export.litept_pack import export_litept_scene_pack
+from chorus.export.training_pack import export_training_scene_pack
 
 
 def run_scene_pipeline(
@@ -19,7 +19,7 @@ def run_scene_pipeline(
     min_samples: int = 5,
     cluster_selection_epsilon: float = 0.1,
     run_oracle_eval: bool = True,
-    export_litept: bool = True,
+    export_training_pack: bool = True,
 ) -> dict:
     print(f"Preparing scene: dataset={adapter.dataset_name}, scene={adapter.scene_id}")
     adapter.prepare()
@@ -55,9 +55,9 @@ def run_scene_pipeline(
             cluster_outputs=cluster_outputs,
         )
 
-    litept_pack_dir = None
-    if export_litept:
-        litept_pack_dir = export_litept_scene_pack(
+    training_pack_dir = None
+    if export_training_pack:
+        training_pack_dir = export_training_scene_pack(
             adapter=adapter,
             cluster_outputs=cluster_outputs,
             teacher_name=teacher.__class__.__name__,
@@ -91,7 +91,7 @@ def run_scene_pipeline(
             for c in cluster_outputs
         ],
         "scene_intrinsic_metrics": scene_intrinsic_metrics,
-        "litept_pack_dir": str(litept_pack_dir) if litept_pack_dir is not None else None,
+        "training_pack_dir": str(training_pack_dir) if training_pack_dir is not None else None,
     }
     if evaluation_summary is not None:
         summary.update(evaluation_summary)
