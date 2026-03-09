@@ -10,3 +10,6 @@ wandb/
 # Scene data directories
 scene[0-9]*_[0-9]*
 
+poc/
+poc2/
+poc3/
