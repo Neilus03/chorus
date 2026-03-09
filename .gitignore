@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.cpython-*.pyc
+*/*.cpython-*.pyc
+
+
+# Weights & Biases
+wandb/
+
+# Scene data directories
+scene[0-9]*_[0-9]*
+
