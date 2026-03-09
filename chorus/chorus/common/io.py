@@ -40,6 +40,37 @@ def _resolve_training_pack_dir(scene_dir: Path) -> Path:
     return training_pack_dir
 
 
+def _validate_training_pack_scene_meta(pack_dir: Path) -> list[str]:
+    if pack_dir.name != "training_pack":
+        return []
+
+    scene_meta_path = pack_dir / "scene_meta.json"
+    scene_meta = load_json_if_exists(scene_meta_path)
+    if scene_meta is None:
+        return [f"{scene_meta_path} (invalid json)"]
+
+    required_fields = [
+        "pack_version",
+        "label_convention",
+        "supervision_mask_definition",
+        "valid_points_definition",
+        "seen_points_definition",
+        "coordinate_units",
+        "coordinate_frame",
+        "point_source",
+        "optional_files_present",
+    ]
+
+    missing_fields = [field for field in required_fields if field not in scene_meta]
+    if not missing_fields:
+        return []
+
+    return [
+        "training pack scene_meta.json missing required fields: "
+        + ", ".join(sorted(missing_fields))
+    ]
+
+
 def expected_scene_output_paths(
     scene_dir: Path,
     granularities: list[float],
@@ -78,6 +109,7 @@ def expected_scene_output_paths(
             [
                 training_pack_dir / "points.npy",
                 training_pack_dir / "valid_points.npy",
+                training_pack_dir / "seen_points.npy",
                 training_pack_dir / "supervision_mask.npy",
                 training_pack_dir / "scene_meta.json",
             ]
@@ -174,5 +206,10 @@ def verify_scene_completion_from_summary(
     )
     if not outputs_ok:
         missing_reasons.extend(missing_outputs)
+
+    if require_training_pack:
+        training_pack_dir = _resolve_training_pack_dir(scene_dir)
+        if training_pack_dir.exists():
+            missing_reasons.extend(_validate_training_pack_scene_meta(training_pack_dir))
 
     return len(missing_reasons) == 0, summary, missing_reasons
