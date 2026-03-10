@@ -1,6 +1,7 @@
-"""PLY visualization utilities for predicted and GT instances.
+"""Mesh PLY visualization for predicted and GT instances.
 
-Writes colored point clouds where each instance gets a distinct color.
+Reads the original ScanNet mesh PLY (with faces), recolors vertices
+by instance assignment, and writes a new binary PLY with faces preserved.
 """
 
 from __future__ import annotations
@@ -10,111 +11,122 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from plyfile import PlyData, PlyElement
 
 from student.data.target_builder import InstanceTargets
 
 log = logging.getLogger(__name__)
 
-# 20 maximally-distinct colors (Tab20), repeated if more instances
-_TAB20 = np.array([
-    [31, 119, 180], [255, 127, 14], [44, 160, 44], [214, 39, 40],
-    [148, 103, 189], [140, 86, 75], [227, 119, 194], [127, 127, 127],
-    [188, 189, 34], [23, 190, 207], [174, 199, 232], [255, 187, 120],
-    [152, 223, 138], [255, 152, 150], [197, 176, 213], [196, 156, 148],
-    [247, 182, 210], [199, 199, 199], [219, 219, 141], [158, 218, 229],
-], dtype=np.uint8)
-
-_UNMATCHED_COLOR = np.array([60, 60, 60], dtype=np.uint8)
-_UNSUPERVISED_COLOR = np.array([30, 30, 30], dtype=np.uint8)
+_UNMATCHED_COLOR = (60, 60, 60)
+_UNSUPERVISED_COLOR = (30, 30, 30)
 
 
-def _instance_palette(n: int) -> np.ndarray:
-    """Return (n, 3) uint8 palette, cycling Tab20 if necessary."""
-    repeats = (n // len(_TAB20)) + 1
-    return np.tile(_TAB20, (repeats, 1))[:n]
+def _instance_palette(n: int, seed: int = 42) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return rng.integers(0, 255, size=(n, 3), dtype=np.uint8)
 
 
-def _write_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
-    """Write a simple colored ASCII PLY."""
-    N = points.shape[0]
-    header = (
-        "ply\n"
-        "format ascii 1.0\n"
-        f"element vertex {N}\n"
-        "property float x\n"
-        "property float y\n"
-        "property float z\n"
-        "property uchar red\n"
-        "property uchar green\n"
-        "property uchar blue\n"
-        "end_header\n"
+def _recolor_mesh(
+    source_ply_path: Path,
+    vertex_colors: np.ndarray,
+    out_path: Path,
+) -> None:
+    plydata = PlyData.read(str(source_ply_path))
+    if "vertex" not in plydata:
+        raise RuntimeError(f"PLY has no vertex element: {source_ply_path}")
+
+    vertex_data = plydata["vertex"].data
+    n_vertices = len(vertex_data)
+    if vertex_colors.shape[0] != n_vertices:
+        raise ValueError(
+            f"Color length {vertex_colors.shape[0]} != "
+            f"vertex count {n_vertices} in {source_ply_path}"
+        )
+
+    out_verts = np.empty(
+        n_vertices,
+        dtype=[
+            ("x", "f4"), ("y", "f4"), ("z", "f4"),
+            ("red", "u1"), ("green", "u1"), ("blue", "u1"),
+        ],
     )
-    with open(path, "w") as f:
-        f.write(header)
-        for i in range(N):
-            f.write(
-                f"{points[i, 0]:.6f} {points[i, 1]:.6f} {points[i, 2]:.6f} "
-                f"{colors[i, 0]} {colors[i, 1]} {colors[i, 2]}\n"
-            )
+    out_verts["x"] = np.asarray(vertex_data["x"], dtype=np.float32)
+    out_verts["y"] = np.asarray(vertex_data["y"], dtype=np.float32)
+    out_verts["z"] = np.asarray(vertex_data["z"], dtype=np.float32)
+    out_verts["red"] = vertex_colors[:, 0]
+    out_verts["green"] = vertex_colors[:, 1]
+    out_verts["blue"] = vertex_colors[:, 2]
+
+    elements = [PlyElement.describe(out_verts, "vertex")]
+    face_el = next((e for e in plydata.elements if e.name == "face"), None)
+    if face_el is not None and len(face_el.data) > 0:
+        elements.append(PlyElement.describe(face_el.data, "face"))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    PlyData(elements, text=False).write(str(out_path))
+
+
+def _resolve_source_mesh(scene_dir: str | Path, scene_meta: dict) -> Path:
+    scene_dir = Path(scene_dir)
+    name = scene_meta.get("geometry_path_name") or scene_meta.get("geometry_source")
+    if name:
+        p = scene_dir / name
+        if p.exists():
+            return p
+    for candidate in scene_dir.glob("*_vh_clean_2.ply"):
+        return candidate
+    raise FileNotFoundError(
+        f"No source mesh PLY in {scene_dir} "
+        f"(tried geometry_path_name={name!r} and *_vh_clean_2.ply)"
+    )
 
 
 def save_prediction_ply(
-    points: np.ndarray,
     mask_logits: torch.Tensor,
     score_logits: torch.Tensor,
     matched_pred_idx: np.ndarray,
+    source_mesh: Path,
     *,
     score_threshold: float = 0.3,
     mask_threshold: float = 0.5,
     path: Path | str = "student_pred.ply",
 ) -> None:
-    """Save a PLY colored by predicted instance assignment.
-
-    - Each high-scoring query's mask gets a distinct color.
-    - Points not claimed by any query stay dark gray.
-    """
     path = Path(path)
-    N = points.shape[0]
-    scores = score_logits.sigmoid()
-    active = (scores >= score_threshold).numpy()
-    masks_binary = (mask_logits.sigmoid() >= mask_threshold).numpy()  # [Q, N]
+    N = mask_logits.shape[1]
+    scores = score_logits.sigmoid().numpy()
+    active = scores >= score_threshold
+    masks_binary = (mask_logits.sigmoid() >= mask_threshold).numpy()
 
-    colors = np.tile(_UNMATCHED_COLOR, (N, 1))
-    palette = _instance_palette(int(active.sum()) + 1)
+    colors = np.full((N, 3), _UNMATCHED_COLOR, dtype=np.uint8)
+    n_active = int(active.sum())
+    palette = _instance_palette(max(n_active, 1))
 
     color_idx = 0
     for q in range(mask_logits.shape[0]):
         if not active[q]:
             continue
-        pts = masks_binary[q]
-        colors[pts] = palette[color_idx]
+        colors[masks_binary[q]] = palette[color_idx]
         color_idx += 1
 
-    _write_ply(path, points, colors)
-    log.info("Prediction PLY saved: %s (%d active queries)", path, int(active.sum()))
+    _recolor_mesh(source_mesh, colors, path)
+    log.info("Prediction mesh: %s (%d active queries)", path, n_active)
 
 
 def save_gt_ply(
-    points: np.ndarray,
     targets: InstanceTargets,
+    source_mesh: Path,
     *,
     path: Path | str = "gt_instances.ply",
 ) -> None:
-    """Save a PLY colored by ground-truth pseudo-instances.
-
-    - Each GT instance gets a distinct color.
-    - Non-supervised points are very dark.
-    """
     path = Path(path)
-    N = points.shape[0]
-    gt_masks = targets.gt_masks.numpy()    # [M, N] bool
-    sup = targets.supervision_mask.numpy()  # [N] bool
+    N = int(targets.supervision_mask.shape[0])
+    gt_masks = targets.gt_masks.numpy()
 
-    colors = np.tile(_UNSUPERVISED_COLOR, (N, 1))
-    palette = _instance_palette(targets.num_instances)
+    colors = np.full((N, 3), _UNSUPERVISED_COLOR, dtype=np.uint8)
+    palette = _instance_palette(max(targets.num_instances, 1))
 
     for m in range(targets.num_instances):
         colors[gt_masks[m]] = palette[m]
 
-    _write_ply(path, points, colors)
-    log.info("GT PLY saved: %s (%d instances)", path, targets.num_instances)
+    _recolor_mesh(source_mesh, colors, path)
+    log.info("GT mesh: %s (%d instances)", path, targets.num_instances)

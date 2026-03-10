@@ -1,11 +1,11 @@
 experiment:
   name: overfit_one_scene
   seed: 42
-  output_root: student_runs
+  output_root: /scratch2/nedela/student_runs
 
 data:
   scene_dir: /scratch2/nedela/chorus_poc/scans/scene0038_00
-  granularity: 0.5
+  granularity: 0.8
   use_colors: true
   append_xyz_to_features: false
   min_instance_points: 10
@@ -16,7 +16,7 @@ model:
     litept_root: /home/nedela/projects/LitePT
     in_channels: 3
     grid_size: 0.02
-  num_queries: 128
+  num_queries: 200
   decoder_hidden_dim: 256
 
 loss:

@@ -233,6 +233,8 @@ def main() -> None:
         output_dir=out_dir,
         score_threshold=eval_cfg.get("score_threshold", 0.3),
         mask_threshold=eval_cfg.get("mask_threshold", 0.5),
+        min_points_per_proposal=eval_cfg.get("min_points_per_proposal", 30),
+        eval_benchmark=eval_cfg.get("scannet_benchmark", "scannet200"),
     )
 
     final_metrics = trainer.train()
@@ -250,10 +252,11 @@ def main() -> None:
     log.info("Final metrics saved: %s", metrics_path)
 
     if use_wandb:
-        wandb.summary.update({
-            f"final/{k}": v for k, v in final_metrics.items()
-            if isinstance(v, (int, float))
-        })
+        wb_final: dict[str, Any] = {}
+        for k, v in final_metrics.items():
+            if isinstance(v, (int, float)):
+                wb_final[f"final/{k}"] = v
+        wandb.summary.update(wb_final)
         wandb.finish()
 
     log.info("Done.")
