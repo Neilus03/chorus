@@ -181,6 +181,7 @@ class SingleSceneTrainer:
         t_start = time.time()
 
         final_metrics: dict[str, Any] = {}
+        last_full_eval: dict[str, Any] | None = None
 
         for self.step in range(1, self.max_steps + 1):
             t0 = time.time()
@@ -286,7 +287,7 @@ class SingleSceneTrainer:
 
             if run_full_eval:
                 try:
-                    full_eval = evaluate_student_predictions(
+                    last_full_eval = evaluate_student_predictions(
                         pred_eval, self.targets,
                         scene_dir=self.sample["scene_dir"],
                         scene_id=self.sample["scene_id"],
@@ -298,22 +299,22 @@ class SingleSceneTrainer:
 
                     if _wandb_active():
                         wb_full: dict[str, Any] = {"step": self.step}
-                        pseudo = full_eval.get("pseudo_gt", {})
+                        pseudo = last_full_eval.get("pseudo_gt", {})
                         if isinstance(pseudo, dict) and "AP25" in pseudo:
                             wb_full["eval/pseudo_AP25"] = pseudo["AP25"]
                             wb_full["eval/pseudo_AP50"] = pseudo["AP50"]
                             wb_full["eval/pseudo_NMI"] = pseudo.get("NMI", 0)
                             wb_full["eval/pseudo_ARI"] = pseudo.get("ARI", 0)
-                        real = full_eval.get("real_gt", {})
+                        real = last_full_eval.get("real_gt", {})
                         if isinstance(real, dict) and "AP25" in real:
                             wb_full["eval/real_AP25"] = real["AP25"]
                             wb_full["eval/real_AP50"] = real["AP50"]
                             wb_full["eval/real_NMI"] = real.get("NMI", 0)
                             wb_full["eval/real_ARI"] = real.get("ARI", 0)
-                        wb_full["eval/num_proposals"] = full_eval.get("num_proposals", 0)
+                        wb_full["eval/num_proposals"] = last_full_eval.get("num_proposals", 0)
                         wandb.log(wb_full)
 
-                    self._log_row({"step": self.step, "full_eval": True, **full_eval})
+                    self._log_row({"step": self.step, "full_eval": True, **last_full_eval})
                 except Exception as e:
                     log.warning("  full eval failed at step %d: %s", self.step, e)
 
@@ -345,4 +346,6 @@ class SingleSceneTrainer:
         final_metrics["total_steps"] = self.max_steps
         final_metrics["best_iou"] = self.best_iou
         final_metrics["training_time_s"] = elapsed
+        if last_full_eval is not None:
+            final_metrics["evaluation"] = last_full_eval
         return final_metrics
