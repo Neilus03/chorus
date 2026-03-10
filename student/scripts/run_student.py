@@ -3,20 +3,8 @@
 
 Usage
 -----
-    python scripts/run_student.py --config configs/overfit_one_scene.yaml \
-        --scene-dir /path/to/scene0042_00 --granularity 0.5
-
-Everything runs in order:
-    1. load config + CLI overrides
-    2. set seed
-    3. build one-scene dataset
-    4. build targets
-    5. build model       (TODO)
-    6. build loss        (TODO)
-    7. build trainer     (TODO)
-    8. train             (TODO)
-    9. final evaluation  (TODO)
-   10. save metrics JSON (TODO)
+    python scripts/run_student.py --config configs/overfit_one_scene.yaml
+    python scripts/run_student.py --config configs/overfit_one_scene.yaml --max-steps 50
 """
 
 from __future__ import annotations
@@ -25,7 +13,6 @@ import argparse
 import json
 import logging
 import random
-import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -43,10 +30,11 @@ if str(_STUDENT_PKG) not in sys.path:
 from student.data import (
     SingleSceneTrainingPackDataset,
     build_instance_targets,
-    load_training_pack_scene,
 )
 from student.data.target_builder import log_target_stats
-from student.data.training_pack import print_training_pack_summary
+from student.losses import MaskSetCriterion
+from student.models.student_model import build_student_model
+from student.engine.trainer import SingleSceneTrainer
 
 log = logging.getLogger("run_student")
 
@@ -172,27 +160,58 @@ def main() -> None:
         yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
     log.info("Output dir: %s", out_dir)
 
-    # ── 5–10: model / loss / train / eval — to be implemented ──
-    log.info(
-        "Data pipeline verified: %d pts, %d features, %d instances.  "
-        "Model / loss / trainer / eval not yet implemented.",
-        ds.num_points,
-        ds.feature_dim,
-        targets.num_instances,
+    # ── 5. model ──
+    bb_cfg = model_cfg["backbone"]
+    model = build_student_model(
+        litept_root=bb_cfg["litept_root"],
+        in_channels=bb_cfg.get("in_channels", ds.feature_dim),
+        grid_size=bb_cfg.get("grid_size", 0.02),
+        hidden_dim=model_cfg.get("decoder_hidden_dim", 256),
+        num_queries=model_cfg.get("num_queries", 128),
+    )
+    total_params = sum(p.numel() for p in model.parameters())
+    log.info("Model: %s params", f"{total_params:,}")
+
+    # ── 6. criterion ──
+    criterion = MaskSetCriterion(
+        bce_weight=loss_cfg.get("bce_weight", 1.0),
+        dice_weight=loss_cfg.get("dice_weight", 1.0),
+        score_weight=loss_cfg.get("score_weight", 0.5),
     )
 
-    # Placeholder: save a stub metrics file so the output structure exists.
-    stub_metrics = {
+    # ── 7. train ──
+    trainer = SingleSceneTrainer(
+        model=model,
+        criterion=criterion,
+        sample=sample,
+        targets=targets,
+        device=device,
+        lr=train_cfg.get("lr", 1e-4),
+        weight_decay=train_cfg.get("weight_decay", 1e-4),
+        grad_clip_norm=train_cfg.get("grad_clip_norm", 1.0),
+        max_steps=train_cfg.get("max_steps", 2000),
+        log_every=train_cfg.get("log_every", 20),
+        eval_every=train_cfg.get("eval_every", 100),
+        save_every=train_cfg.get("save_every", 200),
+        output_dir=out_dir,
+        score_threshold=eval_cfg.get("score_threshold", 0.3),
+    )
+
+    final_metrics = trainer.train()
+
+    # ── 8. save final metrics ──
+    final_metrics.update({
         "scene_id": ds.scene_id,
         "granularity": granularity,
         "num_points": ds.num_points,
         "num_instances": targets.num_instances,
-        "status": "data_pipeline_only",
-    }
-    with (out_dir / "eval" / "final_metrics.json").open("w", encoding="utf-8") as f:
-        json.dump(stub_metrics, f, indent=2)
+    })
+    metrics_path = out_dir / "eval" / "final_metrics.json"
+    with metrics_path.open("w", encoding="utf-8") as f:
+        json.dump(final_metrics, f, indent=2)
+    log.info("Final metrics saved: %s", metrics_path)
 
-    log.info("Done — data pipeline smoke-test passed.")
+    log.info("Done.")
 
 
 if __name__ == "__main__":
