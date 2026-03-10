@@ -4,7 +4,7 @@ experiment:
   output_root: student_runs
 
 data:
-  scene_dir: /scratch2/nedela/chorus_poc/scans/scene0042_00
+  scene_dir: /scratch2/nedela/chorus_poc/scans/scene0038_00
   granularity: 0.5
   use_colors: true
   append_xyz_to_features: false
