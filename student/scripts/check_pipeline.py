@@ -11,6 +11,7 @@ _STUDENT_PKG = Path(__file__).resolve().parent.parent
 if str(_STUDENT_PKG) not in sys.path:
     sys.path.insert(0, str(_STUDENT_PKG))
 
+import numpy as np
 import torch
 
 from student.data import (
@@ -159,9 +160,56 @@ def main() -> None:
     print(f"  N dimension      : {'MATCH' if match else 'MISMATCH'}")
     print(f"  Q={Q} query slots for M={M} GT instances (headroom: {Q - M})")
 
+    # ── 9. Matching + Loss ────────────────────────────────────────
+    sep("9. MATCHING + LOSS")
+    from student.losses.mask_set_loss import MaskSetCriterion
+
+    criterion = MaskSetCriterion(
+        bce_weight=1.0, dice_weight=1.0, score_weight=0.5,
+    )
+
+    model.zero_grad()
+    out2 = model(points, features)
+
+    t0 = time.time()
+    loss_dict = criterion(out2, targets)
+    loss_ms = (time.time() - t0) * 1000
+    print(f"  criterion time   : {loss_ms:.0f} ms")
+    print(f"  cost_matrix      : {loss_dict['cost_matrix_shape']}")
+    print(f"  num_matches      : {loss_dict['num_matches']} / {M} GT instances")
+    print(f"  matched pred idx : {loss_dict['matched_pred_indices'][:8]}{'...' if loss_dict['num_matches'] > 8 else ''}")
+    print(f"  matched gt idx   : {loss_dict['matched_gt_indices'][:8]}{'...' if loss_dict['num_matches'] > 8 else ''}")
+    print(f"  loss_mask_bce    : {loss_dict['loss_mask_bce']:.4f}")
+    print(f"  loss_mask_dice   : {loss_dict['loss_mask_dice']:.4f}")
+    print(f"  loss_score       : {loss_dict['loss_score']:.4f}")
+    print(f"  loss_total       : {loss_dict['loss_total'].item():.4f}")
+    finite = loss_dict["loss_total"].isfinite().item()
+    print(f"  loss is finite   : {finite}")
+
+    # ── 10. Backward through real loss ────────────────────────────
+    sep("10. BACKWARD THROUGH REAL LOSS")
+    t0 = time.time()
+    loss_dict["loss_total"].backward()
+    bwd2_ms = (time.time() - t0) * 1000
+    print(f"  backward time    : {bwd2_ms:.0f} ms")
+
+    bb_grad2 = sum(1 for p in model.backbone.parameters() if p.grad is not None)
+    dc_grad2 = sum(1 for p in model.decoder.parameters() if p.grad is not None)
+    print(f"  backbone grads   : {bb_grad2} / {bb_total}")
+    print(f"  decoder grads    : {dc_grad2} / {dc_total}")
+
+    bb_gnorm = torch.nn.utils.clip_grad_norm_(model.backbone.parameters(), float("inf")).item()
+    dc_gnorm = torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), float("inf")).item()
+    print(f"  backbone grad norm : {bb_gnorm:.4f}")
+    print(f"  decoder grad norm  : {dc_gnorm:.4f}")
+
     # ── summary ───────────────────────────────────────────────────
     sep("SUMMARY")
-    all_ok = bb_grad > 0 and dc_grad > 0 and g > 0 and match
+    all_ok = (
+        bb_grad > 0 and dc_grad > 0 and g > 0 and match
+        and finite and bb_grad2 > 0 and dc_grad2 > 0
+        and loss_dict["num_matches"] == M
+    )
     checks = [
         ("training pack loads", True),
         ("dataset returns correct tensors", True),
@@ -172,11 +220,16 @@ def main() -> None:
         ("scores are scene-dependent", g > 0),
         ("pred/gt N dimension aligned", match),
         ("enough query slots", Q >= M),
+        ("matching finds all GT instances", loss_dict["num_matches"] == M),
+        ("loss is finite", finite),
+        ("real loss backward reaches backbone", bb_grad2 > 0),
+        ("real loss backward reaches decoder", dc_grad2 > 0),
+        ("grad norms are finite", np.isfinite(bb_gnorm) and np.isfinite(dc_gnorm)),
     ]
     for name, ok in checks:
         print(f"  [{'OK' if ok else 'FAIL'}] {name}")
 
-    print(f"\n{'ALL OK — ready for matching + loss.' if all_ok else 'SOMETHING FAILED.'}")
+    print(f"\n{'ALL OK — ready for training loop.' if all_ok else 'SOMETHING FAILED.'}")
 
 
 if __name__ == "__main__":
