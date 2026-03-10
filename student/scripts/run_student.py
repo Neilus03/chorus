@@ -5,6 +5,7 @@ Usage
 -----
     python scripts/run_student.py --config configs/overfit_one_scene.yaml
     python scripts/run_student.py --config configs/overfit_one_scene.yaml --max-steps 50
+    python scripts/run_student.py --config configs/overfit_one_scene.yaml --no-wandb
 """
 
 from __future__ import annotations
@@ -37,6 +38,11 @@ from student.models.student_model import build_student_model
 from student.engine.trainer import SingleSceneTrainer
 
 log = logging.getLogger("run_student")
+
+try:
+    import wandb
+except ImportError:
+    wandb = None  # type: ignore[assignment]
 
 
 # ── config ───────────────────────────────────────────────────────────────
@@ -93,6 +99,9 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--output-root", type=str, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--wandb-project", type=str, default="chorus-student")
+    parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument(
         "overrides", nargs="*",
         help="dotted key=value config overrides, e.g. train.lr=3e-4",
@@ -179,6 +188,34 @@ def main() -> None:
         score_weight=loss_cfg.get("score_weight", 0.5),
     )
 
+    # ── wandb ──
+    use_wandb = (
+        not args.no_wandb
+        and wandb is not None
+    )
+    if use_wandb:
+        run_name = args.wandb_name or f"{ds.scene_id}_g{granularity}"
+        wandb.init(
+            project=args.wandb_project,
+            name=run_name,
+            config={
+                **cfg,
+                "scene_id": ds.scene_id,
+                "num_points": ds.num_points,
+                "feature_dim": ds.feature_dim,
+                "num_instances": targets.num_instances,
+                "total_params": total_params,
+            },
+            dir=str(out_dir),
+            tags=[ds.scene_id, f"g{granularity}", "overfit_one_scene"],
+        )
+        wandb.define_metric("train/*", step_metric="step")
+        wandb.define_metric("eval/*", step_metric="step")
+        wandb.define_metric("step")
+        log.info("wandb run: %s", wandb.run.url)
+    else:
+        log.info("wandb disabled")
+
     # ── 7. train ──
     trainer = SingleSceneTrainer(
         model=model,
@@ -195,6 +232,7 @@ def main() -> None:
         save_every=train_cfg.get("save_every", 200),
         output_dir=out_dir,
         score_threshold=eval_cfg.get("score_threshold", 0.3),
+        mask_threshold=eval_cfg.get("mask_threshold", 0.5),
     )
 
     final_metrics = trainer.train()
@@ -210,6 +248,13 @@ def main() -> None:
     with metrics_path.open("w", encoding="utf-8") as f:
         json.dump(final_metrics, f, indent=2)
     log.info("Final metrics saved: %s", metrics_path)
+
+    if use_wandb:
+        wandb.summary.update({
+            f"final/{k}": v for k, v in final_metrics.items()
+            if isinstance(v, (int, float))
+        })
+        wandb.finish()
 
     log.info("Done.")
 
