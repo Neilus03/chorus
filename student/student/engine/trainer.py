@@ -191,14 +191,25 @@ class SingleSceneTrainer:
             self.optimizer.step()
 
             step_ms = (time.time() - t0) * 1000
+            loss_total = loss_dict["loss_total"].item()
+            loss_bce = loss_dict["loss_mask_bce"].item()
+            loss_dice = loss_dict["loss_mask_dice"].item()
+            loss_score = loss_dict["loss_score"].item()
 
-            # ── log every N steps ──
+            # ── wandb: every step ──
+            if _wandb_active():
+                wandb.log({
+                    "train/loss_total": loss_total,
+                    "train/loss_mask_bce": loss_bce,
+                    "train/loss_mask_dice": loss_dice,
+                    "train/loss_score": loss_score,
+                    "train/grad_norm": grad_norm,
+                    "train/step_ms": step_ms,
+                    "train/lr": self.lr,
+                }, step=self.step)
+
+            # ── console + jsonl: every N steps ──
             if self.step % self.log_every == 0 or self.step == 1:
-                loss_total = loss_dict["loss_total"].item()
-                loss_bce = loss_dict["loss_mask_bce"].item()
-                loss_dice = loss_dict["loss_mask_dice"].item()
-                loss_score = loss_dict["loss_score"].item()
-
                 log.info(
                     "step %4d/%d  loss=%.4f  bce=%.4f  dice=%.4f  score=%.4f  "
                     "gnorm=%.3f  %.0fms",
@@ -206,7 +217,7 @@ class SingleSceneTrainer:
                     loss_total, loss_bce, loss_dice, loss_score,
                     grad_norm, step_ms,
                 )
-                row = {
+                self._log_row({
                     "step": self.step,
                     "loss_total": loss_total,
                     "loss_mask_bce": loss_bce,
@@ -214,19 +225,7 @@ class SingleSceneTrainer:
                     "loss_score": loss_score,
                     "grad_norm": grad_norm,
                     "step_ms": step_ms,
-                }
-                self._log_row(row)
-
-                if _wandb_active():
-                    wandb.log({
-                        "train/loss_total": loss_total,
-                        "train/loss_mask_bce": loss_bce,
-                        "train/loss_mask_dice": loss_dice,
-                        "train/loss_score": loss_score,
-                        "train/grad_norm": grad_norm,
-                        "train/step_ms": step_ms,
-                        "train/lr": self.lr,
-                    }, step=self.step)
+                })
 
             # ── eval metrics ──
             if self.step % self.eval_every == 0 or self.step == 1:
