@@ -1,0 +1,43 @@
+experiment:
+  name: overfit_one_scene
+  seed: 42
+  output_root: student_runs
+
+data:
+  scene_dir: /scratch2/nedela/chorus_poc/scans/scene0042_00
+  granularity: 0.5
+  use_colors: true
+  append_xyz_to_features: false
+  min_instance_points: 10
+
+model:
+  backbone:
+    name: litept
+    litept_root: /home/nedela/projects/LitePT
+    in_channels: 3
+    grid_size: 0.02
+  num_queries: 128
+  decoder_hidden_dim: 256
+
+loss:
+  bce_weight: 1.0
+  dice_weight: 1.0
+  score_weight: 0.5
+
+train:
+  device: cuda:0
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  max_steps: 2000
+  grad_clip_norm: 1.0
+  log_every: 20
+  eval_every: 100
+  save_every: 200
+
+eval:
+  scannet_benchmark: scannet200
+  score_threshold: 0.3
+  mask_threshold: 0.5
+  min_points_per_proposal: 30
+  save_ply: true
+  save_oracle_upper_bound: true
