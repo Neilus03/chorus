@@ -63,6 +63,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--use-release-list",
         action="store_true",
+        default= "/scratch2/nedela/chorus_poc/scans/_chorus_reports/scannet_release_list_full.txt",
         help="Use the full official ScanNet release list from the downloader script",
     )
     parser.add_argument(
@@ -131,6 +132,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--overwrite-teacher",
         action="store_true",
+        default=False,
         help="Recompute teacher masks even if they already exist",
     )
     parser.add_argument(
@@ -140,6 +142,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--continue-on-error",
+        default=True,
         action="store_true",
         help="Continue processing remaining scenes if one scene fails",
     )
@@ -182,6 +185,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--wandb",
+        default=True,
         action="store_true",
         help="Enable Weights & Biases reporting",
     )
@@ -202,6 +206,12 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default="online",
         help="W&B mode: online, offline, disabled",
+    )
+    parser.add_argument(
+        "--wandb-dir",
+        type=Path,
+        default=Path(os.environ.get("CHORUS_WANDB_DIR", "/scratch2/nedela/chorus_wandb")),
+        help="Directory where W&B run files/logs are written (recommended: on /scratch2).",
     )
 
     return parser.parse_args()
@@ -242,6 +252,7 @@ def main() -> None:
     print(f"max_download_retries={args.max_download_retries}")
     print(f"report_dir={report_dir}")
     print(f"wandb={args.wandb}")
+    print(f"wandb_dir={args.wandb_dir}")
 
     teacher = UnSAMv2Teacher(
         device=args.device,
@@ -260,6 +271,7 @@ def main() -> None:
         entity=args.wandb_entity,
         mode=args.wandb_mode,
         run_name=f"chorus_streaming_{timestamp}",
+        wandb_dir=args.wandb_dir,
         config={
             "scans_root": str(scans_root),
             "granularities": granularities,

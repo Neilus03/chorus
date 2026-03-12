@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 
@@ -11,6 +12,7 @@ class WandbReporter:
         entity: str | None = None,
         mode: str = "online",
         run_name: str | None = None,
+        wandb_dir: str | Path | None = None,
         config: dict[str, Any] | None = None,
         extra_metric_fields: list[str] | None = None,
     ):
@@ -31,11 +33,18 @@ class WandbReporter:
             ) from exc
 
         self._wandb = wandb
+
+        resolved_dir: str | None = None
+        if wandb_dir is not None:
+            resolved_dir = str(Path(wandb_dir).expanduser().resolve())
+            Path(resolved_dir).mkdir(parents=True, exist_ok=True)
+
         self.run = wandb.init(
             project=project,
             entity=entity,
             mode=mode,
             name=run_name,
+            dir=resolved_dir,
             config=config or {},
         )
 
