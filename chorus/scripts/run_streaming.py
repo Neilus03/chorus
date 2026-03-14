@@ -313,6 +313,14 @@ def main() -> None:
         print("\n" + "=" * 90)
         print("Streaming run summary")
         print("=" * 90)
+        rt = run_summary.get("run_timing") or {}
+        if rt:
+            print(
+                f"Run wall: {rt.get('wall_clock_hours', 0):.3f} h | "
+                f"full pipeline scenes: {rt.get('num_scenes_fully_processed', 0)} | "
+                f"pace (full pipeline time): {rt.get('pace_full_pipeline_scenes_per_hour')} sc/h | "
+                f"pace (job wall): {rt.get('pace_requested_scenes_per_hour_wall')} sc/h"
+            )
         print(json.dumps(run_summary, indent=2))
         print(f"\nSaved run summary to: {report_path}")
         print(f"Local scene table CSV: {local_reporter.scene_csv_path}")

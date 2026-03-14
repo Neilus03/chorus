@@ -9,6 +9,7 @@ from chorus.common.manifest import (
     add_manifest_event,
     finalize_scene_manifest,
     init_scene_manifest,
+    utcnow_iso,
     write_scene_manifest,
 )
 from chorus.core.pipeline.scene_pipeline import run_scene_pipeline
@@ -220,10 +221,12 @@ def run_streaming_scannet(
 ) -> dict[str, Any]:
     scans_root = Path(scans_root)
 
-
+    run_wall_start_perf = time.perf_counter()
+    run_started_at = utcnow_iso()
 
     run_summary: dict[str, Any] = {
         "scans_root": str(scans_root),
+        "started_at": run_started_at,
         "num_scenes_requested": len(scene_ids),
         "scannet_eval_benchmarks": list(parse_scannet_eval_benchmarks(scannet_eval_benchmarks)),
         "granularities": [float(g) for g in granularities],
@@ -804,6 +807,37 @@ def run_streaming_scannet(
 
             if not continue_on_error:
                 break
+
+    wall_seconds = time.perf_counter() - run_wall_start_perf
+    scene_results = run_summary.get("scene_results") or []
+    full_done = [r for r in scene_results if r.get("status") == "done"]
+    n_full = len(full_done)
+    sum_pipeline_seconds = sum(float(r.get("duration_seconds") or 0.0) for r in full_done)
+    wall_hours = wall_seconds / 3600.0 if wall_seconds > 0 else 0.0
+    pipeline_hours = sum_pipeline_seconds / 3600.0 if sum_pipeline_seconds > 0 else 0.0
+
+    run_summary["finished_at"] = utcnow_iso()
+    run_summary["run_timing"] = {
+        "wall_clock_seconds": round(wall_seconds, 3),
+        "wall_clock_hours": round(wall_hours, 4),
+        "num_scenes_fully_processed": n_full,
+        "num_scenes_skipped_already_done": int(run_summary.get("skipped_done") or 0),
+        "num_scenes_failed": int(run_summary.get("failed") or 0),
+        "sum_pipeline_seconds_full_scenes": round(sum_pipeline_seconds, 3),
+        "sum_pipeline_hours_full_scenes": round(pipeline_hours, 4),
+        # Machine busy on full pipeline only (sequential ≈ wall for those scenes)
+        "pace_full_pipeline_scenes_per_hour": (
+            round(n_full / pipeline_hours, 4) if pipeline_hours > 1e-9 else None
+        ),
+        # Whole job: every scene slot vs wall time (includes fast skips)
+        "pace_requested_scenes_per_hour_wall": (
+            round(len(scene_ids) / wall_hours, 4) if wall_hours > 1e-9 else None
+        ),
+        # Full annotations only vs total job wall (drops when most scenes skipped)
+        "pace_full_scenes_per_hour_wall": (
+            round(n_full / wall_hours, 4) if wall_hours > 1e-9 and n_full > 0 else None
+        ),
+    }
 
     if reporter is not None:
         reporter.log_summary(run_summary)
