@@ -3,7 +3,7 @@
 Pure composition of backbone + decoder.  Nothing else.
 
     input:  points [N, 3], features [N, C]
-    output: dict with mask_logits [Q, N], score_logits [Q], ...
+    output: nested dict with shared point_embed and per-head predictions
 """
 
 from __future__ import annotations
@@ -12,24 +12,24 @@ import torch
 import torch.nn as nn
 
 from student.models.litept_wrapper import LitePTBackbone
-from student.models.instance_decoder import QueryInstanceDecoder
+from student.models.instance_decoder import MultiHeadQueryInstanceDecoder
 
 
 class StudentInstanceSegModel(nn.Module):
-    """LitePT backbone → query instance decoder.
+    """LitePT backbone -> multi-head query instance decoder.
 
     Parameters
     ----------
     backbone:
         Pre-constructed :class:`LitePTBackbone`.
     decoder:
-        Pre-constructed :class:`QueryInstanceDecoder`.
+        Pre-constructed :class:`MultiHeadQueryInstanceDecoder`.
     """
 
     def __init__(
         self,
         backbone: LitePTBackbone,
-        decoder: QueryInstanceDecoder,
+        decoder: MultiHeadQueryInstanceDecoder,
     ) -> None:
         super().__init__()
         self.backbone = backbone
@@ -47,7 +47,7 @@ class StudentInstanceSegModel(nn.Module):
         self,
         points: torch.Tensor,
         features: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict:
         """
         Parameters
         ----------
@@ -56,11 +56,12 @@ class StudentInstanceSegModel(nn.Module):
 
         Returns
         -------
-        Dict with at least:
-            mask_logits  : [Q, N]
-            score_logits : [Q]
-            point_embed  : [N, D]
-            query_embed  : [Q, D]
+        Nested dict:
+            point_embed : [N, D]
+            heads:
+                g02: {mask_logits, score_logits, query_embed}
+                g05: {mask_logits, score_logits, query_embed}
+                g08: {mask_logits, score_logits, query_embed}
         """
         point_feat = self.backbone(points, features)
         return self.decoder(point_feat)
@@ -72,6 +73,7 @@ def build_student_model(
     grid_size: float = 0.02,
     hidden_dim: int = 256,
     num_queries: int = 128,
+    granularities: tuple[str, ...] = ("g02", "g05", "g08"),
 ) -> StudentInstanceSegModel:
     """Convenience factory from scalar config values."""
     backbone = LitePTBackbone(
@@ -79,9 +81,10 @@ def build_student_model(
         in_channels=in_channels,
         grid_size=grid_size,
     )
-    decoder = QueryInstanceDecoder(
+    decoder = MultiHeadQueryInstanceDecoder(
         in_channels=backbone.out_channels,
         hidden_dim=hidden_dim,
         num_queries=num_queries,
+        granularities=granularities,
     )
     return StudentInstanceSegModel(backbone=backbone, decoder=decoder)

@@ -268,3 +268,34 @@ def evaluate_student_predictions(
         result["real_gt"] = {"error": str(e)}
 
     return result
+
+
+def evaluate_student_predictions_multi(
+    pred: dict,
+    targets_by_granularity: dict[str, InstanceTargets],
+    scene_dir: str | Path,
+    scene_id: str,
+    *,
+    score_threshold: float = 0.3,
+    mask_threshold: float = 0.5,
+    min_points: int = 30,
+    eval_benchmark: str = "scannet200",
+) -> dict[str, Any]:
+    """Full evaluation for each granularity head.
+
+    Returns dict mapping granularity keys to per-head evaluation results.
+    """
+    result: dict[str, Any] = {}
+    for g, targets_g in targets_by_granularity.items():
+        head_pred = pred["heads"][g]
+        result[g] = evaluate_student_predictions(
+            head_pred,
+            targets_g,
+            scene_dir=scene_dir,
+            scene_id=scene_id,
+            score_threshold=score_threshold,
+            mask_threshold=mask_threshold,
+            min_points=min_points,
+            eval_benchmark=eval_benchmark,
+        )
+    return result

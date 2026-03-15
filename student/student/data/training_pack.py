@@ -162,6 +162,33 @@ class TrainingPackScene:
         return int(self.points.shape[0])
 
 
+@dataclass(frozen=True)
+class MultiGranTrainingPackScene:
+    """Training-pack with labels loaded for multiple granularities at once.
+
+    Geometry, masks, and metadata are shared; only labels differ per
+    granularity.
+    """
+
+    scene_id: str
+    scene_dir: Path
+    training_pack_dir: Path
+
+    points: np.ndarray               # (N, 3) float
+    colors: np.ndarray | None        # (N, 3) float/uint8 or None
+    labels_by_granularity: dict[str, np.ndarray]  # {"g02": (N,), ...}
+    valid_points: np.ndarray         # (N,)   bool
+    seen_points: np.ndarray          # (N,)   bool
+    supervision_mask: np.ndarray     # (N,)   bool
+
+    scene_meta: dict[str, Any]
+    granularities: tuple[str, ...]   # ("g02", "g05", "g08")
+
+    @property
+    def num_points(self) -> int:
+        return int(self.points.shape[0])
+
+
 # ── main loader ──────────────────────────────────────────────────────────
 
 
@@ -237,6 +264,92 @@ def load_training_pack_scene(
         supervision_mask=supervision_mask,
         scene_meta=meta,
         granularity=granularity,
+    )
+
+
+def _gran_key_to_float(g_key: str) -> float:
+    """Convert a dot-free granularity key to a float for label file lookup.
+
+    ``"g02"`` -> ``0.2``,  ``"g05"`` -> ``0.5``,  ``"g08"`` -> ``0.8``
+
+    Also accepts the dotted on-disk format (e.g. ``"g0.2"`` -> ``0.2``).
+    """
+    stripped = g_key.lstrip("g")
+    if "." in stripped:
+        return float(stripped)
+    return int(stripped) / 10.0
+
+
+def load_training_pack_scene_multi(
+    scene_dir: str | Path,
+    granularities: tuple[str, ...] = ("g02", "g05", "g08"),
+) -> MultiGranTrainingPackScene:
+    """Load a training-pack for one scene with multiple granularities.
+
+    Parameters
+    ----------
+    scene_dir:
+        Path to the scene directory, or directly to the pack subdirectory.
+    granularities:
+        Dot-free granularity keys, e.g. ``("g02", "g05", "g08")``.
+        Each is converted to the dotted on-disk format for label file lookup.
+    """
+    scene_dir = Path(scene_dir)
+    pack_dir = _resolve_pack_dir(scene_dir)
+
+    meta = _load_scene_meta(pack_dir)
+    num_points_declared: int = meta["num_points"]
+
+    points = np.load(pack_dir / "points.npy")
+
+    opt = meta.get("optional_files_present", {})
+    has_colors = opt.get("colors.npy", (pack_dir / "colors.npy").exists())
+    colors: np.ndarray | None = None
+    if has_colors:
+        colors_path = pack_dir / "colors.npy"
+        if not colors_path.exists():
+            raise FileNotFoundError(
+                "scene_meta declares colors.npy present but file is missing"
+            )
+        colors = np.load(colors_path)
+
+    valid_points = np.load(pack_dir / "valid_points.npy").astype(bool)
+    seen_points = np.load(pack_dir / "seen_points.npy").astype(bool)
+    supervision_mask = np.load(pack_dir / "supervision_mask.npy").astype(bool)
+
+    labels_by_gran: dict[str, np.ndarray] = {}
+    for g_key in granularities:
+        g_float = _gran_key_to_float(g_key)
+        label_path = _resolve_label_file(meta, g_float, pack_dir)
+        labels = np.load(label_path)
+        _validate_scene_arrays(
+            num_points_declared=num_points_declared,
+            points=points,
+            colors=colors,
+            labels=labels,
+            valid_points=valid_points,
+            seen_points=seen_points,
+            supervision_mask=supervision_mask,
+        )
+        labels_by_gran[g_key] = labels
+
+    if scene_dir == pack_dir:
+        resolved_scene_dir = pack_dir.parent
+    else:
+        resolved_scene_dir = scene_dir
+
+    return MultiGranTrainingPackScene(
+        scene_id=meta["scene_id"],
+        scene_dir=resolved_scene_dir,
+        training_pack_dir=pack_dir,
+        points=points,
+        colors=colors,
+        labels_by_granularity=labels_by_gran,
+        valid_points=valid_points,
+        seen_points=seen_points,
+        supervision_mask=supervision_mask,
+        scene_meta=meta,
+        granularities=granularities,
     )
 
 

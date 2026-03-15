@@ -95,6 +95,32 @@ def build_instance_targets(
     )
 
 
+def build_instance_targets_multi(
+    labels_by_granularity: dict[str, torch.Tensor],
+    supervision_mask: torch.Tensor,
+    *,
+    min_instance_points: int = 1,
+    ignore_label: int = -1,
+) -> dict[str, InstanceTargets]:
+    """Build per-instance targets for each granularity.
+
+    Calls :func:`build_instance_targets` once per granularity key.
+
+    Returns
+    -------
+    Dict mapping granularity keys (e.g. ``"g02"``) to :class:`InstanceTargets`.
+    """
+    return {
+        g: build_instance_targets(
+            labels,
+            supervision_mask,
+            min_instance_points=min_instance_points,
+            ignore_label=ignore_label,
+        )
+        for g, labels in labels_by_granularity.items()
+    }
+
+
 def log_target_stats(
     targets: InstanceTargets,
     tag: str = "",

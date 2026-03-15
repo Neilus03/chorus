@@ -234,3 +234,68 @@ class MaskSetCriterion(nn.Module):
             "matched_gt_indices": gt_idx,
             "cost_matrix_shape": tuple(cost_matrix.shape),
         }
+
+
+class MultiGranCriterion(nn.Module):
+    """Applies :class:`MaskSetCriterion` independently per granularity head
+    and sums the losses.
+
+    Parameters
+    ----------
+    criterion:
+        A shared :class:`MaskSetCriterion` instance (same loss weights
+        for every head).
+    granularity_weights:
+        Optional per-head loss multiplier.  Defaults to 1.0 for each.
+    """
+
+    def __init__(
+        self,
+        criterion: MaskSetCriterion,
+        granularity_weights: dict[str, float] | None = None,
+    ) -> None:
+        super().__init__()
+        self.criterion = criterion
+        self.granularity_weights = granularity_weights or {}
+
+    def forward(
+        self,
+        pred: dict,
+        targets_by_granularity: dict[str, "InstanceTargets"],
+    ) -> dict[str, Any]:
+        """
+        Parameters
+        ----------
+        pred:
+            Nested dict from ``MultiHeadQueryInstanceDecoder`` with
+            ``pred["heads"][g]`` containing ``mask_logits`` and
+            ``score_logits`` for each granularity ``g``.
+        targets_by_granularity:
+            Dict mapping granularity keys to :class:`InstanceTargets`.
+
+        Returns
+        -------
+        Dict with ``loss_total`` (summed), per-head loss dicts keyed by
+        granularity, and per-head matching info.
+        """
+        heads_pred = pred["heads"]
+        total_loss = None
+        result: dict[str, Any] = {"heads": {}}
+
+        for g, targets_g in targets_by_granularity.items():
+            head_pred = heads_pred[g]
+            ld = self.criterion(head_pred, targets_g)
+
+            w = self.granularity_weights.get(g, 1.0)
+            weighted = w * ld["loss_total"]
+
+            if total_loss is None:
+                total_loss = weighted
+            else:
+                total_loss = total_loss + weighted
+
+            result["heads"][g] = ld
+
+        assert total_loss is not None, "No granularity heads to compute loss for"
+        result["loss_total"] = total_loss
+        return result

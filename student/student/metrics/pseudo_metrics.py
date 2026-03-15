@@ -105,6 +105,43 @@ def compute_pseudo_metrics(
     return metrics
 
 
+def compute_pseudo_metrics_multi(
+    pred: dict,
+    targets_by_granularity: dict[str, InstanceTargets],
+    loss_result: dict,
+    *,
+    score_threshold: float = 0.3,
+    mask_threshold: float = 0.5,
+) -> dict[str, dict[str, Any]]:
+    """Compute pseudo metrics for each granularity head.
+
+    Parameters
+    ----------
+    pred:
+        Nested dict from the multi-head decoder.
+    targets_by_granularity:
+        Dict mapping granularity keys to :class:`InstanceTargets`.
+    loss_result:
+        Output from :class:`MultiGranCriterion`, used to get matching indices.
+
+    Returns
+    -------
+    Dict mapping granularity keys to per-head metric dicts.
+    """
+    result: dict[str, dict[str, Any]] = {}
+    for g, targets_g in targets_by_granularity.items():
+        head_loss = loss_result["heads"][g]
+        result[g] = compute_pseudo_metrics(
+            pred["heads"][g],
+            targets_g,
+            head_loss["matched_pred_indices"],
+            head_loss["matched_gt_indices"],
+            score_threshold=score_threshold,
+            mask_threshold=mask_threshold,
+        )
+    return result
+
+
 def format_pseudo_metrics(m: dict[str, Any]) -> str:
     """One-line summary for logging."""
     return (

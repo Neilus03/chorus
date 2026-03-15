@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single entry point for the first student experiment.
+"""Single entry point for the student experiment (multi-granularity).
 
 Usage
 -----
@@ -28,12 +28,9 @@ _STUDENT_PKG = _SCRIPT_DIR.parent
 if str(_STUDENT_PKG) not in sys.path:
     sys.path.insert(0, str(_STUDENT_PKG))
 
-from student.data import (
-    SingleSceneTrainingPackDataset,
-    build_instance_targets,
-)
+from student.data import MultiGranSceneDataset, build_instance_targets_multi
 from student.data.target_builder import log_target_stats
-from student.losses import MaskSetCriterion
+from student.losses import MaskSetCriterion, MultiGranCriterion
 from student.models.student_model import build_student_model
 from student.engine.trainer import SingleSceneTrainer
 
@@ -74,13 +71,33 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _parse_granularities(data_cfg: dict[str, Any]) -> tuple[str, ...]:
+    """Extract dot-free granularity keys from config.
+
+    Supports both the new list format and the legacy single-float format:
+        granularities: [0.2, 0.5, 0.8]    ->  ("g02", "g05", "g08")
+        granularity: 0.8                   ->  ("g08",)
+    """
+    def _to_key(g: float | str) -> str:
+        s = str(g)
+        if s.startswith("g"):
+            return s.replace(".", "")
+        return f"g{s}".replace(".", "")
+
+    if "granularities" in data_cfg:
+        return tuple(_to_key(g) for g in data_cfg["granularities"])
+    if "granularity" in data_cfg:
+        return (_to_key(data_cfg["granularity"]),)
+    raise KeyError("Config must specify data.granularities or data.granularity")
+
+
 # ── output directory ─────────────────────────────────────────────────────
 
 
-def build_output_dir(cfg: dict[str, Any], scene_id: str, granularity: float) -> Path:
+def build_output_dir(cfg: dict[str, Any], scene_id: str, granularities: tuple[str, ...]) -> Path:
     root = Path(cfg["experiment"]["output_root"])
     name = cfg["experiment"].get("name", "overfit_one_scene")
-    run_name = f"{scene_id}_g{granularity}"
+    run_name = f"{scene_id}_{'_'.join(granularities)}"
     out = root / name / run_name
     out.mkdir(parents=True, exist_ok=True)
     (out / "checkpoints").mkdir(exist_ok=True)
@@ -95,7 +112,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Student instance-seg experiment")
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--scene-dir", type=str, default=None)
-    parser.add_argument("--granularity", type=float, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--output-root", type=str, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
@@ -115,8 +131,6 @@ def main() -> None:
 
     if args.scene_dir is not None:
         cfg.setdefault("data", {})["scene_dir"] = args.scene_dir
-    if args.granularity is not None:
-        cfg.setdefault("data", {})["granularity"] = args.granularity
     if args.device is not None:
         cfg.setdefault("train", {})["device"] = args.device
     if args.output_root is not None:
@@ -132,7 +146,7 @@ def main() -> None:
     exp_cfg = cfg["experiment"]
 
     scene_dir = data_cfg["scene_dir"]
-    granularity = float(data_cfg["granularity"])
+    granularities = _parse_granularities(data_cfg)
     device = train_cfg.get("device", "cuda:0")
     seed = exp_cfg.get("seed", 42)
 
@@ -144,27 +158,28 @@ def main() -> None:
 
     # ── 2. seed ──
     set_seed(seed)
-    log.info("Seed: %d  Device: %s", seed, device)
+    log.info("Seed: %d  Device: %s  Granularities: %s", seed, device, granularities)
 
     # ── 3. dataset ──
-    ds = SingleSceneTrainingPackDataset(
+    ds = MultiGranSceneDataset(
         scene_dir,
-        granularity=granularity,
+        granularities=granularities,
         use_colors=data_cfg.get("use_colors", True),
         append_xyz=data_cfg.get("append_xyz_to_features", False),
     )
     sample = ds[0]
 
     # ── 4. targets ──
-    targets = build_instance_targets(
-        sample["labels"],
+    targets_by_gran = build_instance_targets_multi(
+        sample["labels_by_granularity"],
         sample["supervision_mask"],
         min_instance_points=data_cfg.get("min_instance_points", 1),
     )
-    log_target_stats(targets, tag=f"{ds.scene_id}/g{granularity}")
+    for g, tgt in targets_by_gran.items():
+        log_target_stats(tgt, tag=f"{ds.scene_id}/{g}")
 
     # ── output dir ──
-    out_dir = build_output_dir(cfg, ds.scene_id, granularity)
+    out_dir = build_output_dir(cfg, ds.scene_id, granularities)
     with (out_dir / "resolved_config.yaml").open("w", encoding="utf-8") as f:
         yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
     log.info("Output dir: %s", out_dir)
@@ -177,15 +192,21 @@ def main() -> None:
         grid_size=bb_cfg.get("grid_size", 0.02),
         hidden_dim=model_cfg.get("decoder_hidden_dim", 256),
         num_queries=model_cfg.get("num_queries", 128),
+        granularities=granularities,
     )
     total_params = sum(p.numel() for p in model.parameters())
-    log.info("Model: %s params", f"{total_params:,}")
+    log.info("Model: %s params (%d heads)", f"{total_params:,}", len(granularities))
 
     # ── 6. criterion ──
-    criterion = MaskSetCriterion(
+    base_criterion = MaskSetCriterion(
         bce_weight=loss_cfg.get("bce_weight", 1.0),
         dice_weight=loss_cfg.get("dice_weight", 1.0),
         score_weight=loss_cfg.get("score_weight", 0.5),
+    )
+    gran_weights = loss_cfg.get("granularity_weights", None)
+    criterion = MultiGranCriterion(
+        criterion=base_criterion,
+        granularity_weights=gran_weights,
     )
 
     # ── wandb ──
@@ -194,7 +215,7 @@ def main() -> None:
         and wandb is not None
     )
     if use_wandb:
-        run_name = args.wandb_name or f"{ds.scene_id}_g{granularity}"
+        run_name = args.wandb_name or f"{ds.scene_id}_{'_'.join(granularities)}"
         wandb.init(
             project=args.wandb_project,
             name=run_name,
@@ -203,11 +224,14 @@ def main() -> None:
                 "scene_id": ds.scene_id,
                 "num_points": ds.num_points,
                 "feature_dim": ds.feature_dim,
-                "num_instances": targets.num_instances,
+                "granularities": list(granularities),
+                "num_instances_by_gran": {
+                    g: tgt.num_instances for g, tgt in targets_by_gran.items()
+                },
                 "total_params": total_params,
             },
             dir=str(out_dir),
-            tags=[ds.scene_id, f"g{granularity}", "overfit_one_scene"],
+            tags=[ds.scene_id, *granularities, "overfit_one_scene"],
         )
         wandb.define_metric("train/*", step_metric="step")
         wandb.define_metric("eval/*", step_metric="step")
@@ -221,7 +245,7 @@ def main() -> None:
         model=model,
         criterion=criterion,
         sample=sample,
-        targets=targets,
+        targets_by_granularity=targets_by_gran,
         device=device,
         lr=train_cfg.get("lr", 1e-4),
         weight_decay=train_cfg.get("weight_decay", 1e-4),
@@ -242,9 +266,11 @@ def main() -> None:
     # ── 8. save final metrics ──
     final_metrics.update({
         "scene_id": ds.scene_id,
-        "granularity": granularity,
+        "granularities": list(granularities),
         "num_points": ds.num_points,
-        "num_instances": targets.num_instances,
+        "num_instances_by_gran": {
+            g: tgt.num_instances for g, tgt in targets_by_gran.items()
+        },
     })
     metrics_path = out_dir / "eval" / "final_metrics.json"
     with metrics_path.open("w", encoding="utf-8") as f:

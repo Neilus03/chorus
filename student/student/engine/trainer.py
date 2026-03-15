@@ -1,6 +1,7 @@
-"""Minimal single-scene overfit trainer.
+"""Minimal single-scene overfit trainer (multi-granularity).
 
-Answers one question: can the model overfit one scene?
+Answers one question: can the model overfit one scene across all
+granularity heads simultaneously?
 
 No dataloader, no batching, no distributed, no evaluator class.
 """
@@ -18,9 +19,12 @@ import torch
 import torch.nn as nn
 
 from student.data.target_builder import InstanceTargets
-from student.losses.mask_set_loss import MaskSetCriterion
-from student.metrics.pseudo_metrics import compute_pseudo_metrics, format_pseudo_metrics
-from student.engine.evaluator import evaluate_student_predictions
+from student.losses.mask_set_loss import MultiGranCriterion
+from student.metrics.pseudo_metrics import (
+    compute_pseudo_metrics_multi,
+    format_pseudo_metrics,
+)
+from student.engine.evaluator import evaluate_student_predictions_multi
 
 log = logging.getLogger(__name__)
 
@@ -35,18 +39,18 @@ def _wandb_active() -> bool:
 
 
 class SingleSceneTrainer:
-    """Train on a single sample repeatedly.
+    """Train on a single sample repeatedly with multi-granularity heads.
 
     Parameters
     ----------
     model:
-        The full ``StudentInstanceSegModel``.
+        The full ``StudentInstanceSegModel`` with multi-head decoder.
     criterion:
-        ``MaskSetCriterion`` instance.
+        ``MultiGranCriterion`` instance.
     sample:
-        Dict from ``SingleSceneTrainingPackDataset[0]``.
-    targets:
-        ``InstanceTargets`` from ``build_instance_targets``.
+        Dict from ``MultiGranSceneDataset[0]``.
+    targets_by_granularity:
+        Dict mapping granularity keys to ``InstanceTargets``.
     device:
         CUDA device string.
     lr / weight_decay / grad_clip_norm:
@@ -64,9 +68,9 @@ class SingleSceneTrainer:
     def __init__(
         self,
         model: nn.Module,
-        criterion: MaskSetCriterion,
+        criterion: MultiGranCriterion,
         sample: dict[str, Any],
-        targets: InstanceTargets,
+        targets_by_granularity: dict[str, InstanceTargets],
         *,
         device: str = "cuda:0",
         lr: float = 1e-4,
@@ -98,7 +102,8 @@ class SingleSceneTrainer:
 
         self.model = model.to(device)
         self.criterion = criterion
-        self.targets = targets
+        self.targets_by_granularity = targets_by_granularity
+        self.granularities = list(targets_by_granularity.keys())
 
         self.points = sample["points"].to(device)
         self.features = sample["features"].to(device)
@@ -137,13 +142,14 @@ class SingleSceneTrainer:
 
     # ------------------------------------------------------------------ #
 
-    def _save_ply(
+    def _save_ply_for_head(
         self,
-        pred: dict[str, torch.Tensor],
-        matched_pred_idx: np.ndarray,
+        pred: dict,
+        loss_result: dict,
+        granularity: str,
         tag: str,
     ) -> None:
-        """Save predicted + GT instance-colored mesh PLY files."""
+        """Save predicted + GT instance-colored mesh PLY for one head."""
         from student.engine.vis import (
             save_prediction_ply, save_gt_ply, _resolve_source_mesh,
         )
@@ -156,27 +162,34 @@ class SingleSceneTrainer:
             self.sample.get("scene_meta", {}),
         )
 
+        head_pred = pred["heads"][granularity]
+        head_loss = loss_result["heads"][granularity]
+
         save_prediction_ply(
-            mask_logits=pred["mask_logits"].detach().cpu(),
-            score_logits=pred["score_logits"].detach().cpu(),
-            matched_pred_idx=matched_pred_idx,
+            mask_logits=head_pred["mask_logits"].detach().cpu(),
+            score_logits=head_pred["score_logits"].detach().cpu(),
+            matched_pred_idx=head_loss["matched_pred_indices"],
             source_mesh=source_mesh,
             score_threshold=self.score_threshold,
             mask_threshold=self.mask_threshold,
-            path=eval_dir / f"student_pred_{tag}.ply",
+            path=eval_dir / f"student_pred_{granularity}_{tag}.ply",
         )
 
         save_gt_ply(
-            targets=self.targets,
+            targets=self.targets_by_granularity[granularity],
             source_mesh=source_mesh,
-            path=eval_dir / f"gt_instances_{tag}.ply",
+            path=eval_dir / f"gt_instances_{granularity}_{tag}.ply",
         )
 
     # ------------------------------------------------------------------ #
 
     def train(self) -> dict[str, Any]:
         """Run the full training loop. Returns final metrics dict."""
-        log.info("Starting training: %d steps", self.max_steps)
+        log.info(
+            "Starting training: %d steps, %d heads (%s)",
+            self.max_steps, len(self.granularities),
+            ", ".join(self.granularities),
+        )
         self.model.train()
         t_start = time.time()
 
@@ -189,52 +202,59 @@ class SingleSceneTrainer:
             # forward
             self.optimizer.zero_grad()
             pred = self.model(self.points, self.features)
-            loss_dict = self.criterion(pred, self.targets)
+            loss_result = self.criterion(pred, self.targets_by_granularity)
 
             # backward
-            loss_dict["loss_total"].backward()
+            loss_result["loss_total"].backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.grad_clip_norm,
             ).item()
             self.optimizer.step()
 
             step_ms = (time.time() - t0) * 1000
-            loss_total = loss_dict["loss_total"].item()
-            loss_bce = loss_dict["loss_mask_bce"].item()
-            loss_dice = loss_dict["loss_mask_dice"].item()
-            loss_score = loss_dict["loss_score"].item()
+            loss_total = loss_result["loss_total"].item()
 
             # ── wandb: every step ──
             if _wandb_active():
-                wandb.log({
+                wb: dict[str, Any] = {
                     "step": self.step,
                     "train/loss_total": loss_total,
-                    "train/loss_mask_bce": loss_bce,
-                    "train/loss_mask_dice": loss_dice,
-                    "train/loss_score": loss_score,
                     "train/grad_norm": grad_norm,
                     "train/step_ms": step_ms,
                     "train/lr": self.lr,
-                })
+                }
+                for g in self.granularities:
+                    ld_g = loss_result["heads"][g]
+                    wb[f"train/loss_{g}"] = ld_g["loss_total"].item()
+                    wb[f"train/loss_mask_bce_{g}"] = ld_g["loss_mask_bce"].item()
+                    wb[f"train/loss_mask_dice_{g}"] = ld_g["loss_mask_dice"].item()
+                    wb[f"train/loss_score_{g}"] = ld_g["loss_score"].item()
+                wandb.log(wb)
 
             # ── console + jsonl: every N steps ──
             if self.step % self.log_every == 0 or self.step == 1:
-                log.info(
-                    "step %4d/%d  loss=%.4f  bce=%.4f  dice=%.4f  score=%.4f  "
-                    "gnorm=%.3f  %.0fms",
-                    self.step, self.max_steps,
-                    loss_total, loss_bce, loss_dice, loss_score,
-                    grad_norm, step_ms,
+                per_head_str = "  ".join(
+                    f"{g}={loss_result['heads'][g]['loss_total'].item():.4f}"
+                    for g in self.granularities
                 )
-                self._log_row({
+                log.info(
+                    "step %4d/%d  loss=%.4f  [%s]  gnorm=%.3f  %.0fms",
+                    self.step, self.max_steps, loss_total,
+                    per_head_str, grad_norm, step_ms,
+                )
+                row: dict[str, Any] = {
                     "step": self.step,
                     "loss_total": loss_total,
-                    "loss_mask_bce": loss_bce,
-                    "loss_mask_dice": loss_dice,
-                    "loss_score": loss_score,
                     "grad_norm": grad_norm,
                     "step_ms": step_ms,
-                })
+                }
+                for g in self.granularities:
+                    ld_g = loss_result["heads"][g]
+                    row[f"loss_{g}"] = ld_g["loss_total"].item()
+                    row[f"loss_mask_bce_{g}"] = ld_g["loss_mask_bce"].item()
+                    row[f"loss_mask_dice_{g}"] = ld_g["loss_mask_dice"].item()
+                    row[f"loss_score_{g}"] = ld_g["loss_score"].item()
+                self._log_row(row)
 
             # ── eval metrics ──
             run_pseudo_eval = (self.step % self.eval_every == 0 or self.step == 1)
@@ -245,50 +265,62 @@ class SingleSceneTrainer:
                 self.model.eval()
                 with torch.no_grad():
                     pred_eval = self.model(self.points, self.features)
+                    ld_eval = self.criterion(pred_eval, self.targets_by_granularity)
                 self.model.train()
 
             if run_pseudo_eval:
                 with torch.no_grad():
-                    ld_eval = self.criterion(pred_eval, self.targets)
-                    metrics = compute_pseudo_metrics(
-                        pred_eval, self.targets,
-                        ld_eval["matched_pred_indices"],
-                        ld_eval["matched_gt_indices"],
+                    metrics_by_g = compute_pseudo_metrics_multi(
+                        pred_eval, self.targets_by_granularity, ld_eval,
                         score_threshold=self.score_threshold,
                         mask_threshold=self.mask_threshold,
                     )
 
-                log.info("  [eval] %s", format_pseudo_metrics(metrics))
+                for g in self.granularities:
+                    log.info(
+                        "  [eval %s] %s", g,
+                        format_pseudo_metrics(metrics_by_g[g]),
+                    )
 
-                eval_row = {"step": self.step, "eval": True, **metrics}
+                eval_row: dict[str, Any] = {"step": self.step, "eval": True}
+                for g in self.granularities:
+                    for mk, mv in metrics_by_g[g].items():
+                        eval_row[f"{mk}_{g}"] = mv
                 self._log_row(eval_row)
 
                 if _wandb_active():
-                    wb_metrics = {
-                        "eval/matched_mean_iou": metrics["matched_mean_iou"],
-                        "eval/matched_median_iou": metrics["matched_median_iou"],
-                        "eval/iou_gt_0.25": metrics["matched_iou_gt_0.25"],
-                        "eval/iou_gt_0.50": metrics["matched_iou_gt_0.50"],
-                        "eval/mean_score_matched": metrics["mean_score_matched"],
-                        "eval/mean_score_unmatched": metrics["mean_score_unmatched"],
-                        "eval/score_gap": (
-                            metrics["mean_score_matched"] - metrics["mean_score_unmatched"]
-                        ),
-                        "eval/num_queries_active": metrics["num_queries_above_threshold"],
-                    }
-                    wb_metrics["step"] = self.step
-                    wandb.log(wb_metrics)
+                    wb_eval: dict[str, Any] = {"step": self.step}
+                    for g in self.granularities:
+                        m = metrics_by_g[g]
+                        wb_eval[f"eval/matched_mean_iou_{g}"] = m["matched_mean_iou"]
+                        wb_eval[f"eval/matched_median_iou_{g}"] = m["matched_median_iou"]
+                        wb_eval[f"eval/iou_gt_0.25_{g}"] = m["matched_iou_gt_0.25"]
+                        wb_eval[f"eval/iou_gt_0.50_{g}"] = m["matched_iou_gt_0.50"]
+                        wb_eval[f"eval/mean_score_matched_{g}"] = m["mean_score_matched"]
+                        wb_eval[f"eval/mean_score_unmatched_{g}"] = m["mean_score_unmatched"]
+                        wb_eval[f"eval/score_gap_{g}"] = (
+                            m["mean_score_matched"] - m["mean_score_unmatched"]
+                        )
+                        wb_eval[f"eval/num_queries_active_{g}"] = m["num_queries_above_threshold"]
+                    wandb.log(wb_eval)
 
-                if metrics["matched_mean_iou"] > self.best_iou:
-                    self.best_iou = metrics["matched_mean_iou"]
+                avg_iou = sum(
+                    metrics_by_g[g]["matched_mean_iou"] for g in self.granularities
+                ) / len(self.granularities)
+                if avg_iou > self.best_iou:
+                    self.best_iou = avg_iou
                     self._save_checkpoint("best_pseudo_iou")
 
-                final_metrics = metrics
+                final_metrics = {
+                    f"{mk}_{g}": mv
+                    for g in self.granularities
+                    for mk, mv in metrics_by_g[g].items()
+                }
 
             if run_full_eval:
                 try:
-                    last_full_eval = evaluate_student_predictions(
-                        pred_eval, self.targets,
+                    last_full_eval = evaluate_student_predictions_multi(
+                        pred_eval, self.targets_by_granularity,
                         scene_dir=self.sample["scene_dir"],
                         scene_id=self.sample["scene_id"],
                         score_threshold=self.score_threshold,
@@ -299,19 +331,20 @@ class SingleSceneTrainer:
 
                     if _wandb_active():
                         wb_full: dict[str, Any] = {"step": self.step}
-                        pseudo = last_full_eval.get("pseudo_gt", {})
-                        if isinstance(pseudo, dict) and "AP25" in pseudo:
-                            wb_full["eval/pseudo_AP25"] = pseudo["AP25"]
-                            wb_full["eval/pseudo_AP50"] = pseudo["AP50"]
-                            wb_full["eval/pseudo_NMI"] = pseudo.get("NMI", 0)
-                            wb_full["eval/pseudo_ARI"] = pseudo.get("ARI", 0)
-                        real = last_full_eval.get("real_gt", {})
-                        if isinstance(real, dict) and "AP25" in real:
-                            wb_full["eval/real_AP25"] = real["AP25"]
-                            wb_full["eval/real_AP50"] = real["AP50"]
-                            wb_full["eval/real_NMI"] = real.get("NMI", 0)
-                            wb_full["eval/real_ARI"] = real.get("ARI", 0)
-                        wb_full["eval/num_proposals"] = last_full_eval.get("num_proposals", 0)
+                        for g, eval_g in last_full_eval.items():
+                            pseudo = eval_g.get("pseudo_gt", {})
+                            if isinstance(pseudo, dict) and "AP25" in pseudo:
+                                wb_full[f"eval/pseudo_AP25_{g}"] = pseudo["AP25"]
+                                wb_full[f"eval/pseudo_AP50_{g}"] = pseudo["AP50"]
+                                wb_full[f"eval/pseudo_NMI_{g}"] = pseudo.get("NMI", 0)
+                                wb_full[f"eval/pseudo_ARI_{g}"] = pseudo.get("ARI", 0)
+                            real = eval_g.get("real_gt", {})
+                            if isinstance(real, dict) and "AP25" in real:
+                                wb_full[f"eval/real_AP25_{g}"] = real["AP25"]
+                                wb_full[f"eval/real_AP50_{g}"] = real["AP50"]
+                                wb_full[f"eval/real_NMI_{g}"] = real.get("NMI", 0)
+                                wb_full[f"eval/real_ARI_{g}"] = real.get("ARI", 0)
+                            wb_full[f"eval/num_proposals_{g}"] = eval_g.get("num_proposals", 0)
                         wandb.log(wb_full)
 
                     self._log_row({"step": self.step, "full_eval": True, **last_full_eval})
@@ -328,14 +361,15 @@ class SingleSceneTrainer:
         self.model.eval()
         with torch.no_grad():
             pred_final = self.model(self.points, self.features)
-            ld_final = self.criterion(pred_final, self.targets)
+            ld_final = self.criterion(pred_final, self.targets_by_granularity)
         self.model.train()
 
-        try:
-            self._save_ply(pred_final, ld_final["matched_pred_indices"], "final")
-            log.info("  PLY files saved to %s/eval/", self.output_dir)
-        except Exception as e:
-            log.warning("  PLY save failed: %s", e)
+        for g in self.granularities:
+            try:
+                self._save_ply_for_head(pred_final, ld_final, g, "final")
+                log.info("  PLY files saved for %s to %s/eval/", g, self.output_dir)
+            except Exception as e:
+                log.warning("  PLY save failed for %s: %s", g, e)
 
         elapsed = time.time() - t_start
         log.info(
@@ -344,7 +378,7 @@ class SingleSceneTrainer:
         )
 
         final_metrics["total_steps"] = self.max_steps
-        final_metrics["best_iou"] = self.best_iou
+        final_metrics["best_avg_iou"] = self.best_iou
         final_metrics["training_time_s"] = elapsed
         if last_full_eval is not None:
             final_metrics["evaluation"] = last_full_eval
