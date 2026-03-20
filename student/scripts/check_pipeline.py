@@ -96,6 +96,11 @@ def main() -> None:
         hidden_dim=256,
         num_queries=128,
         granularities=GRANULARITIES,
+        num_decoder_layers=4,
+        num_decoder_heads=8,
+        query_init="hybrid",
+        use_positional_guidance=True,
+        learned_query_ratio=0.25,
     ).to(DEVICE)
     print(f"  built in {time.time() - t0:.2f}s")
 
@@ -103,12 +108,20 @@ def main() -> None:
     dc_params = sum(p.numel() for p in model.decoder.parameters())
     trunk_params = sum(
         p.numel() for n, p in model.decoder.named_parameters()
-        if not n.startswith("heads.")
+        if not n.startswith("heads.") and not n.startswith("initializers.")
     )
-    head_params = dc_params - trunk_params
+    init_params = sum(
+        p.numel() for n, p in model.decoder.named_parameters()
+        if n.startswith("initializers.")
+    )
+    head_params = sum(
+        p.numel() for n, p in model.decoder.named_parameters()
+        if n.startswith("heads.")
+    )
     print(f"  backbone params  : {bb_params:,}")
     print(f"  decoder total    : {dc_params:,}")
     print(f"    shared trunk   : {trunk_params:,}")
+    print(f"    initializers   : {init_params:,}")
     print(f"    heads total    : {head_params:,}")
     print(f"    per head       : {head_params // len(GRANULARITIES):,}")
     print(f"  total params     : {bb_params + dc_params:,}")
@@ -117,6 +130,14 @@ def main() -> None:
     print(f"  decoder hidden   : {model.decoder.hidden_dim}")
     print(f"  num_queries/head : {model.num_queries}")
     print(f"  num_heads        : {len(GRANULARITIES)}")
+    print(f"  decoder layers   : {len(model.decoder.layers)}")
+    print(f"  pos guidance     : {model.decoder.use_positional_guidance}")
+
+    pg = model.parameter_groups(backbone_lr_scale=0.1)
+    pg_bb = sum(p.numel() for p in pg[0]["params"])
+    pg_dc = sum(p.numel() for p in pg[1]["params"])
+    print(f"  param groups     : backbone={pg_bb:,} (scale={pg[0]['lr_scale']})  "
+          f"decoder={pg_dc:,} (scale={pg[1]['lr_scale']})")
 
     # ── 5. Forward pass ───────────────────────────────────────────
     sep("5. FORWARD PASS")
