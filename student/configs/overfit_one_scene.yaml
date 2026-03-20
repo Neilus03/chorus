@@ -16,11 +16,14 @@ model:
     litept_root: /home/nedela/projects/LitePT
     in_channels: 3
     grid_size: 0.02
-  num_queries: 200
+  num_queries_by_granularity:
+    g02: 250
+    g05: 150
+    g08: 100
   decoder_hidden_dim: 256
-  num_decoder_layers: 4
+  num_decoder_layers: 3
   num_decoder_heads: 8
-  query_init: hybrid
+  query_init: learned
   use_positional_guidance: true
   learned_query_ratio: 0.25
 
@@ -37,10 +40,10 @@ loss:
 
 train:
   device: cuda:0
-  lr: 5.0e-5
+  lr: 1.0e-4
   backbone_lr_scale: 0.1
   weight_decay: 1.0e-4
-  max_steps: 8000
+  max_steps: 5000
   grad_clip_norm: 1.0
   log_every: 20
   eval_every: 100
