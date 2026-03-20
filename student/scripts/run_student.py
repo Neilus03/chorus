@@ -193,6 +193,11 @@ def main() -> None:
         hidden_dim=model_cfg.get("decoder_hidden_dim", 256),
         num_queries=model_cfg.get("num_queries", 128),
         granularities=granularities,
+        num_decoder_layers=model_cfg.get("num_decoder_layers", 4),
+        num_decoder_heads=model_cfg.get("num_decoder_heads", 8),
+        query_init=model_cfg.get("query_init", "hybrid"),
+        use_positional_guidance=model_cfg.get("use_positional_guidance", True),
+        learned_query_ratio=model_cfg.get("learned_query_ratio", 0.25),
     )
     total_params = sum(p.numel() for p in model.parameters())
     log.info("Model: %s params (%d heads)", f"{total_params:,}", len(granularities))
@@ -207,6 +212,7 @@ def main() -> None:
     criterion = MultiGranCriterion(
         criterion=base_criterion,
         granularity_weights=gran_weights,
+        aux_weight=loss_cfg.get("aux_weight", 0.0),
     )
 
     # ── wandb ──
@@ -248,6 +254,7 @@ def main() -> None:
         targets_by_granularity=targets_by_gran,
         device=device,
         lr=train_cfg.get("lr", 1e-4),
+        backbone_lr_scale=train_cfg.get("backbone_lr_scale", 0.1),
         weight_decay=train_cfg.get("weight_decay", 1e-4),
         grad_clip_norm=train_cfg.get("grad_clip_norm", 1.0),
         max_steps=train_cfg.get("max_steps", 2000),
