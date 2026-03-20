@@ -164,15 +164,20 @@ def main() -> None:
     # ── 7. Score scene-dependence ─────────────────────────────────
     sep("7. SCORE SCENE-DEPENDENCE (gradient proof)")
     model.zero_grad()
-    probe = torch.randn(100, model.backbone.out_channels, device=DEVICE, requires_grad=True)
-    probe_out = model.decoder(probe)
+    C = model.backbone.out_channels
+    probe_feat = torch.randn(100, C, device=DEVICE)
+    probe_scene = torch.randn(50, C, device=DEVICE, requires_grad=True)
+    probe_xyz = torch.randn(50, 3, device=DEVICE)
+    probe_out = model.decoder(
+        probe_feat, scene_tokens=probe_scene, scene_xyz=probe_xyz,
+    )
     probe_loss = sum(
         h["score_logits"].sum() for h in probe_out["heads"].values()
     )
     probe_loss.backward()
-    g_norm = probe.grad.norm().item()
-    print(f"  d(scores)/d(point_feat) norm : {g_norm:.6f}")
-    print(f"  scene-dependent              : {'YES' if g_norm > 0 else 'NO — BUG!'}")
+    g_norm = probe_scene.grad.norm().item()
+    print(f"  d(scores)/d(scene_tokens) norm : {g_norm:.6f}")
+    print(f"  scene-dependent                : {'YES' if g_norm > 0 else 'NO — BUG!'}")
 
     # ── 8. Shape alignment ────────────────────────────────────────
     sep("8. SHAPE ALIGNMENT (per head)")
