@@ -1,20 +1,42 @@
 """Thin wrapper around the standalone LitePT encoder-decoder.
 
-Downstream code only sees:
+Downstream code receives a structured :class:`LitePTBackboneOutput`::
 
-    dense_feat = backbone(coord, feat)   # [N, 72]
+    bb = backbone(coord, feat)
+    bb.point_feat    # [N, 72] dense per-point features
+    bb.scene_tokens  # [V, 72] sparse voxel features
+    bb.point_xyz     # [N, 3]  original coordinates
+    bb.scene_xyz     # [V, 3]  voxel centroids
+    bb.inverse_map   # [N]     point → voxel index
 
 Everything LitePT-specific (voxelization, Point dict, offset, grid_coord,
-sparse tensors, inverse mapping) is hidden inside this module.
+sparse tensors) is hidden inside this module.
 """
 
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+
+
+@dataclass
+class LitePTBackboneOutput:
+    """Structured output from the LitePT backbone.
+
+    Carries both the dense per-point features needed for final mask
+    dot-products and the sparse voxel tokens needed for efficient
+    Transformer cross-attention in the decoder.
+    """
+
+    point_feat: torch.Tensor    # [N, C] dense per-point features
+    point_xyz: torch.Tensor     # [N, 3] original point coordinates
+    scene_tokens: torch.Tensor  # [V, C] sparse voxel features
+    scene_xyz: torch.Tensor     # [V, 3] voxel centroids
+    inverse_map: torch.Tensor   # [N]    maps points → voxel token index
 
 
 class LitePTBackbone(nn.Module):
@@ -59,6 +81,10 @@ class LitePTBackbone(nn.Module):
         # Default LitePT-S decoder outputs dec_channels[0] = 72.
         self.out_channels: int = 72
 
+        self._cached_voxelization: (
+            tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None
+        ) = None
+
     # ------------------------------------------------------------------ #
 
     def _normalize_inputs(
@@ -97,11 +123,17 @@ class LitePTBackbone(nn.Module):
         self,
         coord: torch.Tensor,
         feat: torch.Tensor,
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        """Grid-sample to one representative point per voxel.
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+        """Grid-sample to one representative per voxel via mean-pooling.
 
-        Returns the LitePT input dict and the ``inverse`` index
-        for densifying back to the original N points.
+        Returns
+        -------
+        point_dict : dict
+            LitePT input dict with mean-pooled coords and features.
+        inverse : Tensor [N]
+            Maps each original point to its voxel index.
+        scene_xyz : Tensor [V, 3]
+            Voxel centroids (mean of all point coordinates per voxel).
         """
         grid_coord = torch.floor(coord / self.grid_size).to(torch.int64)
         grid_coord = grid_coord - grid_coord.min(dim=0).values
@@ -110,26 +142,28 @@ class LitePTBackbone(nn.Module):
             grid_coord, dim=0, sorted=True, return_inverse=True,
         )
 
-        N = coord.shape[0]
         V = unique_grid.shape[0]
 
-        # Pick the first point that falls into each voxel.
-        point_ids = torch.arange(N, device=coord.device, dtype=torch.long)
-        first_idx = torch.full(
-            (V,), fill_value=N, device=coord.device, dtype=torch.long,
+        voxel_counts = torch.bincount(inverse, minlength=V).float().clamp(min=1.0)
+
+        scene_xyz = torch.zeros(V, 3, device=coord.device, dtype=coord.dtype)
+        scene_xyz.index_add_(0, inverse, coord)
+        scene_xyz = scene_xyz / voxel_counts[:, None]
+
+        scene_feat = torch.zeros(
+            V, feat.shape[1], device=feat.device, dtype=feat.dtype,
         )
-        first_idx.scatter_reduce_(
-            0, inverse, point_ids, reduce="amin", include_self=True,
-        )
+        scene_feat.index_add_(0, inverse, feat)
+        scene_feat = scene_feat / voxel_counts[:, None]
 
         point_dict = {
-            "coord": coord[first_idx],
+            "coord": scene_xyz,
             "grid_coord": unique_grid.int(),
-            "feat": feat[first_idx],
+            "feat": scene_feat,
             "offset": torch.tensor([V], device=coord.device, dtype=torch.long),
         }
 
-        return point_dict, inverse
+        return point_dict, inverse, scene_xyz
 
     # ------------------------------------------------------------------ #
 
@@ -137,8 +171,8 @@ class LitePTBackbone(nn.Module):
         self,
         coord: torch.Tensor,
         feat: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run LitePT and densify back to original points.
+    ) -> LitePTBackboneOutput:
+        """Run LitePT and return structured backbone output.
 
         Parameters
         ----------
@@ -147,15 +181,27 @@ class LitePTBackbone(nn.Module):
 
         Returns
         -------
-        (N, 72) float — per-point features at the decoder's output resolution.
+        :class:`LitePTBackboneOutput` with dense per-point features,
+        sparse voxel tokens, coordinates, and inverse mapping.
         """
         coord, feat = self._normalize_inputs(coord, feat)
-        point_dict, inverse = self._voxelize(coord, feat)
+
+        if self._cached_voxelization is not None and self.training:
+            point_dict, inverse, scene_xyz = self._cached_voxelization
+        else:
+            point_dict, inverse, scene_xyz = self._voxelize(coord, feat)
+            if self.training:
+                self._cached_voxelization = (point_dict, inverse, scene_xyz)
 
         out = self.model(point_dict)
 
-        dense_feat = out.feat[inverse]
+        scene_tokens = out.feat          # [V, C]
+        point_feat = scene_tokens[inverse]  # [N, C]
 
-        return dense_feat
-
-# ── test ────────────────────────────────
+        return LitePTBackboneOutput(
+            point_feat=point_feat,
+            point_xyz=coord,
+            scene_tokens=scene_tokens,
+            scene_xyz=scene_xyz,
+            inverse_map=inverse,
+        )

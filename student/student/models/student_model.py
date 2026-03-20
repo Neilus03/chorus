@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from student.models.litept_wrapper import LitePTBackbone
+from student.models.litept_wrapper import LitePTBackbone, LitePTBackboneOutput
 from student.models.instance_decoder import MultiHeadQueryInstanceDecoder
 
 
@@ -63,8 +63,13 @@ class StudentInstanceSegModel(nn.Module):
                 g05: {mask_logits, score_logits, query_embed}
                 g08: {mask_logits, score_logits, query_embed}
         """
-        point_feat = self.backbone(points, features)
-        return self.decoder(point_feat)
+        bb: LitePTBackboneOutput = self.backbone(points, features)
+        return self.decoder(
+            point_feat=bb.point_feat,
+            point_xyz=bb.point_xyz,
+            scene_tokens=bb.scene_tokens,
+            scene_xyz=bb.scene_xyz,
+        )
 
 
 def build_student_model(

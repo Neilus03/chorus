@@ -146,12 +146,20 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
         return out
 
     def forward(
-        self, point_feat: torch.Tensor,
+        self,
+        point_feat: torch.Tensor,
+        *,
+        point_xyz: torch.Tensor | None = None,
+        scene_tokens: torch.Tensor | None = None,
+        scene_xyz: torch.Tensor | None = None,
     ) -> dict:
         """
         Parameters
         ----------
         point_feat : [N, C] or [1, N, C]
+        point_xyz : [N, 3], optional (unused until Phase 2)
+        scene_tokens : [V, C], optional (unused until Phase 2)
+        scene_xyz : [V, 3], optional (unused until Phase 2)
 
         Returns
         -------
