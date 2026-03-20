@@ -595,11 +595,258 @@ python scripts/run_student.py --config configs/overfit_one_scene.yaml \
 
 ---
 
-## Phase 6: Future Improvements (do NOT implement yet)
+## Phase 6: Multi-Scale Backbone Features (Mask3D / Mask2Former3D style)
 
-> These are second-wave upgrades. Build them only after Phase 5 shows the base decoder works.
+> **Files**: `litept_wrapper.py`, `instance_decoder.py`, `student_model.py`,
+> `configs/overfit_one_scene.yaml`
+> **Papers**: Mask3D (multi-scale cross-attention), Mask2Former / M2F3D (per-layer scale
+> assignment), SPFormer (sparse multi-scale features)
+> **Risk**: Medium — requires extracting LitePT encoder internals and reworking decoder
+> cross-attention, but the output contract is preserved
+> **Outcome**: Decoder cross-attends to different spatial resolutions at different layers,
+> giving coarse-to-fine refinement like the Mask2Former3D architecture diagram.
 
-### 6.1 — Duplicate query penalty (CompetitorFormer)
+### Why multi-scale matters
+
+Currently, all decoder layers cross-attend to **one** set of sparse voxel tokens (the final
+LitePT encoder output). This means every refinement layer sees the same resolution.
+
+In Mask3D and Mask2Former3D, each decoder layer attends to a **different feature pyramid
+level**: early layers see coarse/large-receptive-field features (good for finding large
+objects and rough shapes), later layers see fine/high-resolution features (good for refining
+boundaries). This coarse-to-fine progression is a key reason those architectures work well.
+
+### Background: LitePT's internal structure
+
+LitePT has a U-Net-like encoder-decoder with multiple stages:
+
+```
+Encoder stages (LitePT.enc):
+  Stage 0: enc_channels[0] = 36,  no pooling (original resolution)
+  Stage 1: enc_channels[1] = 72,  GridPooling stride=2
+  Stage 2: enc_channels[2] = 144, GridPooling stride=2
+  Stage 3: enc_channels[3] = 252, GridPooling stride=2
+  Stage 4: enc_channels[4] = 504, GridPooling stride=2
+
+Decoder stages (LitePT.dec):
+  Stage 0: dec_channels[0] = 72   (finest, after upsampling from stage 1)
+  Stage 1: dec_channels[1] = 72
+  Stage 2: dec_channels[2] = 144
+  Stage 3: dec_channels[3] = 252
+```
+
+Currently we only use `out.feat` (the final decoded output at stage 0, channel dim 72).
+To get multi-scale features, we need to **intercept intermediate stage outputs**.
+
+### Step 6.1 — Understand LitePT's forward flow and identify tap points
+
+**File**: `LitePT/litept/model.py` (read-only analysis)
+
+LitePT's `forward()` runs:
+1. `self.embedding(point)` — initial projection
+2. `self.enc(point)` — sequential encoder stages (with GridPooling between stages)
+3. `self.dec(point)` — sequential decoder stages (with UnPooling between stages)
+4. Returns final `point` with `.feat` at decoder stage 0
+
+**Tap points** for multi-scale features (prefer decoder stages since they incorporate
+skip connections from the encoder):
+
+| Level | Source           | Approx token count (V) | Channel dim | Spatial resolution |
+|-------|------------------|------------------------|-------------|-------------------|
+| Fine  | dec stage 0 out  | ~V (same as current)   | 72          | grid_size          |
+| Mid   | dec stage 1 out  | ~V/4                   | 72          | grid_size × 2      |
+| Coarse| dec stage 2 out  | ~V/16                  | 144         | grid_size × 4      |
+
+We want 2–3 levels. Using more is diminishing returns and increases memory.
+
+### Step 6.2 — Add hooks or modify LitePT forward to capture multi-scale outputs
+
+**File**: `litept_wrapper.py`
+
+**Option A — Register forward hooks (non-invasive, preferred)**:
+```python
+self._multi_scale_outputs: list[dict] = []
+
+def _hook_fn(stage_idx):
+    def hook(module, input, output):
+        # output is a Point dict; capture feat and coord
+        self._multi_scale_outputs.append({
+            "feat": output.feat.clone(),
+            "coord": output.coord.clone(),
+        })
+    return hook
+
+# In __init__, register hooks on specific decoder stages:
+for idx in [0, 1, 2]:
+    self.model.dec[idx].register_forward_hook(_hook_fn(idx))
+```
+
+**Option B — Subclass LitePT.forward() (more control)**:
+Override `forward()` to run encoder and decoder stage-by-stage, capturing intermediate
+`Point` objects. More invasive but avoids hook fragility.
+
+**Recommendation**: Start with Option A (hooks). Switch to B only if hooks cause issues
+with gradient flow or caching.
+
+### Step 6.3 — Extend `LitePTBackboneOutput` to carry multi-scale features
+
+**File**: `litept_wrapper.py`
+
+Add a new field to the dataclass:
+
+```python
+@dataclass
+class LitePTBackboneOutput:
+    point_feat: torch.Tensor       # [N, C] dense per-point features (unchanged)
+    point_xyz: torch.Tensor        # [N, 3]
+    scene_tokens: torch.Tensor     # [V, C] finest scale (unchanged, for backward compat)
+    scene_xyz: torch.Tensor        # [V, 3]
+    inverse_map: torch.Tensor      # [N]
+
+    # NEW: multi-scale sparse features from decoder stages
+    multi_scale_tokens: list[torch.Tensor]  # [tokens_fine, tokens_mid, tokens_coarse]
+    multi_scale_xyz: list[torch.Tensor]     # [xyz_fine, xyz_mid, xyz_coarse]
+```
+
+Each entry in `multi_scale_tokens[i]` has shape `[V_i, C_i]` where `V_i` decreases and
+`C_i` may differ across scales.
+
+`scene_tokens` / `scene_xyz` remain as the finest scale for backward compatibility.
+
+### Step 6.4 — Add per-scale projection layers to the decoder
+
+**File**: `instance_decoder.py`
+
+Currently there is one `scene_token_proj` that maps `[V, C_in] → [V, D]`. For multi-scale,
+add one projection per scale level:
+
+```python
+self.scale_projs = nn.ModuleList([
+    nn.Sequential(
+        nn.Linear(channels_i, hidden_dim),
+        nn.LayerNorm(hidden_dim),
+        nn.GELU(),
+        nn.Linear(hidden_dim, hidden_dim),
+    )
+    for channels_i in scale_channels  # e.g. [72, 72, 144]
+])
+```
+
+Also add per-scale positional encoding (reuse `FourierPosEnc` + `pos_proj`, or add
+per-scale `pos_proj` if channel dims differ).
+
+### Step 6.5 — Assign scales to decoder layers (round-robin or coarse-to-fine)
+
+**File**: `instance_decoder.py`
+
+**Strategy 1 — Coarse-to-fine** (Mask3D default):
+- Layer 0 cross-attends to coarsest scale (large receptive field, rough localization)
+- Layer 1 cross-attends to mid scale
+- Layer 2 cross-attends to finest scale (boundary refinement)
+- If more layers than scales, cycle back (layer 3 → coarse, etc.)
+
+```python
+def _get_scale_for_layer(self, layer_idx: int) -> int:
+    num_scales = len(self.scale_projs)
+    # Coarse-to-fine: layer 0 → coarsest, layer (num_scales-1) → finest
+    # Reverse index, then cycle
+    return (num_scales - 1) - (layer_idx % num_scales)
+```
+
+**Strategy 2 — All-to-all** (Mask2Former style):
+Each layer attends to all scales concatenated. Simpler but more memory.
+
+**Recommendation**: Start with Strategy 1 (coarse-to-fine round-robin). It is what Mask3D
+uses and is more memory-efficient.
+
+### Step 6.6 — Update `_forward_unbatched` to use multi-scale cross-attention
+
+**File**: `instance_decoder.py`
+
+Change the decoder loop from:
+
+```python
+# Current: single scale
+scene_mem = self.scene_token_proj(scene_tokens)
+scene_pos = self.pos_proj(self.pos_encoder(scene_xyz))
+for layer in self.layers:
+    q = layer(q, q_pos, scene_mem, scene_pos)
+```
+
+to:
+
+```python
+# New: per-layer scale selection
+scale_mems = [proj(tokens) for proj, tokens in
+              zip(self.scale_projs, multi_scale_tokens)]
+scale_poss = [self.pos_proj(self.pos_encoder(xyz))
+              for xyz in multi_scale_xyz]
+
+for layer_idx, layer in enumerate(self.layers):
+    s = self._get_scale_for_layer(layer_idx)
+    q = layer(q, q_pos, scale_mems[s], scale_poss[s])
+```
+
+`QueryDecoderLayer` itself needs **no changes** — it already takes generic
+`(q, q_pos, scene_mem, scene_pos)` tensors. The only difference is which scale's
+memory and positions are passed in.
+
+### Step 6.7 — Update `StudentInstanceSegModel` to pass multi-scale data
+
+**File**: `student_model.py`
+
+Update `forward()` to pass the new fields:
+
+```python
+bb = self.backbone(points, features)
+return self.decoder(
+    point_feat=bb.point_feat,
+    point_xyz=bb.point_xyz,
+    scene_tokens=bb.scene_tokens,
+    scene_xyz=bb.scene_xyz,
+    multi_scale_tokens=bb.multi_scale_tokens,
+    multi_scale_xyz=bb.multi_scale_xyz,
+)
+```
+
+### Step 6.8 — Add config knobs
+
+**File**: `configs/overfit_one_scene.yaml`
+
+```yaml
+model:
+  backbone:
+    multi_scale: true          # enable multi-scale feature extraction
+    multi_scale_stages: [0, 1, 2]  # which decoder stages to tap
+  # num_decoder_layers should ideally be >= len(multi_scale_stages)
+  num_decoder_layers: 3
+```
+
+### Step 6.9 — Backward compatibility
+
+When `multi_scale: false` (default), the backbone returns empty lists for
+`multi_scale_tokens` / `multi_scale_xyz`, and the decoder falls back to the current
+single-scale behavior. This ensures no existing configs or runs break.
+
+### Step 6.10 — Verify Phase 6
+
+Run `check_pipeline.py` with `multi_scale: true`:
+- Verify multi-scale tensors have expected shapes and decreasing token counts
+- Verify gradient flow through all scale projections
+- Verify decoder output shapes are unchanged
+
+Run `run_student.py --max-steps 200` and compare loss/metrics to single-scale baseline.
+
+**Expected**: Slightly slower per-step (more projections), but potentially better
+convergence on `g02` (fine-grained), where multi-scale context should help most.
+
+---
+
+## Phase 7: Future Improvements (do NOT implement yet)
+
+> These are second-wave upgrades. Build them only after Phase 6 shows the base decoder works.
+
+### 7.1 — Duplicate query penalty (CompetitorFormer)
 
 Add a lightweight regularizer that penalizes high cosine similarity between top-scoring
 queries. This discourages multiple queries from competing for the same instance.
@@ -616,31 +863,18 @@ def duplicate_query_penalty(query_embed, score_logits, topk=32):
 
 Add with small weight (~0.01) after the main decoder is working well.
 
-### 6.2 — Multi-scale backbone tokens (Mask3D)
-
-If LitePT internals expose intermediate stages, return multiple sparse feature levels:
-```python
-multi_scale = [
-    {"feat": feat_s1, "xyz": xyz_s1},   # coarse
-    {"feat": feat_s2, "xyz": xyz_s2},   # medium
-    {"feat": feat_s3, "xyz": xyz_s3},   # fine
-]
-```
-
-Cross-attend to different scales at different decoder layers.
-
-### 6.3 — FPS-based query initialization
+### 7.2 — FPS-based query initialization
 
 Replace random voxel sampling with Farthest Point Sampling on voxel centroids. This
 guarantees maximum spatial coverage and directly addresses QueryFormer's concern about
 low-coverage initialization.
 
-### 6.4 — Per-layer anchor update (MAFT)
+### 7.3 — Per-layer anchor update (MAFT)
 
 Add a small MLP that predicts a `delta_xyz` at each decoder layer, updating the query's
 spatial anchor. This lets queries "walk" toward object centers during refinement.
 
-### 6.5 — Per-head query counts
+### 7.4 — Per-head query counts
 
 Allow different numbers of queries per granularity:
 ```yaml
@@ -650,12 +884,12 @@ num_queries_by_granularity:
   g08: 192   # coarse: more, but larger objects
 ```
 
-### 6.6 — Relation-aware self-attention (Relation3D)
+### 7.5 — Relation-aware self-attention (Relation3D)
 
 Add geometric-aware self-attention where the attention bias includes the Euclidean distance
 between query anchors. This helps queries understand spatial relationships between instances.
 
-### 6.7 — Mask-guided cross-attention refinement
+### 7.6 — Mask-guided cross-attention refinement
 
 After the first decoder layer produces initial masks, use those masks to restrict which
 scene tokens each query attends to in subsequent layers (similar to Mask2Former's masked
@@ -667,11 +901,11 @@ attention, adapted for 3D).
 
 | File | Phase | Type of change |
 |------|-------|---------------|
-| `student/models/litept_wrapper.py` | 1 | Dataclass output, mean-pool voxel, cache |
-| `student/models/instance_decoder.py` | 1, 2, 4 | Temporary compat (P1), full rewrite (P2), aux outputs (P4) |
-| `student/models/student_model.py` | 1, 3 | Structured backbone → decoder bridge, param groups |
+| `student/models/litept_wrapper.py` | 1, 6 | Dataclass output, mean-pool voxel, cache (P1); multi-scale hooks + extended dataclass (P6) |
+| `student/models/instance_decoder.py` | 1, 2, 4, 6 | Temporary compat (P1), full rewrite (P2), aux outputs (P4), per-scale projections + layer-scale assignment (P6) |
+| `student/models/student_model.py` | 1, 3, 6 | Structured backbone → decoder bridge, param groups (P1/P3); pass multi-scale data (P6) |
 | `student/losses/mask_set_loss.py` | 4 | Auxiliary deep supervision |
-| `configs/overfit_one_scene.yaml` | 3, 4 | New decoder + loss config params |
+| `configs/overfit_one_scene.yaml` | 3, 4, 6 | New decoder + loss config params (P3/P4); multi_scale backbone config (P6) |
 | `scripts/run_student.py` | 3 | Pass new config keys to builder |
 | `scripts/check_pipeline.py` | 3 | Update for new API |
 | `student/engine/trainer.py` | 3 | Parameter groups, separate LRs |
@@ -697,6 +931,7 @@ attention, adapted for 3D).
 | 3: Config & Training | 3.1–3.6 | 5 | Medium | Yes |
 | 4: Aux Supervision | 4.1–4.4 | 3 | Small | Yes |
 | 5: Validation | 5.1–5.3 | 0 (config only) | Medium (GPU time) | — |
+| 6: Multi-Scale Features | 6.1–6.10 | 4 | Medium | Yes |
 
 ---
 
