@@ -386,14 +386,14 @@ This is normal. The new decoder has much more capacity and needs training to con
 
 ---
 
-## Phase 3: Config, Builder, and Training Integration
+## Phase 3: Config, Builder, and Training Integration ✅
 
 > **Files**: `student_model.py`, `run_student.py`, `overfit_one_scene.yaml`, `trainer.py`,
 > `check_pipeline.py`
 > **Risk**: Low — mechanical config plumbing
 > **Outcome**: New decoder parameters are fully configurable. Training loop is updated.
 
-### Step 3.1 — Update `build_student_model` factory
+### Step 3.1 — Update `build_student_model` factory ✅
 
 **File**: `student_model.py`
 
@@ -407,7 +407,7 @@ Add new parameters and pass them to the decoder constructor:
 | `use_positional_guidance`  | `True`    | Fourier pos enc on/off                |
 | `learned_query_ratio`      | `0.25`    | Fraction of learned vs scene queries  |
 
-### Step 3.2 — Update `overfit_one_scene.yaml`
+### Step 3.2 — Update `overfit_one_scene.yaml` ✅
 
 **File**: `configs/overfit_one_scene.yaml`
 
@@ -433,7 +433,7 @@ and needs more iterations to converge, especially with hybrid query init introdu
 
 Consider lowering `lr` to `5e-5` as Transformers are sensitive to high learning rates.
 
-### Step 3.3 — Update `run_student.py` to pass new config values
+### Step 3.3 — Update `run_student.py` to pass new config values ✅
 
 **File**: `scripts/run_student.py`
 
@@ -449,7 +449,7 @@ model = build_student_model(
 )
 ```
 
-### Step 3.4 — Add parameter groups for separate backbone/decoder LR
+### Step 3.4 — Add parameter groups for separate backbone/decoder LR ✅
 
 **File**: `student_model.py` (method) + `trainer.py` (usage)
 
@@ -469,7 +469,7 @@ Update `SingleSceneTrainer.__init__` to optionally use these groups with AdamW, 
 randomly initialized Transformer decoder typically destabilizes features. A 10x lower backbone
 LR is standard practice.
 
-### Step 3.5 — Update `check_pipeline.py`
+### Step 3.5 — Update `check_pipeline.py` ✅
 
 **File**: `scripts/check_pipeline.py`
 
@@ -477,7 +477,7 @@ Update `build_student_model` call to include `num_decoder_layers`. Update any de
 introspection (e.g., parameter counting) to reflect the new trunk vs head split. Keep all
 existing checks (shapes, gradients, losses, matching).
 
-### Step 3.6 — Verify Phase 3
+### Step 3.6 — Verify Phase 3 ✅
 
 Run `check_pipeline.py` — all checks pass.
 Run `run_student.py --config configs/overfit_one_scene.yaml --max-steps 100` — training
@@ -485,14 +485,14 @@ loop completes, losses decrease, wandb logging works with all new metrics.
 
 ---
 
-## Phase 4: Auxiliary Deep Supervision
+## Phase 4: Auxiliary Deep Supervision ✅
 
 > **Files**: `instance_decoder.py`, `mask_set_loss.py`
 > **Papers**: Mask3D, DETR (auxiliary losses at each decoder layer)
 > **Risk**: Low — additive change, existing loss contract unchanged
 > **Outcome**: Loss is computed at every decoder layer, stabilizing Transformer training.
 
-### Step 4.1 — Return intermediate predictions from decoder
+### Step 4.1 — Return intermediate predictions from decoder ✅
 
 **File**: `instance_decoder.py`
 
@@ -512,7 +512,7 @@ The final layer's output goes into the main `out["heads"]` as before.
 Early layers produce rough masks; applying loss at every layer creates a curriculum that helps
 the network learn faster and avoids the "dead query" problem where some queries never activate.
 
-### Step 4.2 — Update `MultiGranCriterion` to handle `aux_outputs`
+### Step 4.2 — Update `MultiGranCriterion` to handle `aux_outputs` ✅
 
 **File**: `mask_set_loss.py`
 
@@ -530,7 +530,7 @@ if "aux_outputs" in pred:
 **Important**: Each auxiliary layer should run its own Hungarian matching, not reuse the
 final layer's matching. This is standard practice from DETR and Mask3D.
 
-### Step 4.3 — Add `aux_loss_weight` to config
+### Step 4.3 — Add `aux_loss_weight` to config ✅
 
 **File**: `configs/overfit_one_scene.yaml`
 
@@ -539,7 +539,7 @@ loss:
   aux_weight: 0.4   # weight on intermediate decoder layer losses
 ```
 
-### Step 4.4 — Verify Phase 4
+### Step 4.4 — Verify Phase 4 ✅
 
 Run training for 200 steps. Verify:
 - `aux_outputs` are present in the forward pass output
@@ -549,9 +549,11 @@ Run training for 200 steps. Verify:
 
 ---
 
-## Phase 5: Validation and Comparison
+## Phase 5: Validation and Comparison (ready to run)
 
 > **Outcome**: Quantitative evidence that the new decoder improves over the baseline.
+>
+> All config knobs and infrastructure are in place. These steps require GPU runs.
 
 ### Step 5.1 — Run full baseline (old decoder) if not already saved
 
@@ -565,7 +567,11 @@ If no baseline metrics exist, temporarily revert to the old decoder and run the 
 
 ### Step 5.2 — Run full new decoder training
 
-Run the new decoder with the same config (adjust `max_steps` and `lr` if needed).
+Run the new decoder with the current config:
+```bash
+python scripts/run_student.py --config configs/overfit_one_scene.yaml
+```
+
 Expected improvements:
 - Higher matched IoU (iterative refinement produces tighter masks)
 - Higher AP50 (better boundary precision from 3D position guidance)
@@ -574,11 +580,18 @@ Expected improvements:
 
 ### Step 5.3 — Ablation runs (optional but recommended)
 
-Quick ablations to quantify the contribution of each component:
-1. **No positional guidance** (`use_positional_guidance: false`)
-2. **Learned-only queries** (`query_init: learned`)
-3. **2 decoder layers** vs **4 layers** vs **6 layers**
-4. **No auxiliary losses**
+Quick ablations to quantify the contribution of each component.
+All configurable via CLI overrides:
+1. **No positional guidance**: `model.use_positional_guidance=false`
+2. **Learned-only queries**: `model.query_init=learned`
+3. **2 decoder layers** vs **4 layers** vs **6 layers**: `model.num_decoder_layers=2`
+4. **No auxiliary losses**: `loss.aux_weight=0.0`
+
+Example:
+```bash
+python scripts/run_student.py --config configs/overfit_one_scene.yaml \
+    model.num_decoder_layers=2 loss.aux_weight=0.0
+```
 
 ---
 
