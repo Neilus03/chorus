@@ -18,13 +18,13 @@ model:
     grid_size: 0.02
     num_queries: 200
     num_queries_by_granularity:
-      g02: 250
-      g05: 150
+      g02: 300
+      g05: 200
       g08: 100
   decoder_hidden_dim: 256
-  num_decoder_layers: 3
+  num_decoder_layers: 4
   num_decoder_heads: 8
-  query_init: hybrid
+  query_init: learned
   use_positional_guidance: true
   learned_query_ratio: 0.25
 
@@ -32,7 +32,7 @@ loss:
   bce_weight: 1.0
   dice_weight: 1.0
   score_weight: 0.5
-  aux_weight: 0.4
+  aux_weight: 0.2
   # Per-head loss multipliers (optional, defaults to 1.0 each).
   # granularity_weights:
   #   g02: 1.0
