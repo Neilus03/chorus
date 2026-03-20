@@ -4,7 +4,7 @@ experiment:
   output_root: /scratch2/nedela/student_runs
 
 data:
-  scene_dir: /scratch2/nedela/chorus_poc/scans/scene0038_00
+  scene_dir: /scratch2/nedela/chorus_poc/scans/scene0022_00
   granularities: [0.2, 0.5, 0.8]
   use_colors: true
   append_xyz_to_features: false
@@ -18,11 +18,17 @@ model:
     grid_size: 0.02
   num_queries: 200
   decoder_hidden_dim: 256
+  num_decoder_layers: 4
+  num_decoder_heads: 8
+  query_init: hybrid
+  use_positional_guidance: true
+  learned_query_ratio: 0.25
 
 loss:
   bce_weight: 1.0
   dice_weight: 1.0
   score_weight: 0.5
+  aux_weight: 0.4
   # Per-head loss multipliers (optional, defaults to 1.0 each).
   # granularity_weights:
   #   g02: 1.0
@@ -31,9 +37,10 @@ loss:
 
 train:
   device: cuda:0
-  lr: 1.0e-4
+  lr: 5.0e-5
+  backbone_lr_scale: 0.1
   weight_decay: 1.0e-4
-  max_steps: 5000
+  max_steps: 8000
   grad_clip_norm: 1.0
   log_every: 20
   eval_every: 100
