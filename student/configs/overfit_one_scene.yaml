@@ -16,14 +16,15 @@ model:
     litept_root: /home/nedela/projects/LitePT
     in_channels: 3
     grid_size: 0.02
-  num_queries_by_granularity:
-    g02: 250
-    g05: 150
-    g08: 100
+    num_queries: 200
+    num_queries_by_granularity:
+      g02: 250
+      g05: 150
+      g08: 100
   decoder_hidden_dim: 256
   num_decoder_layers: 3
   num_decoder_heads: 8
-  query_init: learned
+  query_init: hybrid
   use_positional_guidance: true
   learned_query_ratio: 0.25
 
