@@ -251,12 +251,15 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
         granularities: tuple[str, ...] = ("g02", "g05", "g08"),
         num_layers: int = 4,
         num_heads: int = 8,
+        learned_ratio: float = 0.25,
+        use_positional_guidance: bool = True,
     ) -> None:
         super().__init__()
         self.in_channels = int(in_channels)
         self.hidden_dim = int(hidden_dim)
         self.num_queries = int(num_queries)
         self.granularities = granularities
+        self.use_positional_guidance = use_positional_guidance
 
         # --- separate projection streams [SPFormer / Mask2Former insight] ---
         self.scene_token_proj = nn.Sequential(
@@ -280,7 +283,7 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
 
         # --- per-head query initializers [QueryFormer / MAFT] ---
         self.initializers = nn.ModuleDict({
-            g: HybridQueryInitializer(hidden_dim, num_queries)
+            g: HybridQueryInitializer(hidden_dim, num_queries, learned_ratio)
             for g in granularities
         })
 
@@ -318,7 +321,11 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
         # ── shared projections (computed once, reused across heads) ──
 
         scene_mem = self.scene_token_proj(scene_tokens)        # [V, D]
-        scene_pos = self.pos_proj(self.pos_encoder(scene_xyz)) # [V, D]
+
+        if self.use_positional_guidance:
+            scene_pos = self.pos_proj(self.pos_encoder(scene_xyz))  # [V, D]
+        else:
+            scene_pos = torch.zeros_like(scene_mem)
 
         scene_mem_b = scene_mem.unsqueeze(0)   # [1, V, D]
         scene_pos_b = scene_pos.unsqueeze(0)   # [1, V, D]
@@ -326,35 +333,51 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
         dense_mask_feat = self.point_mask_proj(point_feat)     # [N, D]
         dense_mask_feat = F.normalize(dense_mask_feat, dim=-1)
 
+        num_layers = len(self.layers)
         out: dict = {"point_embed": dense_mask_feat, "heads": {}}
+        aux_by_layer: list[dict] = [{"heads": {}} for _ in range(num_layers - 1)]
 
         # ── per-granularity query decode ──
 
         for g in self.granularities:
             q_feat, q_xyz = self.initializers[g](scene_mem, scene_xyz)
-            q_pos = self.pos_proj(self.pos_encoder(q_xyz))
+
+            if self.use_positional_guidance:
+                q_pos = self.pos_proj(self.pos_encoder(q_xyz))
+            else:
+                q_pos = torch.zeros_like(q_feat)
 
             q_b = q_feat.unsqueeze(0)        # [1, Q, D]
             q_pos_b = q_pos.unsqueeze(0)     # [1, Q, D]
 
-            for layer in self.layers:
+            head = self.heads[g]
+
+            for layer_idx, layer in enumerate(self.layers):
                 q_b = layer(q_b, q_pos_b, scene_mem_b, scene_pos_b)
 
+                if layer_idx < num_layers - 1:
+                    # auxiliary prediction from intermediate layer
+                    q_aux = q_b.squeeze(0)
+                    me_aux = F.normalize(head.mask_embed(q_aux), dim=-1)
+                    scale_aux = head.logit_scale.exp()
+                    aux_by_layer[layer_idx]["heads"][g] = {
+                        "mask_logits": scale_aux * (me_aux @ dense_mask_feat.T),
+                        "score_logits": head.score_head(q_aux).squeeze(-1),
+                    }
+
+            # final layer prediction
             refined_q = q_b.squeeze(0)       # [Q, D]
-
-            head = self.heads[g]
-            mask_embed = head.mask_embed(refined_q)
-            mask_embed = F.normalize(mask_embed, dim=-1)
-
+            mask_embed = F.normalize(head.mask_embed(refined_q), dim=-1)
             scale = head.logit_scale.exp()
-            mask_logits = scale * (mask_embed @ dense_mask_feat.T)  # [Q, N]
-            score_logits = head.score_head(refined_q).squeeze(-1)   # [Q]
 
             out["heads"][g] = {
-                "mask_logits": mask_logits,
-                "score_logits": score_logits,
+                "mask_logits": scale * (mask_embed @ dense_mask_feat.T),  # [Q, N]
+                "score_logits": head.score_head(refined_q).squeeze(-1),   # [Q]
                 "query_embed": refined_q,
             }
+
+        if aux_by_layer:
+            out["aux_outputs"] = aux_by_layer
 
         return out
 
@@ -404,6 +427,16 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
                 batched["heads"][g] = {
                     k: v.unsqueeze(0) for k, v in head_out.items()
                 }
+            if "aux_outputs" in out:
+                batched["aux_outputs"] = [
+                    {
+                        "heads": {
+                            g: {k: v.unsqueeze(0) for k, v in aux["heads"][g].items()}
+                            for g in aux["heads"]
+                        }
+                    }
+                    for aux in out["aux_outputs"]
+                ]
             return batched
 
         raise ValueError(
