@@ -43,6 +43,17 @@ class StudentInstanceSegModel(nn.Module):
     def num_queries(self) -> int:
         return self.decoder.num_queries
 
+    def parameter_groups(self, backbone_lr_scale: float = 0.1) -> list[dict]:
+        """Return param groups with separate LR scaling for backbone vs decoder.
+
+        The pretrained backbone should train at a lower LR than the randomly
+        initialized Transformer decoder to avoid destabilizing learned features.
+        """
+        return [
+            {"params": list(self.backbone.parameters()), "lr_scale": backbone_lr_scale},
+            {"params": list(self.decoder.parameters()), "lr_scale": 1.0},
+        ]
+
     def forward(
         self,
         points: torch.Tensor,
@@ -79,17 +90,42 @@ def build_student_model(
     hidden_dim: int = 256,
     num_queries: int = 128,
     granularities: tuple[str, ...] = ("g02", "g05", "g08"),
+    num_decoder_layers: int = 4,
+    num_decoder_heads: int = 8,
+    query_init: str = "hybrid",
+    use_positional_guidance: bool = True,
+    learned_query_ratio: float = 0.25,
 ) -> StudentInstanceSegModel:
-    """Convenience factory from scalar config values."""
+    """Convenience factory from scalar config values.
+
+    Parameters
+    ----------
+    query_init:
+        ``"hybrid"`` uses *learned_query_ratio* (default).
+        ``"learned"`` forces all queries to be learned embeddings.
+        ``"scene"`` forces all queries to be scene-sampled.
+    """
     backbone = LitePTBackbone(
         litept_root=litept_root,
         in_channels=in_channels,
         grid_size=grid_size,
     )
+
+    if query_init == "learned":
+        effective_ratio = 1.0
+    elif query_init == "scene":
+        effective_ratio = 0.0
+    else:
+        effective_ratio = learned_query_ratio
+
     decoder = MultiHeadQueryInstanceDecoder(
         in_channels=backbone.out_channels,
         hidden_dim=hidden_dim,
         num_queries=num_queries,
         granularities=granularities,
+        num_layers=num_decoder_layers,
+        num_heads=num_decoder_heads,
+        learned_ratio=effective_ratio,
+        use_positional_guidance=use_positional_guidance,
     )
     return StudentInstanceSegModel(backbone=backbone, decoder=decoder)
