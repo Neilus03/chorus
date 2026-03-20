@@ -74,6 +74,7 @@ class SingleSceneTrainer:
         *,
         device: str = "cuda:0",
         lr: float = 1e-4,
+        backbone_lr_scale: float = 0.1,
         weight_decay: float = 1e-4,
         grad_clip_norm: float = 1.0,
         max_steps: int = 2000,
@@ -109,9 +110,21 @@ class SingleSceneTrainer:
         self.features = sample["features"].to(device)
         self.sample = sample
 
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=lr, weight_decay=weight_decay,
-        )
+        if hasattr(model, "parameter_groups"):
+            param_groups = [
+                {
+                    "params": pg["params"],
+                    "lr": lr * pg["lr_scale"],
+                }
+                for pg in model.parameter_groups(backbone_lr_scale)
+            ]
+            self.optimizer = torch.optim.AdamW(
+                param_groups, lr=lr, weight_decay=weight_decay,
+            )
+        else:
+            self.optimizer = torch.optim.AdamW(
+                self.model.parameters(), lr=lr, weight_decay=weight_decay,
+            )
         self.lr = lr
 
         self.ckpt_dir = self.output_dir / "checkpoints"
@@ -229,6 +242,8 @@ class SingleSceneTrainer:
                     wb[f"train/loss_mask_bce_{g}"] = ld_g["loss_mask_bce"].item()
                     wb[f"train/loss_mask_dice_{g}"] = ld_g["loss_mask_dice"].item()
                     wb[f"train/loss_score_{g}"] = ld_g["loss_score"].item()
+                if "loss_aux" in loss_result:
+                    wb["train/loss_aux"] = loss_result["loss_aux"].item()
                 wandb.log(wb)
 
             # ── console + jsonl: every N steps ──
