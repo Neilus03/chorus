@@ -72,7 +72,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--debug-first-n-frames",
         type=int,
-        default=9,
+        default=10,
         help="How many frames should print teacher debug statistics",
     )
     parser.add_argument(
