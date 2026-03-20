@@ -240,6 +240,10 @@ class MultiGranCriterion(nn.Module):
     """Applies :class:`MaskSetCriterion` independently per granularity head
     and sums the losses.
 
+    When the decoder returns ``aux_outputs`` (intermediate layer predictions),
+    the same criterion is applied to each auxiliary layer with independent
+    Hungarian matching, weighted by *aux_weight*.
+
     Parameters
     ----------
     criterion:
@@ -247,40 +251,29 @@ class MultiGranCriterion(nn.Module):
         for every head).
     granularity_weights:
         Optional per-head loss multiplier.  Defaults to 1.0 for each.
+    aux_weight:
+        Multiplier on losses from intermediate decoder layers.
     """
 
     def __init__(
         self,
         criterion: MaskSetCriterion,
         granularity_weights: dict[str, float] | None = None,
+        aux_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.criterion = criterion
         self.granularity_weights = granularity_weights or {}
+        self.aux_weight = aux_weight
 
-    def forward(
+    def _compute_heads_loss(
         self,
-        pred: dict,
+        heads_pred: dict,
         targets_by_granularity: dict[str, "InstanceTargets"],
-    ) -> dict[str, Any]:
-        """
-        Parameters
-        ----------
-        pred:
-            Nested dict from ``MultiHeadQueryInstanceDecoder`` with
-            ``pred["heads"][g]`` containing ``mask_logits`` and
-            ``score_logits`` for each granularity ``g``.
-        targets_by_granularity:
-            Dict mapping granularity keys to :class:`InstanceTargets`.
-
-        Returns
-        -------
-        Dict with ``loss_total`` (summed), per-head loss dicts keyed by
-        granularity, and per-head matching info.
-        """
-        heads_pred = pred["heads"]
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Compute per-head losses and sum them. Returns (total, per-head dict)."""
         total_loss = None
-        result: dict[str, Any] = {"heads": {}}
+        heads_result: dict[str, Any] = {}
 
         for g, targets_g in targets_by_granularity.items():
             head_pred = heads_pred[g]
@@ -294,8 +287,52 @@ class MultiGranCriterion(nn.Module):
             else:
                 total_loss = total_loss + weighted
 
-            result["heads"][g] = ld
+            heads_result[g] = ld
 
         assert total_loss is not None, "No granularity heads to compute loss for"
-        result["loss_total"] = total_loss
+        return total_loss, heads_result
+
+    def forward(
+        self,
+        pred: dict,
+        targets_by_granularity: dict[str, "InstanceTargets"],
+    ) -> dict[str, Any]:
+        """
+        Parameters
+        ----------
+        pred:
+            Nested dict from ``MultiHeadQueryInstanceDecoder`` with
+            ``pred["heads"][g]`` containing ``mask_logits`` and
+            ``score_logits`` for each granularity ``g``.
+            Optionally ``pred["aux_outputs"]`` — list of intermediate-layer
+            prediction dicts with the same structure.
+        targets_by_granularity:
+            Dict mapping granularity keys to :class:`InstanceTargets`.
+
+        Returns
+        -------
+        Dict with ``loss_total`` (summed), per-head loss dicts keyed by
+        granularity, per-head matching info, and optional ``loss_aux``.
+        """
+        final_loss, heads_result = self._compute_heads_loss(
+            pred["heads"], targets_by_granularity,
+        )
+        result: dict[str, Any] = {"heads": heads_result, "loss_total": final_loss}
+
+        if self.aux_weight > 0 and "aux_outputs" in pred:
+            aux_loss_sum = None
+            for aux_pred in pred["aux_outputs"]:
+                layer_loss, _ = self._compute_heads_loss(
+                    aux_pred["heads"], targets_by_granularity,
+                )
+                if aux_loss_sum is None:
+                    aux_loss_sum = layer_loss
+                else:
+                    aux_loss_sum = aux_loss_sum + layer_loss
+
+            if aux_loss_sum is not None:
+                weighted_aux = self.aux_weight * aux_loss_sum
+                result["loss_aux"] = weighted_aux.detach()
+                result["loss_total"] = result["loss_total"] + weighted_aux
+
         return result
