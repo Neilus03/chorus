@@ -128,7 +128,7 @@ def main() -> None:
     print(f"  backbone out_ch  : {model.backbone.out_channels}")
     print(f"  decoder in_ch    : {model.decoder.in_channels}")
     print(f"  decoder hidden   : {model.decoder.hidden_dim}")
-    print(f"  num_queries/head : {model.num_queries}")
+    print(f"  num_queries      : {model.decoder.num_queries_per_head}")
     print(f"  num_heads        : {len(GRANULARITIES)}")
     print(f"  decoder layers   : {len(model.decoder.layers)}")
     print(f"  pos guidance     : {model.decoder.use_positional_guidance}")

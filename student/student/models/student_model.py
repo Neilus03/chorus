@@ -89,6 +89,7 @@ def build_student_model(
     grid_size: float = 0.02,
     hidden_dim: int = 256,
     num_queries: int = 128,
+    num_queries_by_granularity: dict[str, int] | None = None,
     granularities: tuple[str, ...] = ("g02", "g05", "g08"),
     num_decoder_layers: int = 4,
     num_decoder_heads: int = 8,
@@ -100,6 +101,11 @@ def build_student_model(
 
     Parameters
     ----------
+    num_queries:
+        Default query count for all heads.
+    num_queries_by_granularity:
+        Optional per-head override, e.g. ``{"g02": 300, "g05": 150, "g08": 100}``.
+        Granularities not listed fall back to *num_queries*.
     query_init:
         ``"hybrid"`` uses *learned_query_ratio* (default).
         ``"learned"`` forces all queries to be learned embeddings.
@@ -118,10 +124,18 @@ def build_student_model(
     else:
         effective_ratio = learned_query_ratio
 
+    if num_queries_by_granularity:
+        effective_queries: int | dict[str, int] = {
+            g: num_queries_by_granularity.get(g, num_queries)
+            for g in granularities
+        }
+    else:
+        effective_queries = num_queries
+
     decoder = MultiHeadQueryInstanceDecoder(
         in_channels=backbone.out_channels,
         hidden_dim=hidden_dim,
-        num_queries=num_queries,
+        num_queries=effective_queries,
         granularities=granularities,
         num_layers=num_decoder_layers,
         num_heads=num_decoder_heads,

@@ -234,7 +234,9 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
     hidden_dim:
         Decoder's internal embedding dimension.
     num_queries:
-        Instance query slots per granularity head.
+        Instance query slots.  Either a single int (same for all heads)
+        or a dict mapping granularity keys to per-head counts,
+        e.g. ``{"g02": 300, "g05": 150, "g08": 100}``.
     granularities:
         Keys identifying each granularity level.
     num_layers:
@@ -247,7 +249,7 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
         self,
         in_channels: int,
         hidden_dim: int = 256,
-        num_queries: int = 128,
+        num_queries: int | dict[str, int] = 128,
         granularities: tuple[str, ...] = ("g02", "g05", "g08"),
         num_layers: int = 4,
         num_heads: int = 8,
@@ -257,9 +259,14 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
         super().__init__()
         self.in_channels = int(in_channels)
         self.hidden_dim = int(hidden_dim)
-        self.num_queries = int(num_queries)
         self.granularities = granularities
         self.use_positional_guidance = use_positional_guidance
+
+        if isinstance(num_queries, dict):
+            self.num_queries_per_head = {g: int(num_queries[g]) for g in granularities}
+        else:
+            self.num_queries_per_head = {g: int(num_queries) for g in granularities}
+        self.num_queries = max(self.num_queries_per_head.values())
 
         # --- separate projection streams [SPFormer / Mask2Former insight] ---
         self.scene_token_proj = nn.Sequential(
@@ -283,7 +290,9 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
 
         # --- per-head query initializers [QueryFormer / MAFT] ---
         self.initializers = nn.ModuleDict({
-            g: HybridQueryInitializer(hidden_dim, num_queries, learned_ratio)
+            g: HybridQueryInitializer(
+                hidden_dim, self.num_queries_per_head[g], learned_ratio,
+            )
             for g in granularities
         })
 

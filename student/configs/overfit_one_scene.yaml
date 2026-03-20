@@ -40,7 +40,7 @@ loss:
 
 train:
   device: cuda:0
-  lr: 1.0e-4
+  lr: 5.0e-4
   backbone_lr_scale: 0.1
   weight_decay: 1.0e-4
   max_steps: 5000

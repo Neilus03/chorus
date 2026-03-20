@@ -192,6 +192,7 @@ def main() -> None:
         grid_size=bb_cfg.get("grid_size", 0.02),
         hidden_dim=model_cfg.get("decoder_hidden_dim", 256),
         num_queries=model_cfg.get("num_queries", 128),
+        num_queries_by_granularity=model_cfg.get("num_queries_by_granularity", None),
         granularities=granularities,
         num_decoder_layers=model_cfg.get("num_decoder_layers", 4),
         num_decoder_heads=model_cfg.get("num_decoder_heads", 8),
