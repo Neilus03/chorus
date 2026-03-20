@@ -104,6 +104,7 @@ throughout (e.g. **[Mask3D]**) map to these entries:
 | **[LaSSM]** | — | Local aggregation + coordinate-guided state-space decoder; replaces heavy global attention with efficient SSM refinement | — |
 | **[DETR]** | Carion et al., "End-to-End Object Detection with Transformers", ECCV 2020 | Set-prediction paradigm: learned queries + Hungarian matching + auxiliary losses at each decoder layer | arXiv 2005.12872 |
 | **[Mask2Former]** | Cheng et al., "Masked-attention Mask Transformer for Universal Image Segmentation", CVPR 2022 | Masked cross-attention, per-pixel embedding for mask rendering separate from memory features | arXiv 2112.01527 |
+| **[M2F3D]** | Nguyen & Vu, "Mask2Former for 3D Instance Segmentation", CVPR 2023 Workshop | Direct 3D validation of the Mask2Former recipe — shows the iterative decoder, separate mask-embed / memory-features streams, and set-prediction loss transfer to point clouds with minimal 3D-specific changes. Key bridge between [Mask2Former] (2D) and the fully 3D-native designs like [Mask3D] | — |
 
 ---
 
@@ -209,7 +210,7 @@ numerical values from mean-pooling vs first-point voxelization.
 
 ---
 
-## Phase 2: Decoder Rewrite — Core Components
+## Phase 2: Decoder Rewrite — Core Components ✅
 
 > **Files**: `instance_decoder.py`
 > **Papers**: Mask3D (iterative decoder), MAFT (positional guidance), QueryFormer (query init),
@@ -217,7 +218,7 @@ numerical values from mean-pooling vs first-point voxelization.
 > **Risk**: Medium — this is the largest code change, but the output contract is preserved
 > **Outcome**: Decoder now iteratively refines queries via Transformer layers with 3D awareness.
 
-### Step 2.1 — Implement `FourierPosEnc`
+### Step 2.1 — Implement `FourierPosEnc` ✅
 
 **File**: `instance_decoder.py`
 **Primary source**: **[MAFT]** (arXiv 2309.01692, §3.2 Position-aware Cross-Attention)
@@ -239,7 +240,7 @@ query_xyz [Q, 3]  →  FourierPosEnc  →  [Q, 96]  →  Linear  →  [Q, D]
 ```
 (96 = 3 coords × 16 bands × 2 trig functions, with `num_bands=16`)
 
-### Step 2.2 — Implement `QueryDecoderLayer`
+### Step 2.2 — Implement `QueryDecoderLayer` ✅
 
 **File**: `instance_decoder.py`
 **Primary sources**: **[Mask3D]** (arXiv 2210.03105, §3.3 Transformer Decoder),
@@ -278,7 +279,7 @@ FFN:         Q independent position-wise transforms → updated q [Q, D]
 This is the core mechanism in Mask3D, SPFormer, MAFT, QueryFormer, SGIFormer, Relation3D, and
 OneFormer3D.
 
-### Step 2.3 — Implement `HybridQueryInitializer`
+### Step 2.3 — Implement `HybridQueryInitializer` ✅
 
 **File**: `instance_decoder.py`
 **Primary sources**: **[QueryFormer]** (ICCV 2023, §3.2 Query Initialization Module),
@@ -304,11 +305,11 @@ Our hybrid approach balances scene grounding (sampled) with learning flexibility
 
 **Edge case**: If the scene has fewer voxels than `num_scene`, sample with replacement.
 
-### Step 2.4 — Redesign `GranularityHead` as a lightweight output head
+### Step 2.4 — Redesign `GranularityHead` as a lightweight output head ✅
 
 **File**: `instance_decoder.py`
-**Primary sources**: **[Mask3D]** / **[Mask2Former]** (mask-embed + class/score head pattern),
-**[OneFormer3D]** (unified lightweight heads)
+**Primary sources**: **[Mask3D]** / **[Mask2Former]** / **[M2F3D]** (mask-embed + class/score head
+pattern validated in 3D), **[OneFormer3D]** (unified lightweight heads)
 
 The current `GranularityHead` contains the query bank, the query MLP, and the score head.
 In the new design, query initialization and refinement live in the shared trunk. Each head
@@ -324,12 +325,12 @@ becomes a thin projection:
 task-specific spaces. This is much better parameter allocation — three granularities share
 the expensive self-attention and cross-attention weights but diverge only at the output.
 
-### Step 2.5 — Rewrite `MultiHeadQueryInstanceDecoder`
+### Step 2.5 — Rewrite `MultiHeadQueryInstanceDecoder` ✅
 
 **File**: `instance_decoder.py`
 **Primary sources**: **[Mask3D]** + **[SPFormer]** (shared iterative trunk over sparse tokens),
-**[MAFT]** (positional guidance in cross-attention), **[Mask2Former]** (separate mask-embed
-stream from memory stream)
+**[MAFT]** (positional guidance in cross-attention), **[Mask2Former]** / **[M2F3D]** (separate
+mask-embed stream from memory stream — M2F3D validated this works in 3D)
 
 Replace the entire class internals. The new structure:
 
@@ -370,7 +371,7 @@ the O(Q×N) cost during iterative refinement and only pay it once at the end.
 **Output contract**: Identical to the current decoder. The loss, evaluator, metrics, trainer,
 and vis code need zero changes (except for the optional `aux_outputs` addition in Phase 3).
 
-### Step 2.6 — Verify Phase 2
+### Step 2.6 — Verify Phase 2 ✅
 
 Run `check_pipeline.py`:
 - All shape checks must pass
