@@ -105,15 +105,63 @@ throughout (e.g. **[Mask3D]**) map to these entries:
 | **[DETR]** | Carion et al., "End-to-End Object Detection with Transformers", ECCV 2020 | Set-prediction paradigm: learned queries + Hungarian matching + auxiliary losses at each decoder layer | arXiv 2005.12872 |
 | **[Mask2Former]** | Cheng et al., "Masked-attention Mask Transformer for Universal Image Segmentation", CVPR 2022 | Masked cross-attention, per-pixel embedding for mask rendering separate from memory features | arXiv 2112.01527 |
 | **[M2F3D]** | Nguyen & Vu, "Mask2Former for 3D Instance Segmentation", CVPR 2023 Workshop | Direct 3D validation of the Mask2Former recipe — shows the iterative decoder, separate mask-embed / memory-features streams, and set-prediction loss transfer to point clouds with minimal 3D-specific changes. Key bridge between [Mask2Former] (2D) and the fully 3D-native designs like [Mask3D] | — |
+| **[LitePT]** | Yu et al., "LitePT: Lighter Yet Stronger Point Transformer", 2025 | Hierarchical encoder–decoder with sparse conv + PointROPE attention; U-Net-style `GridPooling` / `GridUnpooling` between stages; **LitePT-S\*** extends **LitePT-S** with a **deeper decoder** (`dec_depths` > 0) for instance segmentation — same encoder width/depth, richer multi-scale fusion in the neck | arXiv 2512.13689 |
+
+---
+
+## LitePT backbone variant policy (canonical: **LitePT-S\***)
+
+This project should treat **[LitePT-S\***](https://github.com/prs-eth/LitePT/blob/main/configs/scannet/insseg-litept-small-v1m2.py) (ScanNet instance-seg config `insseg-litept-small-v1m2`) as the **default backbone**, not the semantic-seg **LitePT-S** config where the decoder is effectively **unrolled upsampling only**.
+
+**Paper**: **[LitePT]** (arXiv:2512.13689) — hierarchical point Transformer, efficient PointROPE + FlashAttention-style varlen attention on serialized patches, U-Net encoder–decoder.
+
+### LitePT-S vs LitePT-S\* (what actually differs)
+
+Both share the **same encoder** (`enc_depths=(2, 2, 2, 6, 2)`, `enc_channels=(36, 72, 144, 252, 504)`, same strides). Final dense feature width at the finest decoder output remains **`dec_channels[0] = 72`** (`backbone_out_channels=72` in official configs).
+
+| Variant | Typical config | `dec_depths` | Decoder blocks per stage | Role |
+|---------|----------------|--------------|---------------------------|------|
+| **LitePT-S** | `semseg-litept-small-v1m1.py` | `(0, 0, 0, 0)` | **0** — no `Block` stacks in the decoder | Each decoder stage is **only** `GridUnpooling` (+ skip fusion). Fast, fewer params (~12.7M). |
+| **LitePT-S\*** | `insseg-litept-small-v1m2.py` | `(2, 2, 2, 2)` | **2** per stage × 4 stages = **8** decoder `Block`s | Adds **conv + (optional) attention** blocks after each unpool (see `dec_conv`, `dec_attn` in that config). ~16.0M params; stronger multi-scale features before the head. |
+
+So the “star” is **not** a wider encoder — it is a **deeper decoder stack** (and different `dec_conv` / `dec_attn` schedules), matching the paper’s emphasis on a full encoder–decoder hierarchy.
+
+### Implications for **every phase** of this plan
+
+1. **`litept_wrapper.py`** should construct `LitePT(...)` with kwargs that match **LitePT-S\*** (or load them from YAML), not rely on constructor defaults (defaults in `litept/model.py` match **LitePT-S** with `dec_depths=(0,0,0,0)`).
+2. **Pretrained weights**: A checkpoint trained with **LitePT-S** is **not** shape-compatible with **LitePT-S\*** (different `dec_depths` → different parameters). Use the Hugging Face / official **instance-seg** weights for S\* when freezing or fine-tuning the backbone.
+3. **`out_channels` / student heads**: Still **72** at the finest output for both S and S\* — no change to mask head input dim from switching S → S\*.
+4. **Phase 6 (multi-scale taps)**: Meaningful per-scale **decoder** features basically require **S\***. With **LitePT-S**, you can still tap each `GridUnpooling` output, but there is **no** extra Transformer/conv refinement at each scale — multi-scale is much weaker.
 
 ---
 
 ## Phase 1: Backbone Refactor ✅
 
 > **Files**: `litept_wrapper.py`, `student_model.py`
-> **Papers**: SPFormer (sparse scene representation), Mask3D (multi-scale backbone output)
+> **Papers**: SPFormer (sparse scene representation), Mask3D (multi-scale backbone output), **[LitePT]** (backbone architecture)
 > **Risk**: Low — backbone changes are isolated behind a clean API boundary
 > **Outcome**: Backbone now exposes sparse tokens + geometry. Pipeline still works.
+
+### Step 1.0 — Align `LitePT` constructor with **LitePT-S\*** (recommended follow-up) ⚠️
+
+**File**: `litept_wrapper.py`
+
+The standalone class lives at `litept/model.py` on `PYTHONPATH` (same implementation as `models/litept/litept.py` in the full LitePT repo). **Defaults** in `LitePT.__init__` correspond to **LitePT-S** (`dec_depths=(0, 0, 0, 0)`).
+
+**Action**: Add optional YAML/config-driven kwargs (or a preset string `litept_variant: litept_s_star`) so the wrapper builds:
+
+```python
+# Mirror configs/scannet/insseg-litept-small-v1m2.py backbone dict (abbreviated)
+LitePT(
+    in_channels=...,  # must match dataset features (3 vs 6 in official configs)
+    dec_depths=(2, 2, 2, 2),
+    dec_conv=(True, True, True, False),
+    dec_attn=(False, False, False, True),
+    # ... keep all other keys identical to that config for weight compatibility
+)
+```
+
+Until this is done, document which checkpoint the student run assumes (**S** vs **S\***). Phases 2–5 remain valid either way (same 72-D features); Phase 6 should assume **S\*** for the full multi-scale story.
 
 ### Step 1.1 — Define `LitePTBackboneOutput` dataclass ✅
 
@@ -419,6 +467,9 @@ model:
     litept_root: /home/nedela/projects/LitePT
     in_channels: 3
     grid_size: 0.02
+    # Optional (Phase 1 Step 1.0 / Phase 6): match LitePT-S* for insseg checkpoints + multi-scale
+    # litept_variant: litept_s_star
+    # Or pass explicit kwargs mirroring configs/scannet/insseg-litept-small-v1m2.py
   num_queries: 200
   decoder_hidden_dim: 256
   num_decoder_layers: 4
@@ -427,6 +478,12 @@ model:
   use_positional_guidance: true
   learned_query_ratio: 0.25
 ```
+
+**LitePT-S\*** alignment: When loading **instance-segmentation** pretrained weights or implementing
+Phase 6, the backbone block must use the same `dec_depths`, `dec_conv`, and `dec_attn` as
+`insseg-litept-small-v1m2.py` (see **LitePT backbone variant policy** above). `in_channels` must
+match the student dataset (official ScanNet configs use `6` with color+normal; Chorus may use `3`
+RGB-only — then train from scratch or adapt first layers).
 
 Increase `max_steps` from 5000 to at least 8000 — the Transformer decoder has more parameters
 and needs more iterations to converge, especially with hybrid query init introducing randomness.
@@ -597,248 +654,210 @@ python scripts/run_student.py --config configs/overfit_one_scene.yaml \
 
 ## Phase 6: Multi-Scale Backbone Features (Mask3D / Mask2Former3D style)
 
-> **Files**: `litept_wrapper.py`, `instance_decoder.py`, `student_model.py`,
+> **Files**: `litept/model.py` (import path in Chorus; same class as `models/litept/litept.py`
+> in the upstream repo), `litept_wrapper.py`, `instance_decoder.py`, `student_model.py`,
 > `configs/overfit_one_scene.yaml`
 > **Papers**: Mask3D (multi-scale cross-attention), Mask2Former / M2F3D (per-layer scale
-> assignment), SPFormer (sparse multi-scale features)
-> **Risk**: Medium — requires extracting LitePT encoder internals and reworking decoder
-> cross-attention, but the output contract is preserved
-> **Outcome**: Decoder cross-attends to different spatial resolutions at different layers,
-> giving coarse-to-fine refinement like the Mask2Former3D architecture diagram.
+> assignment), SPFormer (sparse multi-scale features), **[LitePT]** (U-Net hierarchy + decoder blocks)
+> **Risk**: Medium — requires extracting intermediate `Point` states from LitePT’s decoder and
+> reworking cross-attention, but the output contract is preserved
+> **Outcome**: Student decoder layers cross-attend to different LitePT decoder scales
+> (coarse → fine), similar in spirit to Mask2Former3D diagrams — **assuming LitePT-S\***.
+
+### Prerequisite: use **LitePT-S\***, not bare **LitePT-S**
+
+Phase 6 assumes the backbone is configured like **`insseg-litept-small-v1m2.py`** (**LitePT-S\***):
+`dec_depths=(2, 2, 2, 2)` with non-trivial `dec_conv` / `dec_attn`. Each of the four decoder
+substages runs **`GridUnpooling` + `dec_depths[s]` × `Block`** (subsampled conv and/or
+PointROPE attention), so **hooks after each substage see features that were actually refined
+at that resolution**.
+
+If the backbone is **LitePT-S** (`dec_depths=(0,0,0,0)`), decoder substages contain **only**
+`GridUnpooling` — you can still build a pyramid, but there is **no** per-scale decoder
+`Block` stack. Multi-scale cross-attention is much less informative; prefer enabling S\*
+before investing in Phase 6.
 
 ### Why multi-scale matters
 
-Currently, all decoder layers cross-attend to **one** set of sparse voxel tokens (the final
-LitePT encoder output). This means every refinement layer sees the same resolution.
+Currently, all student decoder layers cross-attend to **one** set of sparse voxel tokens
+(the final LitePT output at the finest resolution). Every refinement layer sees the same
+memory.
 
-In Mask3D and Mask2Former3D, each decoder layer attends to a **different feature pyramid
-level**: early layers see coarse/large-receptive-field features (good for finding large
-objects and rough shapes), later layers see fine/high-resolution features (good for refining
-boundaries). This coarse-to-fine progression is a key reason those architectures work well.
+In Mask3D / Mask2Former3D, different layers attend to **different pyramid levels**: coarse
+levels for object discovery, fine levels for mask boundaries. LitePT’s **encoder–decoder**
+already forms such a pyramid; we expose it to the student.
 
-### Background: LitePT's internal structure
+### Background: LitePT forward (from `LitePT.forward`)
 
-LitePT has a U-Net-like encoder-decoder with multiple stages:
+Reference: `LitePT` in `litept/model.py` (matches the snippet from `models/litept/litept.py`).
+
+1. `Point(data_dict)` → optional serialization (`enc_attn[0]`) → `sparsify()`
+2. `embedding` → `enc` (hierarchical **encoder**: `GridPooling` + per-stage `Block`s)
+3. `dec` (hierarchical **decoder**: repeated substages until finest resolution)
+4. Return `point` — `point.feat` is **[V, dec_channels[0]]** at full resolution (72-D for official S / S\*).
+
+**Encoder** (`self.enc`): stages `enc0` … `enc4` with increasing channel width
+`(36 → 72 → 144 → 252 → 504)` and decreasing spatial extent (strides in `stride`).
+
+**Decoder** (`self.dec`): built in a loop `for s in reversed(range(num_stages - 1))`, i.e.
+**`s = 3, 2, 1, 0`**, each substage named `dec{s}` and appended in that order. So **forward
+execution order** is:
 
 ```
-Encoder stages (LitePT.enc):
-  Stage 0: enc_channels[0] = 36,  no pooling (original resolution)
-  Stage 1: enc_channels[1] = 72,  GridPooling stride=2
-  Stage 2: enc_channels[2] = 144, GridPooling stride=2
-  Stage 3: enc_channels[3] = 252, GridPooling stride=2
-  Stage 4: enc_channels[4] = 504, GridPooling stride=2
-
-Decoder stages (LitePT.dec):
-  Stage 0: dec_channels[0] = 72   (finest, after upsampling from stage 1)
-  Stage 1: dec_channels[1] = 72
-  Stage 2: dec_channels[2] = 144
-  Stage 3: dec_channels[3] = 252
+dec3 → dec2 → dec1 → dec0
 ```
 
-Currently we only use `out.feat` (the final decoded output at stage 0, channel dim 72).
-To get multi-scale features, we need to **intercept intermediate stage outputs**.
+Each `dec{s}` is a `PointSequential` containing:
 
-### Step 6.1 — Understand LitePT's forward flow and identify tap points
+- `GridUnpooling` (“up”) — fuses upsampled features with encoder skip (`skip_channels=enc_channels[s]`)
+- `dec_depths[s]` × `Block` — conv and/or PointROPE attention (`dec_conv[s]`, `dec_attn[s]`)
 
-**File**: `LitePT/litept/model.py` (read-only analysis)
+**LitePT-S\*** (`insseg-litept-small-v1m2`): `dec_depths=(2,2,2,2)`, `dec_conv=(True,True,True,False)`,
+`dec_attn=(False,False,False,True)` — attention only in the last decoder substage (`dec0` blocks).
 
-LitePT's `forward()` runs:
-1. `self.embedding(point)` — initial projection
-2. `self.enc(point)` — sequential encoder stages (with GridPooling between stages)
-3. `self.dec(point)` — sequential decoder stages (with UnPooling between stages)
-4. Returns final `point` with `.feat` at decoder stage 0
+**Indexing vs resolution**: `self.dec[0]` runs **`dec3`** (first in the chain — **coarsest**
+decoder features, fewest tokens after that stage’s unpool relative to the final grid).
+`self.dec[3]` runs **`dec0`** (**finest** — matches today’s single-scale `out.feat` used for
+`scene_tokens`). Do **not** confuse the integer `s` in `dec{s}` with the index into
+`nn.Sequential`; use the mapping table below.
 
-**Tap points** for multi-scale features (prefer decoder stages since they incorporate
-skip connections from the encoder):
+| `self.dec` index (forward order) | Module name | Relative resolution | `dec_channels[s]` (width after unpool) | LitePT-S\* blocks |
+|----------------------------------|-------------|---------------------|----------------------------------------|---------------------|
+| 0 | `dec3` | coarsest in pyramid | 252 | 2 |
+| 1 | `dec2` | | 144 | 2 |
+| 2 | `dec1` | | 72 | 2 |
+| 3 | `dec0` | **finest** (default memory) | 72 | 2 (+ `dec_attn` True) |
 
-| Level | Source           | Approx token count (V) | Channel dim | Spatial resolution |
-|-------|------------------|------------------------|-------------|-------------------|
-| Fine  | dec stage 0 out  | ~V (same as current)   | 72          | grid_size          |
-| Mid   | dec stage 1 out  | ~V/4                   | 72          | grid_size × 2      |
-| Coarse| dec stage 2 out  | ~V/16                  | 144         | grid_size × 4      |
+Token counts **increase** along the decoder (upsampling). For student cross-attention, coarse
+levels have **smaller V** (cheaper attention); the finest level matches current **V**.
 
-We want 2–3 levels. Using more is diminishing returns and increases memory.
+### Step 6.1 — Choose tap points (decoder substage outputs)
 
-### Step 6.2 — Add hooks or modify LitePT forward to capture multi-scale outputs
+**Goal**: After a forward pass, collect `K` tensors `(feat, coord or grid_coord)` — one per
+scale — in **coarse-to-fine** order for the student:
+
+```text
+multi_scale_tokens[0]  ← after self.dec[0]  (dec3, coarsest)
+...
+multi_scale_tokens[-1] ← after self.dec[3]  (dec0, finest = current default)
+```
+
+**Optional**: Also experiment with **encoder** taps (e.g. after `enc{s}`) for even coarser
+semantics; start with **decoder-only** taps to stay close to Mask3D / M2F3D “FPN from fused
+decoder features”.
+
+### Step 6.2 — Implement capture (hooks vs manual unroll)
 
 **File**: `litept_wrapper.py`
 
-**Option A — Register forward hooks (non-invasive, preferred)**:
-```python
-self._multi_scale_outputs: list[dict] = []
+**Option A — Forward hooks on each `self.dec[i]` (non-invasive)**:
 
-def _hook_fn(stage_idx):
-    def hook(module, input, output):
-        # output is a Point dict; capture feat and coord
-        self._multi_scale_outputs.append({
-            "feat": output.feat.clone(),
-            "coord": output.coord.clone(),
-        })
+```python
+def _hook_capture(scale_order: int):
+    def hook(module, inp, out_point):
+        # out_point is Point; read sparse feat and geometry
+        self._captured[scale_order] = {
+            "feat": out_point.feat,
+            "coord": out_point.coord,  # or grid_coord — match what Fourier PE expects
+        }
     return hook
 
-# In __init__, register hooks on specific decoder stages:
-for idx in [0, 1, 2]:
-    self.model.dec[idx].register_forward_hook(_hook_fn(idx))
+for i in range(4):
+    self.model.dec[i].register_forward_hook(_hook_capture(i))
 ```
 
-**Option B — Subclass LitePT.forward() (more control)**:
-Override `forward()` to run encoder and decoder stage-by-stage, capturing intermediate
-`Point` objects. More invasive but avoids hook fragility.
+Clear `_captured` at the start of each `forward`. **Note**: `Point` may carry
+`sparse_conv_feat`; use the same field the rest of LitePT uses for `[V, C]` features.
 
-**Recommendation**: Start with Option A (hooks). Switch to B only if hooks cause issues
-with gradient flow or caching.
+**Option B — Subclass `LitePT` or copy the official `forward`** and run `self.dec` one
+substage at a time with explicit captures (maximum control, easier debugging).
 
-### Step 6.3 — Extend `LitePTBackboneOutput` to carry multi-scale features
+**Recommendation**: Option A first; verify gradients reach backbone if training LitePT.
+
+### Step 6.3 — Extend `LitePTBackboneOutput`
 
 **File**: `litept_wrapper.py`
 
-Add a new field to the dataclass:
-
 ```python
-@dataclass
-class LitePTBackboneOutput:
-    point_feat: torch.Tensor       # [N, C] dense per-point features (unchanged)
-    point_xyz: torch.Tensor        # [N, 3]
-    scene_tokens: torch.Tensor     # [V, C] finest scale (unchanged, for backward compat)
-    scene_xyz: torch.Tensor        # [V, 3]
-    inverse_map: torch.Tensor      # [N]
-
-    # NEW: multi-scale sparse features from decoder stages
-    multi_scale_tokens: list[torch.Tensor]  # [tokens_fine, tokens_mid, tokens_coarse]
-    multi_scale_xyz: list[torch.Tensor]     # [xyz_fine, xyz_mid, xyz_coarse]
+multi_scale_tokens: list[torch.Tensor]   # coarse → fine, len ≤ 4 for S*
+multi_scale_xyz: list[torch.Tensor]        # centroids or coords per scale (match pos enc)
 ```
 
-Each entry in `multi_scale_tokens[i]` has shape `[V_i, C_i]` where `V_i` decreases and
-`C_i` may differ across scales.
+`scene_tokens` / `scene_xyz` remain the **finest** scale (after `dec0`), i.e. current behavior.
+`point_feat = scene_tokens[inverse]` unchanged.
 
-`scene_tokens` / `scene_xyz` remain as the finest scale for backward compatibility.
+Per-scale channel widths for **LitePT-S\*** follow `dec_channels` at each unpool: **252, 144,
+72, 72** (coarse → fine). Student `scale_projs` must list these **in the same order** as
+`multi_scale_tokens`.
 
-### Step 6.4 — Add per-scale projection layers to the decoder
+### Step 6.4 — Per-scale projections in the student decoder
 
 **File**: `instance_decoder.py`
 
-Currently there is one `scene_token_proj` that maps `[V, C_in] → [V, D]`. For multi-scale,
-add one projection per scale level:
+Replace a single `scene_token_proj` with:
 
 ```python
-self.scale_projs = nn.ModuleList([
-    nn.Sequential(
-        nn.Linear(channels_i, hidden_dim),
-        nn.LayerNorm(hidden_dim),
-        nn.GELU(),
-        nn.Linear(hidden_dim, hidden_dim),
-    )
-    for channels_i in scale_channels  # e.g. [72, 72, 144]
-])
+# Example channel widths when tapping all four decoder substages (LitePT-S*)
+scale_channels = [252, 144, 72, 72]
+self.scale_projs = nn.ModuleList([... for c in scale_channels])
 ```
 
-Also add per-scale positional encoding (reuse `FourierPosEnc` + `pos_proj`, or add
-per-scale `pos_proj` if channel dims differ).
+Reuse `FourierPosEnc` + `pos_proj` per scale (separate `pos_proj` if needed when dimensions
+differ). Normalize coordinates consistently (meter-scale vs grid — match current `scene_xyz`
+convention).
 
-### Step 6.5 — Assign scales to decoder layers (round-robin or coarse-to-fine)
+### Step 6.5 — Map student Transformer layers → pyramid levels
 
 **File**: `instance_decoder.py`
 
-**Strategy 1 — Coarse-to-fine** (Mask3D default):
-- Layer 0 cross-attends to coarsest scale (large receptive field, rough localization)
-- Layer 1 cross-attends to mid scale
-- Layer 2 cross-attends to finest scale (boundary refinement)
-- If more layers than scales, cycle back (layer 3 → coarse, etc.)
+**Strategy — Coarse-to-fine round-robin** (same as earlier plan): student layer `i` attends to
+`multi_scale_tokens[j]` with `j` chosen so early layers use coarse features, late layers use
+fine. With 4 scales and `num_decoder_layers` 3–4, either cycle or truncate:
 
 ```python
-def _get_scale_for_layer(self, layer_idx: int) -> int:
-    num_scales = len(self.scale_projs)
-    # Coarse-to-fine: layer 0 → coarsest, layer (num_scales-1) → finest
-    # Reverse index, then cycle
-    return (num_scales - 1) - (layer_idx % num_scales)
+def _scale_index_for_layer(self, layer_idx: int, num_scales: int) -> int:
+    # Example: layer 0 → coarsest (0), ..., layer num_scales-1 → finest (num_scales-1)
+    return min(layer_idx, num_scales - 1)  # or modular arithmetic / custom schedule
 ```
 
-**Strategy 2 — All-to-all** (Mask2Former style):
-Each layer attends to all scales concatenated. Simpler but more memory.
+**Strategy — All scales concatenated** (Mask2Former-style): higher memory; optional later.
 
-**Recommendation**: Start with Strategy 1 (coarse-to-fine round-robin). It is what Mask3D
-uses and is more memory-efficient.
+### Step 6.6 — Wire `_forward_unbatched` to per-scale memory
 
-### Step 6.6 — Update `_forward_unbatched` to use multi-scale cross-attention
+Same pattern as before: build `scale_mems[s]`, `scale_poss[s]` from captured lists; inside
+the student trunk loop, index `s = _scale_index_for_layer(layer_idx, ...)`. `QueryDecoderLayer`
+unchanged.
 
-**File**: `instance_decoder.py`
+### Step 6.7 — `StudentInstanceSegModel` forward
 
-Change the decoder loop from:
+Pass `multi_scale_tokens` and `multi_scale_xyz` from `LitePTBackboneOutput` into the decoder.
 
-```python
-# Current: single scale
-scene_mem = self.scene_token_proj(scene_tokens)
-scene_pos = self.pos_proj(self.pos_encoder(scene_xyz))
-for layer in self.layers:
-    q = layer(q, q_pos, scene_mem, scene_pos)
-```
-
-to:
-
-```python
-# New: per-layer scale selection
-scale_mems = [proj(tokens) for proj, tokens in
-              zip(self.scale_projs, multi_scale_tokens)]
-scale_poss = [self.pos_proj(self.pos_encoder(xyz))
-              for xyz in multi_scale_xyz]
-
-for layer_idx, layer in enumerate(self.layers):
-    s = self._get_scale_for_layer(layer_idx)
-    q = layer(q, q_pos, scale_mems[s], scale_poss[s])
-```
-
-`QueryDecoderLayer` itself needs **no changes** — it already takes generic
-`(q, q_pos, scene_mem, scene_pos)` tensors. The only difference is which scale's
-memory and positions are passed in.
-
-### Step 6.7 — Update `StudentInstanceSegModel` to pass multi-scale data
-
-**File**: `student_model.py`
-
-Update `forward()` to pass the new fields:
-
-```python
-bb = self.backbone(points, features)
-return self.decoder(
-    point_feat=bb.point_feat,
-    point_xyz=bb.point_xyz,
-    scene_tokens=bb.scene_tokens,
-    scene_xyz=bb.scene_xyz,
-    multi_scale_tokens=bb.multi_scale_tokens,
-    multi_scale_xyz=bb.multi_scale_xyz,
-)
-```
-
-### Step 6.8 — Add config knobs
+### Step 6.8 — Config knobs
 
 **File**: `configs/overfit_one_scene.yaml`
 
 ```yaml
 model:
   backbone:
-    multi_scale: true          # enable multi-scale feature extraction
-    multi_scale_stages: [0, 1, 2]  # which decoder stages to tap
-  # num_decoder_layers should ideally be >= len(multi_scale_stages)
-  num_decoder_layers: 3
+    # First align with LitePT-S* (Phase 1 Step 1.0)
+    litept_variant: litept_s_star   # or explicit dec_depths: [2,2,2,2]
+    multi_scale: true
+    multi_scale_tap: decoder_submodules  # decoder-only; optional: encoder later
+    multi_scale_indices: [0, 1, 2, 3]    # all dec{i}; or [0,2,3] for 3 levels
+  num_decoder_layers: 4   # ≥ 1; align with multi-scale schedule
 ```
 
 ### Step 6.9 — Backward compatibility
 
-When `multi_scale: false` (default), the backbone returns empty lists for
-`multi_scale_tokens` / `multi_scale_xyz`, and the decoder falls back to the current
-single-scale behavior. This ensures no existing configs or runs break.
+`multi_scale: false` → empty lists; student uses finest `scene_tokens` only (current behavior).
 
 ### Step 6.10 — Verify Phase 6
 
-Run `check_pipeline.py` with `multi_scale: true`:
-- Verify multi-scale tensors have expected shapes and decreasing token counts
-- Verify gradient flow through all scale projections
-- Verify decoder output shapes are unchanged
-
-Run `run_student.py --max-steps 200` and compare loss/metrics to single-scale baseline.
-
-**Expected**: Slightly slower per-step (more projections), but potentially better
-convergence on `g02` (fine-grained), where multi-scale context should help most.
+- With **LitePT-S\***: assert len(token list) matches taps; **V** increases coarse → fine;
+  finest matches existing `scene_tokens.shape[0]`.
+- `check_pipeline.py` + short `run_student.py` — compare loss vs single-scale.
+- **Expected**: Higher per-step cost (more projections + possibly more scales); best case
+  gains on fine granularity `g02` and boundaries.
 
 ---
 

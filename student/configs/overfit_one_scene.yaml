@@ -4,7 +4,7 @@ experiment:
   output_root: /scratch2/nedela/student_runs
 
 data:
-  scene_dir: /scratch2/nedela/chorus_poc/scans/scene0022_00
+  scene_dir: /scratch2/nedela/chorus_poc/scans/scene0020_00
   granularities: [0.2, 0.5, 0.8]
   use_colors: true
   append_xyz_to_features: false
@@ -14,6 +14,8 @@ model:
   backbone:
     name: litept
     litept_root: /home/nedela/projects/LitePT
+    # litept_s_star = deeper decoder (insseg-litept-small-v1m2); litept_s = shallow (semseg v1m1)
+    litept_variant: litept_s_star
     in_channels: 3
     grid_size: 0.02
     num_queries: 200

@@ -87,6 +87,8 @@ def build_student_model(
     litept_root: str,
     in_channels: int,
     grid_size: float = 0.02,
+    litept_variant: str = "litept_s_star",
+    litept_kwargs: dict | None = None,
     hidden_dim: int = 256,
     num_queries: int = 128,
     num_queries_by_granularity: dict[str, int] | None = None,
@@ -110,11 +112,19 @@ def build_student_model(
         ``"hybrid"`` uses *learned_query_ratio* (default).
         ``"learned"`` forces all queries to be learned embeddings.
         ``"scene"`` forces all queries to be scene-sampled.
+    litept_variant:
+        ``"litept_s_star"`` (default) uses the deeper decoder from instance-seg configs;
+        ``"litept_s"`` matches semantic-seg LitePT-S (``dec_depths`` all zero). Must match
+        any pretrained checkpoint architecture.
+    litept_kwargs:
+        Optional extra keyword arguments merged into :class:`~litept.model.LitePT`.
     """
     backbone = LitePTBackbone(
         litept_root=litept_root,
         in_channels=in_channels,
         grid_size=grid_size,
+        litept_variant=litept_variant,
+        litept_kwargs=litept_kwargs,
     )
 
     if query_init == "learned":

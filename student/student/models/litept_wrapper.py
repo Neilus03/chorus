@@ -9,6 +9,11 @@ Downstream code receives a structured :class:`LitePTBackboneOutput`::
     bb.scene_xyz     # [V, 3]  voxel centroids
     bb.inverse_map   # [N]     point → voxel index
 
+By default the backbone is **LitePT-S\*** (ScanNet instance-seg architecture from
+``configs/scannet/insseg-litept-small-v1m2.py``): deeper decoder
+``dec_depths=(2, 2, 2, 2)`` vs LitePT-S where ``dec_depths=(0, 0, 0, 0)``. Use
+``litept_variant="litept_s"`` only for checkpoints trained with the shallow decoder.
+
 Everything LitePT-specific (voxelization, Point dict, offset, grid_coord,
 sparse tensors) is hidden inside this module.
 """
@@ -18,9 +23,51 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn as nn
+
+# LitePT-S* — mirrors LitePT/configs/scannet/insseg-litept-small-v1m2.py ``backbone`` dict
+# (excluding ``type`` and ``in_channels``, which come from the student config).
+LITEPT_S_STAR_KWARGS: dict[str, Any] = {
+    "order": ("z", "z-trans", "hilbert", "hilbert-trans"),
+    "stride": (2, 2, 2, 2),
+    "enc_depths": (2, 2, 2, 6, 2),
+    "enc_channels": (36, 72, 144, 252, 504),
+    "enc_num_head": (2, 4, 8, 14, 28),
+    "enc_patch_size": (1024, 1024, 1024, 1024, 1024),
+    "enc_conv": (True, True, True, False, False),
+    "enc_attn": (False, False, False, True, True),
+    "enc_rope_freq": (100.0, 100.0, 100.0, 100.0, 100.0),
+    "dec_depths": (2, 2, 2, 2),
+    "dec_channels": (72, 72, 144, 252),
+    "dec_num_head": (4, 4, 8, 14),
+    "dec_patch_size": (1024, 1024, 1024, 1024),
+    "dec_conv": (True, True, True, False),
+    "dec_attn": (False, False, False, True),
+    "dec_rope_freq": (100.0, 100.0, 100.0, 100.0),
+    "mlp_ratio": 4,
+    "qkv_bias": True,
+    "qk_scale": None,
+    "attn_drop": 0.0,
+    "proj_drop": 0.0,
+    "drop_path": 0.3,
+    "pre_norm": True,
+    "shuffle_orders": True,
+    "enc_mode": False,
+}
+
+
+def _litept_constructor_kwargs(variant: str) -> dict[str, Any]:
+    if variant == "litept_s_star":
+        return dict(LITEPT_S_STAR_KWARGS)
+    if variant == "litept_s":
+        # ``litept.model.LitePT`` defaults match semantic-seg LitePT-S (no decoder blocks).
+        return {}
+    raise ValueError(
+        f"Unknown litept_variant {variant!r}; expected 'litept_s_star' or 'litept_s'."
+    )
 
 
 @dataclass
@@ -59,11 +106,18 @@ class LitePTBackbone(nn.Module):
         litept_root: str,
         in_channels: int,
         grid_size: float = 0.02,
+        litept_variant: str = "litept_s_star",
+        litept_kwargs: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.litept_root = Path(litept_root).resolve()
         self.in_channels = int(in_channels)
         self.grid_size = float(grid_size)
+        if litept_variant not in ("litept_s_star", "litept_s"):
+            raise ValueError(
+                f"litept_variant must be 'litept_s_star' or 'litept_s', got {litept_variant!r}"
+            )
+        self.litept_variant = litept_variant
 
         if not self.litept_root.exists():
             raise FileNotFoundError(
@@ -76,9 +130,12 @@ class LitePTBackbone(nn.Module):
 
         from litept.model import LitePT
 
-        self.model = LitePT(in_channels=self.in_channels)
+        ctor: dict[str, Any] = _litept_constructor_kwargs(litept_variant)
+        if litept_kwargs:
+            ctor.update(litept_kwargs)
+        self.model = LitePT(in_channels=self.in_channels, **ctor)
 
-        # Default LitePT-S decoder outputs dec_channels[0] = 72.
+        # LitePT-S and LitePT-S* both use dec_channels[0] = 72 at the finest output.
         self.out_channels: int = 72
 
         self._cached_voxelization: (

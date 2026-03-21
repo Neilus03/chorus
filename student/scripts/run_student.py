@@ -190,6 +190,8 @@ def main() -> None:
         litept_root=bb_cfg["litept_root"],
         in_channels=bb_cfg.get("in_channels", ds.feature_dim),
         grid_size=bb_cfg.get("grid_size", 0.02),
+        litept_variant=bb_cfg.get("litept_variant", "litept_s_star"),
+        litept_kwargs=bb_cfg.get("litept_kwargs", None),
         hidden_dim=model_cfg.get("decoder_hidden_dim", 256),
         num_queries=model_cfg.get("num_queries", 128),
         num_queries_by_granularity=model_cfg.get("num_queries_by_granularity", None),
