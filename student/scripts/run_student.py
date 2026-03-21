@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import random
 import sys
 from pathlib import Path
 from typing import Any
@@ -28,6 +27,12 @@ _STUDENT_PKG = _SCRIPT_DIR.parent
 if str(_STUDENT_PKG) not in sys.path:
     sys.path.insert(0, str(_STUDENT_PKG))
 
+from student.config_utils import (
+    load_config,
+    parse_granularities,
+    resolve_num_queries,
+    set_seed,
+)
 from student.data import MultiGranSceneDataset, build_instance_targets_multi
 from student.data.target_builder import log_target_stats
 from student.losses import MaskSetCriterion, MultiGranCriterion
@@ -45,11 +50,6 @@ except ImportError:
 # ── config ───────────────────────────────────────────────────────────────
 
 
-def load_config(config_path: str | Path) -> dict[str, Any]:
-    with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
-
-
 def apply_cli_overrides(cfg: dict[str, Any], overrides: list[str]) -> None:
     """Apply dotted key=value overrides, e.g. ``train.lr=3e-4``."""
     for item in overrides:
@@ -61,34 +61,6 @@ def apply_cli_overrides(cfg: dict[str, Any], overrides: list[str]) -> None:
         for p in parts[:-1]:
             d = d.setdefault(p, {})
         d[parts[-1]] = yaml.safe_load(value)
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def _parse_granularities(data_cfg: dict[str, Any]) -> tuple[str, ...]:
-    """Extract dot-free granularity keys from config.
-
-    Supports both the new list format and the legacy single-float format:
-        granularities: [0.2, 0.5, 0.8]    ->  ("g02", "g05", "g08")
-        granularity: 0.8                   ->  ("g08",)
-    """
-    def _to_key(g: float | str) -> str:
-        s = str(g)
-        if s.startswith("g"):
-            return s.replace(".", "")
-        return f"g{s}".replace(".", "")
-
-    if "granularities" in data_cfg:
-        return tuple(_to_key(g) for g in data_cfg["granularities"])
-    if "granularity" in data_cfg:
-        return (_to_key(data_cfg["granularity"]),)
-    raise KeyError("Config must specify data.granularities or data.granularity")
 
 
 # ── output directory ─────────────────────────────────────────────────────
@@ -146,7 +118,7 @@ def main() -> None:
     exp_cfg = cfg["experiment"]
 
     scene_dir = data_cfg["scene_dir"]
-    granularities = _parse_granularities(data_cfg)
+    granularities = parse_granularities(data_cfg)
     device = train_cfg.get("device", "cuda:0")
     seed = exp_cfg.get("seed", 42)
 
@@ -186,6 +158,7 @@ def main() -> None:
 
     # ── 5. model ──
     bb_cfg = model_cfg["backbone"]
+    num_queries, num_queries_by_granularity = resolve_num_queries(model_cfg, bb_cfg)
     model = build_student_model(
         litept_root=bb_cfg["litept_root"],
         in_channels=bb_cfg.get("in_channels", ds.feature_dim),
@@ -193,8 +166,8 @@ def main() -> None:
         litept_variant=bb_cfg.get("litept_variant", "litept_s_star"),
         litept_kwargs=bb_cfg.get("litept_kwargs", None),
         hidden_dim=model_cfg.get("decoder_hidden_dim", 256),
-        num_queries=model_cfg.get("num_queries", 128),
-        num_queries_by_granularity=model_cfg.get("num_queries_by_granularity", None),
+        num_queries=num_queries,
+        num_queries_by_granularity=num_queries_by_granularity,
         granularities=granularities,
         num_decoder_layers=model_cfg.get("num_decoder_layers", 4),
         num_decoder_heads=model_cfg.get("num_decoder_heads", 8),
