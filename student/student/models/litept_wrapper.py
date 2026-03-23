@@ -21,7 +21,7 @@ sparse tensors) is hidden inside this module.
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -77,13 +77,20 @@ class LitePTBackboneOutput:
     Carries both the dense per-point features needed for final mask
     dot-products and the sparse voxel tokens needed for efficient
     Transformer cross-attention in the decoder.
+
+    When ``multi_scale`` is enabled, ``multi_scale_tokens`` and
+    ``multi_scale_xyz`` contain per-decoder-substage features in
+    **coarse → fine** order (e.g. 4 entries for LitePT-S*).
     """
 
     point_feat: torch.Tensor    # [N, C] dense per-point features
     point_xyz: torch.Tensor     # [N, 3] original point coordinates
-    scene_tokens: torch.Tensor  # [V, C] sparse voxel features
-    scene_xyz: torch.Tensor     # [V, 3] voxel centroids
+    scene_tokens: torch.Tensor  # [V, C] sparse voxel features (finest scale)
+    scene_xyz: torch.Tensor     # [V, 3] voxel centroids (finest scale)
     inverse_map: torch.Tensor   # [N]    maps points → voxel token index
+
+    multi_scale_tokens: list[torch.Tensor] = field(default_factory=list)
+    multi_scale_xyz: list[torch.Tensor] = field(default_factory=list)
 
 
 class LitePTBackbone(nn.Module):
@@ -108,6 +115,7 @@ class LitePTBackbone(nn.Module):
         grid_size: float = 0.02,
         litept_variant: str = "litept_s_star",
         litept_kwargs: dict[str, Any] | None = None,
+        multi_scale: bool = False,
     ) -> None:
         super().__init__()
         self.litept_root = Path(litept_root).resolve()
@@ -141,6 +149,34 @@ class LitePTBackbone(nn.Module):
         self._cached_voxelization: (
             tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None
         ) = None
+
+        #  multi-scale decoder feature capture 
+        self._multi_scale = bool(multi_scale)
+        self._captured: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._multi_scale_channels: list[int] = []
+
+        if self._multi_scale and hasattr(self.model, "dec"):
+            dec_channels_cfg = list(ctor.get("dec_channels", (72, 72, 144, 252)))
+            # dec_channels_cfg is indexed s=0 (finest) .. s=3 (coarsest).
+            # self.model.dec runs in forward order dec3→dec0 (coarsest→finest),
+            # so reversed gives coarse→fine channel widths.
+            self._multi_scale_channels = list(reversed(dec_channels_cfg))
+            num_dec_stages = len(self.model.dec)
+            for i in range(num_dec_stages):
+                self.model.dec[i].register_forward_hook(self._make_hook(i))
+
+    def _make_hook(self, scale_idx: int):
+        """Return a forward hook that captures (feat, coord) from a decoder substage."""
+        def hook(module, input, output):
+            self._captured[scale_idx] = (output.feat, output.coord)
+        return hook
+
+    @property
+    def multi_scale_channels(self) -> list[int] | None:
+        """Channel widths of each captured decoder scale (coarse → fine), or None."""
+        if self._multi_scale and self._multi_scale_channels:
+            return list(self._multi_scale_channels)
+        return None
 
     # ------------------------------------------------------------------ #
 
@@ -240,6 +276,8 @@ class LitePTBackbone(nn.Module):
         -------
         :class:`LitePTBackboneOutput` with dense per-point features,
         sparse voxel tokens, coordinates, and inverse mapping.
+        When ``multi_scale`` is enabled, also includes per-scale
+        decoder features in coarse → fine order.
         """
         coord, feat = self._normalize_inputs(coord, feat)
 
@@ -250,10 +288,20 @@ class LitePTBackbone(nn.Module):
             if self.training:
                 self._cached_voxelization = (point_dict, inverse, scene_xyz)
 
+        self._captured.clear()
+
         out = self.model(point_dict)
 
         scene_tokens = out.feat          # [V, C]
         point_feat = scene_tokens[inverse]  # [N, C]
+
+        ms_tokens: list[torch.Tensor] = []
+        ms_xyz: list[torch.Tensor] = []
+        if self._multi_scale and self._captured:
+            for i in sorted(self._captured.keys()):
+                cap_feat, cap_coord = self._captured[i]
+                ms_tokens.append(cap_feat)
+                ms_xyz.append(cap_coord)
 
         return LitePTBackboneOutput(
             point_feat=point_feat,
@@ -261,4 +309,6 @@ class LitePTBackbone(nn.Module):
             scene_tokens=scene_tokens,
             scene_xyz=scene_xyz,
             inverse_map=inverse,
+            multi_scale_tokens=ms_tokens,
+            multi_scale_xyz=ms_xyz,
         )

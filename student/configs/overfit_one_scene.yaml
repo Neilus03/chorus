@@ -18,15 +18,19 @@ model:
     litept_variant: litept_s_star
     in_channels: 3
     grid_size: 0.02
+    # multi-scale decoder feature capture (coarse→fine cross-attention).
+    # Each student trunk layer attends to a different LitePT decoder scale.
+    # Requires litept_s_star for meaningful per-scale features.
+    multi_scale: true
     num_queries: 200
     num_queries_by_granularity:
-      g02: 300
+      g02: 350
       g05: 200
-      g08: 100
-  decoder_hidden_dim: 384
-  num_decoder_layers: 4
-  num_decoder_heads: 8
-  query_init: hybrid
+      g08: 150
+  decoder_hidden_dim: 256
+  num_decoder_layers: 2
+  num_decoder_heads: 4
+  query_init: learned
   use_positional_guidance: true
   learned_query_ratio: 0.5
 
@@ -44,10 +48,10 @@ loss:
 train:
   device: cuda:0
   lr: 5.0e-4
-  backbone_lr_scale: 0.1
+  backbone_lr_scale: 0.75
   weight_decay: 1.0e-4
   max_steps: 5000
-  grad_clip_norm: 1.0
+  grad_clip_norm: 2.0
   log_every: 20
   eval_every: 100
   save_every: 200
