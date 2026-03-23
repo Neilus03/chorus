@@ -174,6 +174,7 @@ def main() -> None:
         query_init=model_cfg.get("query_init", "hybrid"),
         use_positional_guidance=model_cfg.get("use_positional_guidance", True),
         learned_query_ratio=model_cfg.get("learned_query_ratio", 0.25),
+        multi_scale=bb_cfg.get("multi_scale", False),
     )
     total_params = sum(p.numel() for p in model.parameters())
     log.info("Model: %s params (%d heads)", f"{total_params:,}", len(granularities))

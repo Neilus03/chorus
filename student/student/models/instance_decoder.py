@@ -255,6 +255,7 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
         num_heads: int = 8,
         learned_ratio: float = 0.25,
         use_positional_guidance: bool = True,
+        multi_scale_channels: list[int] | None = None,
     ) -> None:
         super().__init__()
         self.in_channels = int(in_channels)
@@ -268,13 +269,29 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
             self.num_queries_per_head = {g: int(num_queries) for g in granularities}
         self.num_queries = max(self.num_queries_per_head.values())
 
-        # --- separate projection streams [SPFormer / Mask2Former insight] ---
+        # --- single-scale scene memory projection (always built for fallback) ---
         self.scene_token_proj = nn.Sequential(
             nn.Linear(in_channels, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+
+        # --- multi-scale per-level projections [Mask3D / M2F3D style] ---
+        if multi_scale_channels is not None and len(multi_scale_channels) > 0:
+            self.scale_projs = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(c, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, hidden_dim),
+                )
+                for c in multi_scale_channels
+            ])
+        else:
+            self.scale_projs = None
+
+        # --- dense point projection for final mask dot-product ---
         self.point_mask_proj = nn.Sequential(
             nn.Linear(in_channels, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -309,35 +326,88 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
 
     # ------------------------------------------------------------------ #
 
+    def _scale_index_for_layer(self, layer_idx: int, num_scales: int) -> int:
+        """Map a trunk layer index to a pyramid scale index (coarse → fine).
+
+        Spreads layers evenly across available scales so that:
+        - The first layer always uses the coarsest scale (index 0).
+        - The last layer always uses the finest scale (index num_scales-1).
+        - Intermediate layers are linearly interpolated between the two.
+
+        When ``num_layers > num_scales``, extra layers repeat the nearest
+        scale.  When ``num_layers < num_scales``, some intermediate scales
+        are skipped.
+        """
+        num_layers = len(self.layers)
+        if num_layers == 1:
+            return num_scales - 1
+        return round(layer_idx * (num_scales - 1) / (num_layers - 1))
+
+    # ------------------------------------------------------------------ #
+
     def _forward_unbatched(
         self,
         point_feat: torch.Tensor,
         scene_tokens: torch.Tensor,
         scene_xyz: torch.Tensor,
+        multi_scale_tokens: list[torch.Tensor] | None = None,
+        multi_scale_xyz: list[torch.Tensor] | None = None,
     ) -> dict:
         """Core forward on unbatched tensors.
 
         Parameters
         ----------
-        point_feat   : [N, C_in] — dense per-point backbone features
-        scene_tokens : [V, C_in] — sparse voxel backbone features
-        scene_xyz    : [V, 3]    — voxel centroids
+        point_feat         : [N, C_in] — dense per-point backbone features
+        scene_tokens       : [V, C_in] — sparse voxel backbone features (finest)
+        scene_xyz          : [V, 3]    — voxel centroids (finest)
+        multi_scale_tokens : optional list of [V_i, C_i] coarse → fine
+        multi_scale_xyz    : optional list of [V_i, 3]   coarse → fine
         """
         assert point_feat.ndim == 2 and point_feat.shape[1] == self.in_channels
         assert scene_tokens.ndim == 2 and scene_tokens.shape[1] == self.in_channels
         assert scene_xyz.ndim == 2 and scene_xyz.shape[1] == 3
 
-        # ── shared projections (computed once, reused across heads) ──
+        use_multi_scale = (
+            self.scale_projs is not None
+            and multi_scale_tokens is not None
+            and len(multi_scale_tokens) > 0
+        )
 
-        scene_mem = self.scene_token_proj(scene_tokens)        # [V, D]
+        # ── scene memory: multi-scale or single-scale ──
 
-        if self.use_positional_guidance:
-            scene_pos = self.pos_proj(self.pos_encoder(scene_xyz))  # [V, D]
+        if use_multi_scale:
+            num_scales = len(multi_scale_tokens)
+            scale_mems = [
+                proj(tokens)
+                for proj, tokens in zip(self.scale_projs, multi_scale_tokens)
+            ]
+            if self.use_positional_guidance:
+                scale_poss = [
+                    self.pos_proj(self.pos_encoder(xyz))
+                    for xyz in multi_scale_xyz
+                ]
+            else:
+                scale_poss = [torch.zeros_like(m) for m in scale_mems]
+
+            scale_mems_b = [m.unsqueeze(0) for m in scale_mems]
+            scale_poss_b = [p.unsqueeze(0) for p in scale_poss]
+
+            init_mem = scale_mems[-1]      # finest for query init
+            init_xyz = multi_scale_xyz[-1]
         else:
-            scene_pos = torch.zeros_like(scene_mem)
+            scene_mem = self.scene_token_proj(scene_tokens)
+            if self.use_positional_guidance:
+                scene_pos = self.pos_proj(self.pos_encoder(scene_xyz))
+            else:
+                scene_pos = torch.zeros_like(scene_mem)
 
-        scene_mem_b = scene_mem.unsqueeze(0)   # [1, V, D]
-        scene_pos_b = scene_pos.unsqueeze(0)   # [1, V, D]
+            scene_mem_b = scene_mem.unsqueeze(0)
+            scene_pos_b = scene_pos.unsqueeze(0)
+
+            init_mem = scene_mem
+            init_xyz = scene_xyz
+
+        # ── dense mask features (always finest resolution) ──
 
         dense_mask_feat = self.point_mask_proj(point_feat)     # [N, D]
         dense_mask_feat = F.normalize(dense_mask_feat, dim=-1)
@@ -349,7 +419,7 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
         # ── per-granularity query decode ──
 
         for g in self.granularities:
-            q_feat, q_xyz = self.initializers[g](scene_mem, scene_xyz)
+            q_feat, q_xyz = self.initializers[g](init_mem, init_xyz)
 
             if self.use_positional_guidance:
                 q_pos = self.pos_proj(self.pos_encoder(q_xyz))
@@ -362,26 +432,29 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
             head = self.heads[g]
 
             for layer_idx, layer in enumerate(self.layers):
-                q_b = layer(q_b, q_pos_b, scene_mem_b, scene_pos_b)
+                if use_multi_scale:
+                    s = self._scale_index_for_layer(layer_idx, num_scales)
+                    q_b = layer(q_b, q_pos_b, scale_mems_b[s], scale_poss_b[s])
+                else:
+                    q_b = layer(q_b, q_pos_b, scene_mem_b, scene_pos_b)
 
                 if layer_idx < num_layers - 1:
-                    # auxiliary prediction from intermediate layer
                     q_aux = q_b.squeeze(0)
                     me_aux = F.normalize(head.mask_embed(q_aux), dim=-1)
-                    scale_aux = head.logit_scale.exp()
+                    logit_s = head.logit_scale.exp()
                     aux_by_layer[layer_idx]["heads"][g] = {
-                        "mask_logits": scale_aux * (me_aux @ dense_mask_feat.T),
+                        "mask_logits": logit_s * (me_aux @ dense_mask_feat.T),
                         "score_logits": head.score_head(q_aux).squeeze(-1),
                     }
 
             # final layer prediction
             refined_q = q_b.squeeze(0)       # [Q, D]
             mask_embed = F.normalize(head.mask_embed(refined_q), dim=-1)
-            scale = head.logit_scale.exp()
+            logit_s = head.logit_scale.exp()
 
             out["heads"][g] = {
-                "mask_logits": scale * (mask_embed @ dense_mask_feat.T),  # [Q, N]
-                "score_logits": head.score_head(refined_q).squeeze(-1),   # [Q]
+                "mask_logits": logit_s * (mask_embed @ dense_mask_feat.T),  # [Q, N]
+                "score_logits": head.score_head(refined_q).squeeze(-1),     # [Q]
                 "query_embed": refined_q,
             }
 
@@ -399,14 +472,18 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
         point_xyz: torch.Tensor | None = None,
         scene_tokens: torch.Tensor | None = None,
         scene_xyz: torch.Tensor | None = None,
+        multi_scale_tokens: list[torch.Tensor] | None = None,
+        multi_scale_xyz: list[torch.Tensor] | None = None,
     ) -> dict:
         """
         Parameters
         ----------
-        point_feat   : [N, C] or [1, N, C] — dense per-point backbone features
-        point_xyz    : [N, 3], optional — reserved for future anchor updates
-        scene_tokens : [V, C] — sparse voxel features from backbone (**required**)
-        scene_xyz    : [V, 3] — voxel centroids (**required**)
+        point_feat         : [N, C] or [1, N, C] — dense per-point backbone features
+        point_xyz          : [N, 3], optional — reserved for future anchor updates
+        scene_tokens       : [V, C] — sparse voxel features from backbone (**required**)
+        scene_xyz          : [V, 3] — voxel centroids (**required**)
+        multi_scale_tokens : optional list of [V_i, C_i] per decoder scale (coarse → fine)
+        multi_scale_xyz    : optional list of [V_i, 3]   per decoder scale (coarse → fine)
 
         Returns
         -------
@@ -418,15 +495,22 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
                 "decoder. Pass them from LitePTBackboneOutput."
             )
 
+        ms_kw = dict(
+            multi_scale_tokens=multi_scale_tokens,
+            multi_scale_xyz=multi_scale_xyz,
+        )
+
         if point_feat.ndim == 2:
-            return self._forward_unbatched(point_feat, scene_tokens, scene_xyz)
+            return self._forward_unbatched(
+                point_feat, scene_tokens, scene_xyz, **ms_kw,
+            )
 
         if point_feat.ndim == 3:
             assert point_feat.shape[0] == 1, (
                 f"Only batch_size=1 supported, got {tuple(point_feat.shape)}"
             )
             out = self._forward_unbatched(
-                point_feat[0], scene_tokens, scene_xyz,
+                point_feat[0], scene_tokens, scene_xyz, **ms_kw,
             )
             batched: dict = {
                 "point_embed": out["point_embed"].unsqueeze(0),

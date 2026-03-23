@@ -80,6 +80,8 @@ class StudentInstanceSegModel(nn.Module):
             point_xyz=bb.point_xyz,
             scene_tokens=bb.scene_tokens,
             scene_xyz=bb.scene_xyz,
+            multi_scale_tokens=bb.multi_scale_tokens or None,
+            multi_scale_xyz=bb.multi_scale_xyz or None,
         )
 
 
@@ -98,6 +100,7 @@ def build_student_model(
     query_init: str = "hybrid",
     use_positional_guidance: bool = True,
     learned_query_ratio: float = 0.25,
+    multi_scale: bool = False,
 ) -> StudentInstanceSegModel:
     """Convenience factory from scalar config values.
 
@@ -118,6 +121,11 @@ def build_student_model(
         any pretrained checkpoint architecture.
     litept_kwargs:
         Optional extra keyword arguments merged into :class:`~litept.model.LitePT`.
+    multi_scale:
+        Enable multi-scale decoder feature capture from LitePT.  Each student
+        Transformer layer cross-attends to a different backbone decoder scale
+        (coarse → fine).  Requires ``litept_variant="litept_s_star"`` for
+        meaningful per-scale features.
     """
     backbone = LitePTBackbone(
         litept_root=litept_root,
@@ -125,6 +133,7 @@ def build_student_model(
         grid_size=grid_size,
         litept_variant=litept_variant,
         litept_kwargs=litept_kwargs,
+        multi_scale=multi_scale,
     )
 
     if query_init == "learned":
@@ -151,5 +160,6 @@ def build_student_model(
         num_heads=num_decoder_heads,
         learned_ratio=effective_ratio,
         use_positional_guidance=use_positional_guidance,
+        multi_scale_channels=backbone.multi_scale_channels,
     )
     return StudentInstanceSegModel(backbone=backbone, decoder=decoder)
