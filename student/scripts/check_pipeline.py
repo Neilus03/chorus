@@ -171,6 +171,7 @@ def main() -> None:
         query_init=model_cfg.get("query_init", "hybrid"),
         use_positional_guidance=model_cfg.get("use_positional_guidance", True),
         learned_query_ratio=model_cfg.get("learned_query_ratio", 0.25),
+        multi_scale=bb_cfg.get("multi_scale", False),
     ).to(device)
     print(f"  built in {time.time() - t0:.2f}s")
 
@@ -202,6 +203,12 @@ def main() -> None:
     print(f"  num_heads        : {len(granularities)}")
     print(f"  decoder layers   : {len(model.decoder.layers)}")
     print(f"  pos guidance     : {model.decoder.use_positional_guidance}")
+    ms_ch = model.backbone.multi_scale_channels
+    if ms_ch:
+        print(f"  multi-scale      : YES — {len(ms_ch)} scales, channels {ms_ch}")
+        print(f"  scale_projs      : {len(model.decoder.scale_projs)} projections")
+    else:
+        print(f"  multi-scale      : NO (single finest-scale memory)")
 
     backbone_lr_scale = train_cfg.get("backbone_lr_scale", 0.1)
     pg = model.parameter_groups(backbone_lr_scale=backbone_lr_scale)
