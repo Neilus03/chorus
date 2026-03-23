@@ -1,54 +1,72 @@
-# Multigranular Query-Based Decoder Upgrade Plan
+# Multi-Granular Query-Based Decoder Upgrade Plan
 
-> **Goal**: Replace the current one-shot prototype-matching decoder with a modern iterative
-> query-refinement Transformer decoder, aligned with Mask3D, SPFormer, MAFT, and QueryFormer.
+> **My goal** is to replace the original one-shot prototype-matching decoder with a modern
+> iterative query-refinement Transformer decoder, aligned with Mask3D, SPFormer, MAFT, and
+> QueryFormer.
 >
-> **Guiding principle**: Each phase produces a fully working pipeline. No phase breaks
-> `run_student.py` or `check_pipeline.py`. The output contract
-> `{"point_embed", "heads": {"gXX": {"mask_logits", "score_logits", "query_embed"}}}` is
-> preserved so the loss, evaluator, and metrics code keep working with minimal changes.
+> **My guiding principle**: each phase should leave a fully working pipeline. I do not want
+> any phase to break `run_student.py` or `check_pipeline.py`. I keep the output contract
+> `{"point_embed", "heads": {"gXX": {"mask_logits", "score_logits", "query_embed"}}}` so my
+> loss, evaluator, and metrics code keep working with minimal changes.
 
 ---
 
-## Current Architecture (what we have)
+## Starting point (what I began with)
+
+This is the **baseline stack before Phases 1–2**: a tensor-only backbone and a one-shot
+decoder, with no structured geometry for the student.
 
 ```
-LitePTBackbone
-  forward(coord, feat) → dense_feat [N, 72]
-    ├─ _voxelize: picks FIRST point per voxel (unstable)
-    └─ returns: single tensor, no geometry, no sparse tokens
+LitePTBackbone (early version)
+  forward(coord, feat) → dense_feat [N, 72]   # single tensor
+    ├─ voxelization picked an arbitrary first point per voxel (unstable)
+    └─ no separate sparse tokens or coordinates for the decoder
 
-MultiHeadQueryInstanceDecoder
+MultiHeadQueryInstanceDecoder (original)
   forward(point_feat [N, 72]) → dict
-    ├─ input_proj + point_head  →  point_embed [N, D]       (shared)
-    ├─ per head:
-    │     query_embed  →  nn.Embedding [Q, D]               (learned only)
-    │     mask_logits  =  cosine_sim(query, point_embed)     (one-shot)
-    │     soft_pool    =  softmax(mask) @ point_embed        (single pooling step)
-    │     score_logits =  score_head(query + pooled)         (no iterative refinement)
-    └─ no self-attention, no cross-attention, no positional guidance
+    ├─ cosine mask logits vs a shared point embedding (one shot)
+    └─ no self-attention, no cross-attention to sparse tokens, no Fourier PE
 
 StudentInstanceSegModel
-  forward(points, features)
-    point_feat = backbone(points, features)   # single tensor
-    return decoder(point_feat)                # decoder sees no geometry
+  point_feat = backbone(points, features)
+  return decoder(point_feat)                  # decoder saw no scene structure
 ```
-
-**What is missing** (vs. Mask3D / SPFormer / MAFT / QueryFormer):
-- No iterative query refinement (multiple decoder layers)
-- No query self-attention (queries can't resolve duplicates)
-- No cross-attention to sparse scene tokens (queries attend to ALL dense points)
-- No explicit 3D positional encoding (decoder is geometry-blind)
-- No scene-aware query initialization (only learned embeddings)
-- No deep supervision (loss only on final output)
-- Backbone discards sparse voxel tokens and coordinates
 
 ---
 
-## Target Architecture (what we are building)
+## Current architecture (where my repo is now)
+
+> After **Phases 1–4** (and my LitePT-S\* wiring in `litept_wrapper`), my student stack uses a
+> **LitePT-S\*** backbone (`LITEPT_S_STAR_KWARGS`), structured `LitePTBackboneOutput`, mean-pooled
+> voxels, an iterative multi-head decoder, and optional auxiliary loss. **I have not implemented
+> Phase 6 yet** — cross-attention still uses a **single** finest-resolution memory.
 
 ```
-LitePTBackbone
+LitePTBackbone  (default: LitePT-S* — deeper LitePT decoder)
+  forward(coord, feat) → LitePTBackboneOutput
+    ├─ mean-pooled voxels → LitePT Point dict
+    └─ scene_tokens [V, 72] = finest decoder output; point_feat = gather to points
+
+MultiHeadQueryInstanceDecoder
+  forward(point_feat, point_xyz, scene_tokens, scene_xyz) → dict + optional aux_outputs
+    ├─ one sparse memory scale for now (finest); each trunk layer reuses the same scene_mem
+    └─ mask logits from projected point features; Hungarian matching + aux loss in training
+
+StudentInstanceSegModel
+  bb = backbone(points, features);  return decoder(bb, ...)
+```
+
+---
+
+## Target architecture (what I am building)
+
+### A — Core target (Phases 1–5) ✅ — **single-scale** scene memory
+
+This is the **mainline design** I implemented in code: one LitePT output resolution for
+cross-attention (finest sparse voxels), dense features for masks only.
+
+```
+LitePTBackbone  (canonical: **LitePT-S\*** — `dec_depths=(2,2,2,2)`, see insseg config)
   forward(coord, feat) → LitePTBackboneOutput
     ├─ point_feat   [N, C]    dense per-point features  (for final mask dot-product)
     ├─ point_xyz    [N, 3]    original coordinates
@@ -58,110 +76,120 @@ LitePTBackbone
 
 MultiHeadQueryInstanceDecoder
   forward(point_feat, point_xyz, scene_tokens, scene_xyz) → dict
-    ├─ scene_token_proj(scene_tokens)  →  scene_mem [V, D]     (sparse memory)
+    ├─ scene_token_proj(scene_tokens)  →  scene_mem [V, D]     (single-scale sparse memory)
     ├─ point_mask_proj(point_feat)     →  mask_feat [N, D]     (dense mask basis)
     ├─ FourierPosEnc(scene_xyz)        →  scene_pos [V, D]     (3D position encoding)
     ├─ per head:
-    │     HybridQueryInit(scene_tokens, scene_xyz) → q [Q, D], q_xyz [Q, 3]
+    │     HybridQueryInit / learned / scene → q [Q, D], q_xyz [Q, 3]
     │     FourierPosEnc(q_xyz) → q_pos [Q, D]
-    │     for layer in shared_trunk (4-6 layers):        ← ITERATIVE REFINEMENT
-    │         q = self_attn(q, q)                        ← query-query interaction
-    │         q = cross_attn(q, scene_mem)               ← query-to-scene reasoning
+    │     for layer in shared_trunk:
+    │         q = self_attn(q, q)
+    │         q = cross_attn(q, scene_mem)    ← one memory tensor (finest scale)
     │         q = FFN(q)
-    │         [optional: predict intermediate masks]      ← deep supervision
+    │         [aux_outputs per layer if enabled]
     │     mask_logits = mask_embed(q) @ mask_feat.T
     │     score_logits = score_head(q)
-    └─ output: same dict contract as before + optional aux_outputs
+    └─ output: dict contract + optional aux_outputs
 
 StudentInstanceSegModel
   forward(points, features)
-    bb = backbone(points, features)          # structured dataclass
-    return decoder(                          # decoder gets full geometry
-      point_feat=bb.point_feat,
-      point_xyz=bb.point_xyz,
-      scene_tokens=bb.scene_tokens,
-      scene_xyz=bb.scene_xyz,
-    )
+    bb = backbone(points, features)
+    return decoder(point_feat=..., point_xyz=..., scene_tokens=..., scene_xyz=...)
 ```
+
+### B — Phase 6 extension: **multi-scale** LitePT decoder features (my next goal)
+
+Same backbone contract as **A**, plus **lists** of intermediate decoder outputs so each
+trunk layer can cross-attend to a **different** resolution (coarse → fine). This **requires
+LitePT-S\*** so each decoder substage includes real `Block` stacks; shallow LitePT-S only has
+unpools (a much weaker pyramid).
+
+```
+LitePTBackboneOutput  (extended)
+    ├─ … (same as A)
+    ├─ multi_scale_tokens: list[[V_i, C_i]]   coarse → fine (e.g. 252, 144, 72, 72 channels)
+    └─ multi_scale_xyz: list[[V_i, 3]]
+
+MultiHeadQueryInstanceDecoder
+    ├─ scale_projs[i](multi_scale_tokens[i]) → scene_mem_i
+    ├─ for layer_idx, layer in enumerate(layers):
+    │       i = schedule(layer_idx)   # e.g. coarse-to-fine
+    │       q = layer(q, q_pos, scene_mem_i, scene_pos_i)
+    └─ mask / score heads unchanged
+```
+
+**Relationship:** **B** generalizes **A**: if I set `multi_scale` off or only pass the finest scale,
+behavior matches my present single-memory path.
 
 ---
 
 ## Paper References
 
-Each upgrade in this plan is grounded in one or more published methods. Short tags used
-throughout (e.g. **[Mask3D]**) map to these entries:
+I ground each upgrade in published methods. Short tags (e.g. **[Mask3D]**) map to these entries:
 
-| Tag | Paper | Key idea adopted | Ref |
-|-----|-------|-----------------|-----|
-| **[Mask3D]** | Schult et al., "Mask3D for 3D Semantic Instance Segmentation", ICRA 2023 | Iterative Transformer decoder that refines instance queries via multi-scale cross-attention to point-cloud features; deep supervision at every decoder layer | arXiv 2210.03105 |
-| **[SPFormer]** | Sun et al., "Superpoint Transformer for 3D Scene Instance Segmentation", AAAI 2023 | Cross-attention over sparse superpoints instead of raw points — makes the decoder both faster and cleaner | arXiv 2211.15766 |
-| **[MAFT]** | Lai et al., "Mask-Attention-Free Transformer for 3D Instance Segmentation", ICCV 2023 | Replaces mask-attention with position queries + Fourier relative position encoding + auxiliary center regression; much faster convergence | arXiv 2309.01692 |
-| **[QueryFormer]** | Lu et al., "Query Refinement Transformer for 3D Instance Segmentation", ICCV 2023 | Query Initialization Module for high-coverage / low-repetition seeds; denoising + contrastive loss to suppress background queries | ICCV 2023 |
-| **[SGIFormer]** | — | Semantic-guided query initialization + geometric-enhanced interleaving Transformer decoder | — |
-| **[OneFormer3D]** | Kolodiazhnyi et al., "OneFormer3D: One Transformer for Unified Point Cloud Segmentation", CVPR 2024 | Unified instance/semantic/panoptic decoder with efficient query selection and matching | arXiv 2311.14405 |
-| **[CompetitorFormer]** | — | Explicit competition-aware design so one dominant query emerges per instance instead of many duplicates fighting | — |
-| **[Relation3D]** | — | Adaptive superpoint aggregation + relation-aware self-attention with positional and geometric relationships between queries | — |
-| **[LaSSM]** | — | Local aggregation + coordinate-guided state-space decoder; replaces heavy global attention with efficient SSM refinement | — |
-| **[DETR]** | Carion et al., "End-to-End Object Detection with Transformers", ECCV 2020 | Set-prediction paradigm: learned queries + Hungarian matching + auxiliary losses at each decoder layer | arXiv 2005.12872 |
-| **[Mask2Former]** | Cheng et al., "Masked-attention Mask Transformer for Universal Image Segmentation", CVPR 2022 | Masked cross-attention, per-pixel embedding for mask rendering separate from memory features | arXiv 2112.01527 |
-| **[M2F3D]** | Nguyen & Vu, "Mask2Former for 3D Instance Segmentation", CVPR 2023 Workshop | Direct 3D validation of the Mask2Former recipe — shows the iterative decoder, separate mask-embed / memory-features streams, and set-prediction loss transfer to point clouds with minimal 3D-specific changes. Key bridge between [Mask2Former] (2D) and the fully 3D-native designs like [Mask3D] | — |
-| **[LitePT]** | Yu et al., "LitePT: Lighter Yet Stronger Point Transformer", 2025 | Hierarchical encoder–decoder with sparse conv + PointROPE attention; U-Net-style `GridPooling` / `GridUnpooling` between stages; **LitePT-S\*** extends **LitePT-S** with a **deeper decoder** (`dec_depths` > 0) for instance segmentation — same encoder width/depth, richer multi-scale fusion in the neck | arXiv 2512.13689 |
+| Tag | Citation | Key idea I borrow | Identifier |
+|-----|----------|-------------------|------------|
+| **[Mask3D]** | Schult et al., *Mask3D for 3D Semantic Instance Segmentation*, ICRA 2023 | Iterative Transformer decoder with multi-scale cross-attention to point features; deep supervision per decoder layer | [arXiv:2210.03105](https://arxiv.org/abs/2210.03105) |
+| **[SPFormer]** | Sun et al., *Superpoint Transformer for 3D Scene Instance Segmentation*, AAAI 2023 | Cross-attention over sparse superpoints instead of raw points | [arXiv:2211.15766](https://arxiv.org/abs/2211.15766) |
+| **[MAFT]** | Lai et al., *Mask-Attention-Free Transformer for 3D Instance Segmentation*, ICCV 2023 | Position queries + Fourier relative PE + auxiliary center regression; fast convergence | [arXiv:2309.01692](https://arxiv.org/abs/2309.01692) |
+| **[QueryFormer]** | Lu et al., *Query Refinement Transformer for 3D Instance Segmentation*, ICCV 2023 | Query initialization, denoising, contrastive loss for background queries | [OpenAccess ICCV 2023](https://openaccess.thecvf.com/content/ICCV2023/html/Lu_Query_Refinement_Transformer_for_3D_Instance_Segmentation_ICCV_2023_paper.html) |
+| **[SGIFormer]** | Yao et al., *SGIFormer: Semantic-guided and Geometric-enhanced Interleaving Transformer for 3D Instance Segmentation*, IEEE TCSVT 2025 (also arXiv preprint) | Semantic-guided mix query init + geometric-enhanced interleaving decoder | [arXiv:2407.11564](https://arxiv.org/abs/2407.11564) |
+| **[OneFormer3D]** | Kolodiazhnyi et al., *OneFormer3D: One Transformer for Unified Point Cloud Segmentation*, CVPR 2024 | Unified instance / semantic / panoptic queries and matching | [arXiv:2311.14405](https://arxiv.org/abs/2311.14405) |
+| **[CompetitorFormer]** | Wang et al., *CompetitorFormer: Competitor Transformer for 3D Instance Segmentation* | Plug-in competition-oriented modules so a dominant query wins per instance | [arXiv:2411.14179](https://arxiv.org/abs/2411.14179) |
+| **[Relation3D]** | Lu et al., *Relation3D: Enhancing Relation Modeling for Point Cloud Instance Segmentation*, CVPR 2025 | Adaptive superpoint aggregation + relation-aware self-attention with geometric relationships between queries | [arXiv:2506.17891](https://arxiv.org/abs/2506.17891) |
+| **[LaSSM]** | Yao et al., *LaSSM: Efficient Semantic-Spatial Query Decoding via Local Aggregation and State Space Models for 3D Instance Segmentation* | Local aggregation + coordinate-guided SSM decoder instead of heavy global attention | [arXiv:2602.11007](https://arxiv.org/abs/2602.11007) |
+| **[DETR]** | Carion et al., *End-to-End Object Detection with Transformers*, ECCV 2020 | Learned queries + Hungarian matching + auxiliary decoder losses | [arXiv:2005.12872](https://arxiv.org/abs/2005.12872) |
+| **[Mask2Former]** | Cheng et al., *Masked-attention Mask Transformer for Universal Image Segmentation*, CVPR 2022 | Masked cross-attention; mask and memory streams | [arXiv:2112.01527](https://arxiv.org/abs/2112.01527) |
+| **[M2F3D]** | Schult et al., *Mask2Former for 3D Instance Segmentation*, CVPR 2022 *Transformers for Vision* workshop (Spotlight) | Mask2Former recipe adapted to 3D; bridge from 2D [Mask2Former] to 3D-native methods like [Mask3D] | [RWTH publication record](https://www.vision.rwth-aachen.de/publication/00225/) (workshop; extended as [Mask3D]) |
+| **[LitePT]** | Yu et al., *LitePT: Lighter Yet Stronger Point Transformer*, 2025 | Sparse conv + PointROPE; U-Net `GridPooling` / `GridUnpooling`; **LitePT-S\*** = deeper decoder for instance seg | [arXiv:2512.13689](https://arxiv.org/abs/2512.13689) |
 
 ---
 
 ## LitePT backbone variant policy (canonical: **LitePT-S\***)
 
-This project should treat **[LitePT-S\***](https://github.com/prs-eth/LitePT/blob/main/configs/scannet/insseg-litept-small-v1m2.py) (ScanNet instance-seg config `insseg-litept-small-v1m2`) as the **default backbone**, not the semantic-seg **LitePT-S** config where the decoder is effectively **unrolled upsampling only**.
+I treat **[LitePT-S\***](https://github.com/prs-eth/LitePT/blob/main/configs/scannet/insseg-litept-small-v1m2.py) (`insseg-litept-small-v1m2`) as my **default** backbone, not the semantic-seg **LitePT-S** config where the decoder is effectively **unrolled upsampling only**.
 
-**Paper**: **[LitePT]** (arXiv:2512.13689) — hierarchical point Transformer, efficient PointROPE + FlashAttention-style varlen attention on serialized patches, U-Net encoder–decoder.
+**Paper**: **[LitePT]** ([arXiv:2512.13689](https://arxiv.org/abs/2512.13689)) — hierarchical point Transformer, PointROPE + varlen attention, U-Net encoder–decoder.
 
 ### LitePT-S vs LitePT-S\* (what actually differs)
 
-Both share the **same encoder** (`enc_depths=(2, 2, 2, 6, 2)`, `enc_channels=(36, 72, 144, 252, 504)`, same strides). Final dense feature width at the finest decoder output remains **`dec_channels[0] = 72`** (`backbone_out_channels=72` in official configs).
+Both share the **same encoder** (`enc_depths=(2, 2, 2, 6, 2)`, `enc_channels=(36, 72, 144, 252, 504)`, same strides). The finest decoder output width stays **`dec_channels[0] = 72`** (`backbone_out_channels=72` in official configs).
 
 | Variant | Typical config | `dec_depths` | Decoder blocks per stage | Role |
 |---------|----------------|--------------|---------------------------|------|
 | **LitePT-S** | `semseg-litept-small-v1m1.py` | `(0, 0, 0, 0)` | **0** — no `Block` stacks in the decoder | Each decoder stage is **only** `GridUnpooling` (+ skip fusion). Fast, fewer params (~12.7M). |
 | **LitePT-S\*** | `insseg-litept-small-v1m2.py` | `(2, 2, 2, 2)` | **2** per stage × 4 stages = **8** decoder `Block`s | Adds **conv + (optional) attention** blocks after each unpool (see `dec_conv`, `dec_attn` in that config). ~16.0M params; stronger multi-scale features before the head. |
 
-So the “star” is **not** a wider encoder — it is a **deeper decoder stack** (and different `dec_conv` / `dec_attn` schedules), matching the paper’s emphasis on a full encoder–decoder hierarchy.
+So the “star” is **not** a wider encoder — it is a **deeper decoder stack** (and different `dec_conv` / `dec_attn` schedules), which matches the **[LitePT]** paper’s emphasis on a full encoder–decoder hierarchy.
 
-### Implications for **every phase** of this plan
+### Implications for my phases
 
-1. **`litept_wrapper.py`** should construct `LitePT(...)` with kwargs that match **LitePT-S\*** (or load them from YAML), not rely on constructor defaults (defaults in `litept/model.py` match **LitePT-S** with `dec_depths=(0,0,0,0)`).
-2. **Pretrained weights**: A checkpoint trained with **LitePT-S** is **not** shape-compatible with **LitePT-S\*** (different `dec_depths` → different parameters). Use the Hugging Face / official **instance-seg** weights for S\* when freezing or fine-tuning the backbone.
-3. **`out_channels` / student heads**: Still **72** at the finest output for both S and S\* — no change to mask head input dim from switching S → S\*.
-4. **Phase 6 (multi-scale taps)**: Meaningful per-scale **decoder** features basically require **S\***. With **LitePT-S**, you can still tap each `GridUnpooling` output, but there is **no** extra Transformer/conv refinement at each scale — multi-scale is much weaker.
+1. In **`litept_wrapper.py`** I construct `LitePT(...)` with kwargs that match **LitePT-S\*** (or load them from YAML). I do not rely on raw constructor defaults: defaults in `litept/model.py` are **LitePT-S** (`dec_depths=(0,0,0,0)`).
+2. **Pretrained weights**: a checkpoint trained with **LitePT-S** is **not** shape-compatible with **LitePT-S\***. I use Hugging Face / official **instance-seg** weights for S\* when I freeze or fine-tune the backbone.
+3. **`out_channels` / my student heads**: still **72** at the finest output for both S and S\* — switching S → S\* does not change mask-head input width.
+4. **Phase 6 (multi-scale taps)**: meaningful per-scale **decoder** features basically require **S\***. With **LitePT-S** I could still tap each `GridUnpooling` output, but there is **no** extra Transformer/conv refinement at each scale — the pyramid would be much weaker.
 
 ---
 
 ## Phase 1: Backbone Refactor ✅
 
-> **Files**: `litept_wrapper.py`, `student_model.py`
-> **Papers**: SPFormer (sparse scene representation), Mask3D (multi-scale backbone output), **[LitePT]** (backbone architecture)
-> **Risk**: Low — backbone changes are isolated behind a clean API boundary
-> **Outcome**: Backbone now exposes sparse tokens + geometry. Pipeline still works.
+> **Files**: `litept_wrapper.py`, `student_model.py`  
+> **Papers**: SPFormer (sparse scene representation), Mask3D (multi-scale backbone output), **[LitePT]** (backbone architecture)  
+> **Risk** (was): low — backbone changes stayed behind a small API boundary  
+> **Outcome**: my backbone exposes sparse tokens + geometry; the pipeline still runs end-to-end.
 
-### Step 1.0 — Align `LitePT` constructor with **LitePT-S\*** (recommended follow-up) ⚠️
+### Step 1.0 — Align `LitePT` constructor with **LitePT-S\*** ✅
 
 **File**: `litept_wrapper.py`
 
-The standalone class lives at `litept/model.py` on `PYTHONPATH` (same implementation as `models/litept/litept.py` in the full LitePT repo). **Defaults** in `LitePT.__init__` correspond to **LitePT-S** (`dec_depths=(0, 0, 0, 0)`).
+**Implemented**: `LITEPT_S_STAR_KWARGS` mirrors `insseg-litept-small-v1m2.py`; default
+`litept_variant="litept_s_star"`. Use `litept_variant="litept_s"` or `litept_kwargs` overrides
+for shallow-decoder / legacy checkpoints. **Defaults** in raw `LitePT.__init__` (without the
+wrapper) still correspond to **LitePT-S** — always construct via `LitePTBackbone` or pass the
+same kwargs explicitly.
 
-**Action**: Add optional YAML/config-driven kwargs (or a preset string `litept_variant: litept_s_star`) so the wrapper builds:
-
-```python
-# Mirror configs/scannet/insseg-litept-small-v1m2.py backbone dict (abbreviated)
-LitePT(
-    in_channels=...,  # must match dataset features (3 vs 6 in official configs)
-    dec_depths=(2, 2, 2, 2),
-    dec_conv=(True, True, True, False),
-    dec_attn=(False, False, False, True),
-    # ... keep all other keys identical to that config for weight compatibility
-)
-```
-
-Until this is done, document which checkpoint the student run assumes (**S** vs **S\***). Phases 2–5 remain valid either way (same 72-D features); Phase 6 should assume **S\*** for the full multi-scale story.
+Phases 2–5 use the same 72-D finest features whether **S** or **S\***; Phase 6 assumes **S\***
+for meaningful per-scale decoder taps.
 
 ### Step 1.1 — Define `LitePTBackboneOutput` dataclass ✅
 
@@ -179,7 +207,7 @@ Add a `@dataclass` that defines the backbone's output contract:
 
 **Why**: Every modern decoder needs both sparse scene tokens (for efficient cross-attention)
 and dense point features (for mask rendering). SPFormer uses superpoints; Mask3D uses
-multi-scale sparse features. Our sparse tokens are the voxel-level features from LitePT.
+multi-scale sparse features. My sparse tokens are the voxel-level features from LitePT.
 
 ### Step 1.2 — Upgrade `_voxelize` to mean-pool ✅
 
@@ -260,11 +288,10 @@ numerical values from mean-pooling vs first-point voxelization.
 
 ## Phase 2: Decoder Rewrite — Core Components ✅
 
-> **Files**: `instance_decoder.py`
-> **Papers**: Mask3D (iterative decoder), MAFT (positional guidance), QueryFormer (query init),
-> SPFormer (sparse cross-attention)
-> **Risk**: Medium — this is the largest code change, but the output contract is preserved
-> **Outcome**: Decoder now iteratively refines queries via Transformer layers with 3D awareness.
+> **Files**: `instance_decoder.py`  
+> **Papers**: Mask3D (iterative decoder), MAFT (positional guidance), QueryFormer (query init), SPFormer (sparse cross-attention)  
+> **Risk** (was): medium — largest code change, but I preserved the output contract  
+> **Outcome**: my decoder iteratively refines queries with Transformer layers and 3D awareness.
 
 ### Step 2.1 — Implement `FourierPosEnc` ✅
 
@@ -322,8 +349,8 @@ Cross-Attn:  Q×V attention matrix (queries attend to scene) → updated q [Q, D
 FFN:         Q independent position-wise transforms → updated q [Q, D]
 ```
 
-**Why this is the single biggest upgrade**: The current decoder does ONE pass: query → similarity
-→ pool → score. A 4-layer trunk gives queries 4 rounds of self-correction and scene-reading.
+**Why this was the single biggest upgrade**: before Phase 2, my decoder did **one** pass:
+query → similarity → pool → score. A 4-layer trunk gives queries four rounds of self-correction and scene-reading.
 This is the core mechanism in Mask3D, SPFormer, MAFT, QueryFormer, SGIFormer, Relation3D, and
 OneFormer3D.
 
@@ -349,7 +376,7 @@ Returns `(q_feat [Q, D], q_xyz [Q, 3])`.
 - SGIFormer uses semantic-guided initialization.
 - LaSSM uses semantic-spatial initialization from superpoints.
 
-Our hybrid approach balances scene grounding (sampled) with learning flexibility (free).
+My hybrid setup balances scene grounding (sampled) with learning flexibility (free).
 
 **Edge case**: If the scene has fewer voxels than `num_scene`, sample with replacement.
 
@@ -359,9 +386,9 @@ Our hybrid approach balances scene grounding (sampled) with learning flexibility
 **Primary sources**: **[Mask3D]** / **[Mask2Former]** / **[M2F3D]** (mask-embed + class/score head
 pattern validated in 3D), **[OneFormer3D]** (unified lightweight heads)
 
-The current `GranularityHead` contains the query bank, the query MLP, and the score head.
-In the new design, query initialization and refinement live in the shared trunk. Each head
-becomes a thin projection:
+The old `GranularityHead` had held the query bank, the query MLP, and the score head.
+In my new design, query initialization and refinement live in the shared trunk. Each head
+became a thin projection:
 
 | Component    | Architecture                         | Output       |
 |--------------|--------------------------------------|--------------|
@@ -416,8 +443,8 @@ This separation is critical. SPFormer's core insight is that queries should cros
 sparse representation, not to all raw points. By keeping point_mask_proj separate, we avoid
 the O(Q×N) cost during iterative refinement and only pay it once at the end.
 
-**Output contract**: Identical to the current decoder. The loss, evaluator, metrics, trainer,
-and vis code need zero changes (except for the optional `aux_outputs` addition in Phase 3).
+**Output contract**: I kept it identical to the old decoder so loss, evaluator, metrics, trainer,
+and vis needed no changes (except optional `aux_outputs` in Phase 3).
 
 ### Step 2.6 — Verify Phase 2 ✅
 
@@ -436,10 +463,9 @@ This is normal. The new decoder has much more capacity and needs training to con
 
 ## Phase 3: Config, Builder, and Training Integration ✅
 
-> **Files**: `student_model.py`, `run_student.py`, `overfit_one_scene.yaml`, `trainer.py`,
-> `check_pipeline.py`
-> **Risk**: Low — mechanical config plumbing
-> **Outcome**: New decoder parameters are fully configurable. Training loop is updated.
+> **Files**: `student_model.py`, `run_student.py`, `overfit_one_scene.yaml`, `trainer.py`, `check_pipeline.py`  
+> **Risk** (was): low — mostly plumbing  
+> **Outcome**: decoder hyperparameters are configurable; my training loop and scripts read them.
 
 ### Step 3.1 — Update `build_student_model` factory ✅
 
@@ -482,8 +508,8 @@ model:
 **LitePT-S\*** alignment: When loading **instance-segmentation** pretrained weights or implementing
 Phase 6, the backbone block must use the same `dec_depths`, `dec_conv`, and `dec_attn` as
 `insseg-litept-small-v1m2.py` (see **LitePT backbone variant policy** above). `in_channels` must
-match the student dataset (official ScanNet configs use `6` with color+normal; Chorus may use `3`
-RGB-only — then train from scratch or adapt first layers).
+match my dataset (official ScanNet configs use `6` with color+normal; I may use `3`
+RGB-only — then I train from scratch or adapt the first layers).
 
 Increase `max_steps` from 5000 to at least 8000 — the Transformer decoder has more parameters
 and needs more iterations to converge, especially with hybrid query init introducing randomness.
@@ -544,10 +570,10 @@ loop completes, losses decrease, wandb logging works with all new metrics.
 
 ## Phase 4: Auxiliary Deep Supervision ✅
 
-> **Files**: `instance_decoder.py`, `mask_set_loss.py`
-> **Papers**: Mask3D, DETR (auxiliary losses at each decoder layer)
-> **Risk**: Low — additive change, existing loss contract unchanged
-> **Outcome**: Loss is computed at every decoder layer, stabilizing Transformer training.
+> **Files**: `instance_decoder.py`, `mask_set_loss.py`  
+> **Papers**: Mask3D, DETR (auxiliary losses at decoder layers)  
+> **Risk** (was): low — additive; I kept the same loss contract  
+> **Outcome**: I supervise intermediate decoder layers, which stabilizes training.
 
 ### Step 4.1 — Return intermediate predictions from decoder ✅
 
@@ -608,9 +634,8 @@ Run training for 200 steps. Verify:
 
 ## Phase 5: Validation and Comparison (ready to run)
 
-> **Outcome**: Quantitative evidence that the new decoder improves over the baseline.
->
-> All config knobs and infrastructure are in place. These steps require GPU runs.
+> **My goal here**: quantitative evidence that my new decoder improves over the baseline I saved.  
+> Config and scripts are ready; these steps need GPU time.
 
 ### Step 5.1 — Run full baseline (old decoder) if not already saved
 
@@ -652,21 +677,21 @@ python scripts/run_student.py --config configs/overfit_one_scene.yaml \
 
 ---
 
-## Phase 6: Multi-Scale Backbone Features (Mask3D / Mask2Former3D style)
+## Phase 6: Multi-Scale Backbone Features (Mask3D / Mask2Former3D style) ✅
 
-> **Files**: `litept/model.py` (import path in Chorus; same class as `models/litept/litept.py`
-> in the upstream repo), `litept_wrapper.py`, `instance_decoder.py`, `student_model.py`,
-> `configs/overfit_one_scene.yaml`
-> **Papers**: Mask3D (multi-scale cross-attention), Mask2Former / M2F3D (per-layer scale
-> assignment), SPFormer (sparse multi-scale features), **[LitePT]** (U-Net hierarchy + decoder blocks)
-> **Risk**: Medium — requires extracting intermediate `Point` states from LitePT’s decoder and
-> reworking cross-attention, but the output contract is preserved
-> **Outcome**: Student decoder layers cross-attend to different LitePT decoder scales
-> (coarse → fine), similar in spirit to Mask2Former3D diagrams — **assuming LitePT-S\***.
+> **Files**: `litept/model.py` (what I import in Chorus; same class as `models/litept/litept.py`
+> upstream), `litept_wrapper.py`, `instance_decoder.py`, `student_model.py`, `configs/overfit_one_scene.yaml`  
+> **Papers**: Mask3D (multi-scale cross-attention), Mask2Former / M2F3D (per-layer scale assignment), SPFormer, **[LitePT]** (U-Net + decoder blocks)  
+> **Risk** (expected): medium — I must extract intermediate `Point` states from LitePT’s decoder and rewire cross-attention; I will keep the same prediction contract  
+> **Outcome I want**: each of my student trunk layers cross-attends to a different LitePT decoder scale (coarse → fine), in the spirit of Mask2Former3D — on **LitePT-S\***.
 
 ### Prerequisite: use **LitePT-S\***, not bare **LitePT-S**
 
-Phase 6 assumes the backbone is configured like **`insseg-litept-small-v1m2.py`** (**LitePT-S\***):
+My `LitePTBackbone` already defaults to **LitePT-S\*** (`LITEPT_S_STAR_KWARGS` in
+`litept_wrapper.py`, overridable via `litept_variant` / YAML). Phase 6 **adds** multi-scale
+taps on top of that backbone.
+
+Phase 6 assumes the running model matches **`insseg-litept-small-v1m2.py`** (**LitePT-S\***):
 `dec_depths=(2, 2, 2, 2)` with non-trivial `dec_conv` / `dec_attn`. Each of the four decoder
 substages runs **`GridUnpooling` + `dec_depths[s]` × `Block`** (subsampled conv and/or
 PointROPE attention), so **hooks after each substage see features that were actually refined
@@ -679,13 +704,13 @@ before investing in Phase 6.
 
 ### Why multi-scale matters
 
-Currently, all student decoder layers cross-attend to **one** set of sparse voxel tokens
+**Right now**, all my student trunk layers cross-attend to **one** set of sparse voxel tokens
 (the final LitePT output at the finest resolution). Every refinement layer sees the same
 memory.
 
 In Mask3D / Mask2Former3D, different layers attend to **different pyramid levels**: coarse
 levels for object discovery, fine levels for mask boundaries. LitePT’s **encoder–decoder**
-already forms such a pyramid; we expose it to the student.
+already forms such a pyramid; Phase 6 is about **exposing** it to my student decoder.
 
 ### Background: LitePT forward (from `LitePT.forward`)
 
@@ -717,9 +742,9 @@ Each `dec{s}` is a `PointSequential` containing:
 
 **Indexing vs resolution**: `self.dec[0]` runs **`dec3`** (first in the chain — **coarsest**
 decoder features, fewest tokens after that stage’s unpool relative to the final grid).
-`self.dec[3]` runs **`dec0`** (**finest** — matches today’s single-scale `out.feat` used for
-`scene_tokens`). Do **not** confuse the integer `s` in `dec{s}` with the index into
-`nn.Sequential`; use the mapping table below.
+`self.dec[3]` runs **`dec0`** (**finest** — matches my current single-scale `out.feat` used for
+`scene_tokens`). I must not confuse the integer `s` in `dec{s}` with the index into
+`nn.Sequential`; I use the mapping table below.
 
 | `self.dec` index (forward order) | Module name | Relative resolution | `dec_channels[s]` (width after unpool) | LitePT-S\* blocks |
 |----------------------------------|-------------|---------------------|----------------------------------------|---------------------|
@@ -790,7 +815,7 @@ Per-scale channel widths for **LitePT-S\*** follow `dec_channels` at each unpool
 72, 72** (coarse → fine). Student `scale_projs` must list these **in the same order** as
 `multi_scale_tokens`.
 
-### Step 6.4 — Per-scale projections in the student decoder
+### Step 6.4 — Per-scale projections in my decoder
 
 **File**: `instance_decoder.py`
 
@@ -825,7 +850,7 @@ def _scale_index_for_layer(self, layer_idx: int, num_scales: int) -> int:
 ### Step 6.6 — Wire `_forward_unbatched` to per-scale memory
 
 Same pattern as before: build `scale_mems[s]`, `scale_poss[s]` from captured lists; inside
-the student trunk loop, index `s = _scale_index_for_layer(layer_idx, ...)`. `QueryDecoderLayer`
+my trunk loop, index `s = _scale_index_for_layer(layer_idx, ...)`. `QueryDecoderLayer`
 unchanged.
 
 ### Step 6.7 — `StudentInstanceSegModel` forward
@@ -839,8 +864,7 @@ Pass `multi_scale_tokens` and `multi_scale_xyz` from `LitePTBackboneOutput` into
 ```yaml
 model:
   backbone:
-    # First align with LitePT-S* (Phase 1 Step 1.0)
-    litept_variant: litept_s_star   # or explicit dec_depths: [2,2,2,2]
+    litept_variant: litept_s_star   # default in code; required for meaningful decoder taps
     multi_scale: true
     multi_scale_tap: decoder_submodules  # decoder-only; optional: encoder later
     multi_scale_indices: [0, 1, 2, 3]    # all dec{i}; or [0,2,3] for 3 levels
@@ -863,7 +887,7 @@ model:
 
 ## Phase 7: Future Improvements (do NOT implement yet)
 
-> These are second-wave upgrades. Build them only after Phase 6 shows the base decoder works.
+> These are second-wave ideas. I will add them only after Phase 6 shows the multi-scale backbone is worth the complexity.
 
 ### 7.1 — Duplicate query penalty (CompetitorFormer)
 
@@ -926,7 +950,8 @@ attention, adapted for 3D).
 | `student/losses/mask_set_loss.py` | 4 | Auxiliary deep supervision |
 | `configs/overfit_one_scene.yaml` | 3, 4, 6 | New decoder + loss config params (P3/P4); multi_scale backbone config (P6) |
 | `scripts/run_student.py` | 3 | Pass new config keys to builder |
-| `scripts/check_pipeline.py` | 3 | Update for new API |
+| `scripts/check_pipeline.py` | 3 | Update for new API; YAML-aligned model build |
+| `student/config_utils.py` | — | Shared `load_config`, `parse_granularities`, `resolve_num_queries` |
 | `student/engine/trainer.py` | 3 | Parameter groups, separate LRs |
 
 **Files that require NO changes** (output contract preserved):
@@ -958,32 +983,30 @@ attention, adapted for 3D).
 
 ### Why sparse scene tokens instead of all dense points for cross-attention?
 
-A scene with N=100k points and Q=200 queries would create a Q×N = 20M attention matrix **per
-layer, per head**. With 4 layers and 8 heads, that is 640M attention weights — infeasible.
+With N=100k points and Q=200 queries, a full Q×N attention map is **per layer, per head**
+on the order of tens of millions of entries — infeasible at my scene sizes.
 
-Using V~5k sparse voxel tokens (at grid_size=0.02), the attention matrix is Q×V = 1M per
-layer per head, a 20× reduction. SPFormer's superpoint cross-attention and Mask3D's multi-scale
-sparse features both demonstrate this approach works without mask quality loss.
+With V~5k sparse voxel tokens (e.g. `grid_size=0.02`), I pay Q×V per layer per head — a large
+but manageable reduction. **[SPFormer]** and **[Mask3D]** both show sparse memory works without
+sacrificing mask quality.
 
 ### Why hybrid query initialization instead of pure learned or pure scene-sampled?
 
-- **Pure learned** (current): Queries have no spatial grounding. They must learn, from scratch,
-  where objects tend to appear. QueryFormer shows this leads to low coverage and duplicates.
-- **Pure scene-sampled**: All queries are tied to existing geometry. No capacity to hallucinate
-  objects that span multiple voxels or to act as "background absorbers."
-- **Hybrid** (75/25): Scene-sampled queries guarantee coverage; learned queries provide
-  flexibility. This is the approach used by BFL and similar to SGIFormer's design.
+- **Pure learned**: queries start with no spatial grounding; **[QueryFormer]** shows that can
+  mean low coverage and duplicate queries.
+- **Pure scene-sampled**: every query is tied to geometry; I lose flexible slots for
+  large objects or background behavior.
+- **Hybrid** (75/25 in my default): I sample most queries from voxels and keep a slice of
+  fully learned slots — similar in spirit to **[SGIFormer]**-style priors.
 
-### Why shared trunk instead of per-head decoders?
+### Why a shared trunk instead of per-head decoders?
 
-Three separate 4-layer Transformers would triple the decoder parameters with no benefit.
-The three granularities differ at the output level (what size objects to segment), not at
-the reasoning level (how to understand scene geometry). A shared trunk learns one strong
-representation; heads just project it into granularity-specific predictions.
+Three separate 4-layer Transformers would triple parameters with little gain: my three
+granularities differ at the **output** (what object scale to segment), not in **how** I read
+geometry. One trunk plus thin heads matches **[Mask3D]**-style parameter sharing.
 
 ### Why Fourier positional encoding instead of learned positional encoding?
 
-Fourier features generalize to arbitrary coordinate ranges without needing to discretize or
-bin space. Learned positional encodings (e.g., lookup tables) require knowing the spatial
-extent at init time and don't extrapolate. MAFT uses relative position encoding;
-our Fourier approach is simpler and achieves the same goal of injecting geometric awareness.
+Fourier features handle arbitrary coordinate ranges without binning. Learned tables need a
+fixed spatial extent and extrapolate poorly. **[MAFT]** motivates position-aware attention;
+Fourier PE is my simpler way to inject 3D structure.
