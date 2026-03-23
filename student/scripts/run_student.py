@@ -6,6 +6,7 @@ Usage
     python scripts/run_student.py --config configs/overfit_one_scene.yaml
     python scripts/run_student.py --config configs/overfit_one_scene.yaml --max-steps 50
     python scripts/run_student.py --config configs/overfit_one_scene.yaml --no-wandb
+    python scripts/run_student.py --config configs/overfit_one_scene.yaml --print-model
 """
 
 from __future__ import annotations
@@ -90,6 +91,11 @@ def main() -> None:
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--wandb-project", type=str, default="chorus-student")
     parser.add_argument("--wandb-name", type=str, default=None)
+    parser.add_argument(
+        "--print-model",
+        action="store_true",
+        help="Log the full module tree (str(model)) after build; use for architecture inspection.",
+    )
     parser.add_argument(
         "overrides", nargs="*",
         help="dotted key=value config overrides, e.g. train.lr=3e-4",
@@ -178,6 +184,10 @@ def main() -> None:
     )
     total_params = sum(p.numel() for p in model.parameters())
     log.info("Model: %s params (%d heads)", f"{total_params:,}", len(granularities))
+    if args.print_model:
+        log.info("Full model architecture:")
+        for line in str(model).splitlines():
+            log.info("%s", line)
 
     # ── 6. criterion ──
     base_criterion = MaskSetCriterion(
