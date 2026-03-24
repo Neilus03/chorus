@@ -135,6 +135,28 @@ def _validate_scene_arrays(
         )
 
 
+def _load_seen_points_with_legacy_fallback(
+    pack_dir: Path,
+    valid_points: np.ndarray,
+) -> np.ndarray:
+    """Load seen-points mask with legacy litept fallback.
+
+    Some older ``litept_pack`` exports do not include ``seen_points.npy``.
+    For backward compatibility we fall back to ``valid_points`` so existing
+    training code can proceed.
+    """
+    seen_points_path = pack_dir / "seen_points.npy"
+    if seen_points_path.exists():
+        return np.load(seen_points_path).astype(bool)
+
+    log.warning(
+        "[%s] missing seen_points.npy; falling back to valid_points.npy "
+        "(legacy litept_pack compatibility)",
+        pack_dir,
+    )
+    return valid_points.copy()
+
+
 # ── main dataclass ───────────────────────────────────────────────────────
 
 
@@ -232,7 +254,7 @@ def load_training_pack_scene(
 
     # ── masks ──
     valid_points = np.load(pack_dir / "valid_points.npy").astype(bool)
-    seen_points = np.load(pack_dir / "seen_points.npy").astype(bool)
+    seen_points = _load_seen_points_with_legacy_fallback(pack_dir, valid_points)
     supervision_mask = np.load(pack_dir / "supervision_mask.npy").astype(bool)
 
     _validate_scene_arrays(
@@ -314,7 +336,7 @@ def load_training_pack_scene_multi(
         colors = np.load(colors_path)
 
     valid_points = np.load(pack_dir / "valid_points.npy").astype(bool)
-    seen_points = np.load(pack_dir / "seen_points.npy").astype(bool)
+    seen_points = _load_seen_points_with_legacy_fallback(pack_dir, valid_points)
     supervision_mask = np.load(pack_dir / "supervision_mask.npy").astype(bool)
 
     labels_by_gran: dict[str, np.ndarray] = {}
