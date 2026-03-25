@@ -17,6 +17,8 @@ export http_proxy=http://proxy.ethz.ch:3128
 export https_proxy=http://proxy.ethz.ch:3128
 export HTTP_PROXY=http://proxy.ethz.ch:3128
 export HTTPS_PROXY=http://proxy.ethz.ch:3128
+export no_proxy=localhost,127.0.0.1
+export NO_PROXY=localhost,127.0.0.1
 
 # 2. Activate your Python environment from the WORK drive
 source /cluster/work/igp_psr/nedela/litept-env/bin/activate
@@ -33,6 +35,9 @@ export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export VECLIB_MAXIMUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
+# wandb service port-file times out on network filesystems; use local scratch
+export WANDB__SERVICE_WAIT=120
+export WANDB_DIR=${TMPDIR:-/tmp}
 
 echo "STEP 1: Starting Python on the Compute Node..."
 
