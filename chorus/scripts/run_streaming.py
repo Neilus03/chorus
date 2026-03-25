@@ -7,21 +7,30 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+print("DEBUG: Starting imports in run_streaming.py...")
 import argparse
 import json
 import os
 from datetime import datetime
 
+print("DEBUG: Importing save_json...")
 from chorus.core.quality.diagnostics import save_json
+print("DEBUG: Importing UnSAMv2Teacher...")
 from chorus.core.teacher.unsamv2 import UnSAMv2Teacher
+print("DEBUG: Importing ScanNet Eval Benchmarks...")
 from chorus.datasets.scannet.benchmark import (
     DEFAULT_SCANNET_EVAL_BENCHMARKS,
     parse_scannet_eval_benchmarks,
 )
+print("DEBUG: Importing ScanNetEvaluationHooks...")
 from chorus.datasets.scannet.evaluation import ScanNetEvaluationHooks
+print("DEBUG: Importing read_scene_ids and run_streaming_scannet...")
 from chorus.orchestrators.streaming import read_scene_ids, run_streaming_scannet
+print("DEBUG: Importing LocalTableReporter...")
 from chorus.tracking.local_report import LocalTableReporter
+print("DEBUG: Importing WandbReporter...")
 from chorus.tracking.wandb import WandbReporter
+print("DEBUG: All imports completed successfully.")
 
 
 class CombinedReporter:
