@@ -13,6 +13,8 @@ def _resolve_downloader_path() -> Path:
         f"/scratch2/{user}/chorus/tools/download-scannet.py",
         f"/scratch2/{user}/chorus_poc/tools/download-scannet.py",
         "/scratch2/nedela/chorus_poc/tools/download-scannet.py",
+        f"/cluster/work/igp_psr/{user}/chorus_poc/tools/download-scannet.py",
+        f"/cluster/work/igp_psr/{user}/chorus/tools/download-scannet.py",
     ]
 
     for candidate in candidates:
