@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import time
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,7 @@ import torch
 import torch.nn as nn
 from torch.nn.utils import clip_grad_norm_
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from student.data.multi_scene_dataset import MultiSceneDataset
 from student.data.target_builder import build_instance_targets_multi
@@ -94,6 +95,10 @@ class MultiSceneTrainer:
         grad_clip_norm: float = 1.0,
         max_epochs: int = 50,
         eval_every_epochs: int = 5,
+        train_eval_every_epochs: int | None = None,
+        train_eval_num_scenes: int = 3,
+        train_eval_scene_ids: list[str] | None = None,
+        train_eval_selection: str = "first",
         save_every_epochs: int = 10,
         output_dir: Path | str,
         score_threshold: float = 0.3,
@@ -110,6 +115,10 @@ class MultiSceneTrainer:
         self.grad_clip_norm = grad_clip_norm
         self.max_epochs = max_epochs
         self.eval_every_epochs = eval_every_epochs
+        self.train_eval_every_epochs = train_eval_every_epochs
+        self.train_eval_num_scenes = train_eval_num_scenes
+        self.train_eval_scene_ids = train_eval_scene_ids
+        self.train_eval_selection = train_eval_selection
         self.save_every_epochs = save_every_epochs
         self.output_dir = Path(output_dir)
         self.score_threshold = score_threshold
@@ -167,6 +176,41 @@ class MultiSceneTrainer:
         self.best_val_metrics: dict[str, Any] = {}
 
     # ------------------------------------------------------------------ #
+
+    def _make_train_eval_subset(self, epoch: int) -> Subset:
+        """Create a small training-scene subset for metric evaluation."""
+        n_total = len(self.train_dataset)
+        if n_total == 0:
+            raise ValueError("train_dataset is empty")
+
+        scene_ids = self.train_dataset.scene_ids
+        id_to_idx = {sid: i for i, sid in enumerate(scene_ids)}
+
+        if self.train_eval_scene_ids:
+            chosen_ids = [sid for sid in self.train_eval_scene_ids if sid in id_to_idx]
+            if not chosen_ids:
+                raise ValueError(
+                    "train_eval_scene_ids did not match any training scene ids: "
+                    f"{self.train_eval_scene_ids}"
+                )
+            indices = [id_to_idx[sid] for sid in chosen_ids]
+        else:
+            k = min(max(self.train_eval_num_scenes, 0), n_total)
+            if k == 0:
+                raise ValueError("train_eval_num_scenes must be >= 1")
+
+            if self.train_eval_selection == "random":
+                rng = random.Random(epoch * 9973 + 1337)
+                indices = rng.sample(list(range(n_total)), k=k)
+            elif self.train_eval_selection == "first":
+                indices = list(range(k))
+            else:
+                raise ValueError(
+                    f"Unknown train_eval_selection={self.train_eval_selection!r} "
+                    "(expected 'first' or 'random')"
+                )
+
+        return Subset(self.train_dataset, indices)
 
     def _clear_backbone_cache(self) -> None:
         """Invalidate LitePT voxelization cache before processing a new scene."""
@@ -372,6 +416,76 @@ class MultiSceneTrainer:
 
     # ------------------------------------------------------------------ #
 
+    def _train_eval(self, epoch: int) -> dict[str, Any]:
+        """Evaluate metrics on a subset of training scenes."""
+        log.info("Train-eval at epoch %d ...", epoch)
+
+        train_subset = self._make_train_eval_subset(epoch)
+        train_result = evaluate_multi_scene(
+            model=self.model,
+            dataset=train_subset,  # type: ignore[arg-type]
+            criterion=self.criterion,
+            device=self.device,
+            granularities=self.granularities,
+            score_threshold=self.score_threshold,
+            mask_threshold=self.mask_threshold,
+            min_points=self.min_points_per_proposal,
+            eval_benchmark=self.eval_benchmark,
+            min_instance_points=self.min_instance_points,
+        )
+
+        self.model.train()
+
+        agg = train_result["aggregate"]
+        log.info(
+            "  [train-eval epoch %d] loss=%.4f  "
+            "pseudo(AP25=%.3f, AP50=%.3f, NMI=%.4f, ARI=%.4f)  "
+            "real(AP25=%.3f, AP50=%.3f)  mIoU=%.3f",
+            epoch,
+            agg["loss_mean"],
+            agg["pseudo_AP25_mean"],
+            agg["pseudo_AP50_mean"],
+            agg["pseudo_NMI_mean"],
+            agg["pseudo_ARI_mean"],
+            agg["real_AP25_mean"],
+            agg["real_AP50_mean"],
+            agg["matched_mean_iou_mean"],
+        )
+
+        self._log_row({
+            "epoch": epoch,
+            "train_eval": True,
+            **{f"train_eval_{k}": v for k, v in agg.items() if isinstance(v, (int, float))},
+        })
+
+        if _wandb_active():
+            wb: dict[str, Any] = {
+                "epoch": epoch,
+                "global_step": self.global_step,
+            }
+            for k, v in agg.items():
+                if isinstance(v, (int, float)):
+                    wb[f"train_eval/{k}"] = v
+
+            for scene_id, scene_data in train_result["per_scene"].items():
+                eval_data = scene_data.get("eval", {})
+                for g in self.granularities:
+                    g_eval = eval_data.get(g, {})
+                    pseudo = g_eval.get("pseudo_gt", {})
+                    if isinstance(pseudo, dict) and "AP25" in pseudo:
+                        wb[f"train_eval_scene/{scene_id}/pseudo_AP25_{g}"] = pseudo["AP25"]
+                        wb[f"train_eval_scene/{scene_id}/pseudo_AP50_{g}"] = pseudo["AP50"]
+                        wb[f"train_eval_scene/{scene_id}/pseudo_NMI_{g}"] = pseudo.get("NMI", 0)
+                        wb[f"train_eval_scene/{scene_id}/pseudo_ARI_{g}"] = pseudo.get("ARI", 0)
+                    real = g_eval.get("real_gt", {})
+                    if isinstance(real, dict) and "AP25" in real:
+                        wb[f"train_eval_scene/{scene_id}/real_AP25_{g}"] = real["AP25"]
+                        wb[f"train_eval_scene/{scene_id}/real_AP50_{g}"] = real["AP50"]
+
+            wandb.log(wb)
+
+        return train_result
+
     def train(self) -> dict[str, Any]:
         """Run the full training loop.  Returns final metrics dict."""
         log.info(
@@ -411,6 +525,12 @@ class MultiSceneTrainer:
                         "  New best val pseudo AP50: %.4f at epoch %d",
                         ap50, epoch,
                     )
+
+            if (
+                self.train_eval_every_epochs is not None
+                and (epoch % self.train_eval_every_epochs == 0 or epoch == self.max_epochs)
+            ):
+                self._train_eval(epoch)
 
             if epoch % self.save_every_epochs == 0:
                 self._save_checkpoint("last")

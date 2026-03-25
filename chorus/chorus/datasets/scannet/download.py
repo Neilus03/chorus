@@ -44,7 +44,10 @@ def _install_proxy_handler():
         if https_proxy:
             proxies["https"] = https_proxy
         proxy_handler = urllib.request.ProxyHandler(proxies)
+        # The ScanNet server rejects the default "Python-urllib/3.x" User-Agent
+        # when requests arrive via a proxy. Use a wget-like UA instead.
         opener = urllib.request.build_opener(proxy_handler)
+        opener.addheaders = [("User-Agent", "Wget/1.21")]
         urllib.request.install_opener(opener)
         print(f"[chorus] Installed proxy handler: {proxies}")
 

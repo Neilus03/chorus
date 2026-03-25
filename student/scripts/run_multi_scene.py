@@ -81,6 +81,37 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--max-epochs", type=int, default=None)
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument(
+        "--no-train-metrics",
+        action="store_true",
+        help="Disable periodic training-scene metric evaluation/logging",
+    )
+    parser.add_argument(
+        "--eval-train-every-epochs",
+        type=int,
+        default=None,
+        help="Evaluate a small subset of training scenes every N epochs "
+        "(default: same cadence as validation)",
+    )
+    parser.add_argument(
+        "--eval-train-num-scenes",
+        type=int,
+        default=3,
+        help="How many training scenes to evaluate when train-eval is enabled",
+    )
+    parser.add_argument(
+        "--eval-train-selection",
+        type=str,
+        default="random",
+        choices=["first", "random"],
+        help="Training-scene selection strategy (first N vs random N)",
+    )
+    parser.add_argument(
+        "--eval-train-scene-ids",
+        type=str,
+        default=None,
+        help="Comma-separated training scene ids to evaluate (overrides num-scenes)",
+    )
     parser.add_argument("--wandb-project", type=str, default="chorus-student")
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument(
@@ -219,6 +250,8 @@ def main() -> None:
         wandb.define_metric("train_scene/*", step_metric="global_step")
         wandb.define_metric("val/*", step_metric="epoch")
         wandb.define_metric("val_scene/*", step_metric="epoch")
+        wandb.define_metric("train_eval/*", step_metric="epoch")
+        wandb.define_metric("train_eval_scene/*", step_metric="epoch")
         log.info("wandb run: %s", wandb.run.url)
     else:
         log.info("wandb disabled")
@@ -235,6 +268,24 @@ def main() -> None:
         grad_clip_norm=train_cfg.get("grad_clip_norm", 1.0),
         max_epochs=train_cfg.get("max_epochs", 50),
         eval_every_epochs=train_cfg.get("eval_every_epochs", 5),
+        train_eval_every_epochs=(
+            None
+            if args.no_train_metrics
+            else (
+                args.eval_train_every_epochs
+                if args.eval_train_every_epochs is not None
+                else eval_cfg.get(
+                    "train_eval_every_epochs", train_cfg.get("eval_every_epochs", 5)
+                )
+            )
+        ),
+        train_eval_num_scenes=args.eval_train_num_scenes,
+        train_eval_scene_ids=(
+            [s.strip() for s in args.eval_train_scene_ids.split(",") if s.strip()]
+            if args.eval_train_scene_ids
+            else None
+        ),
+        train_eval_selection=args.eval_train_selection,
         save_every_epochs=train_cfg.get("save_every_epochs", 10),
         output_dir=out_dir,
         score_threshold=eval_cfg.get("score_threshold", 0.3),
