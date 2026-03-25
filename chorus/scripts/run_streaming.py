@@ -221,15 +221,31 @@ def main() -> None:
     args = _parse_args()
 
     scans_root = args.scans_root.resolve()
+    if not scans_root.exists() and "/scratch2/nedela" in str(scans_root):
+        euler_root = Path(str(scans_root).replace("/scratch2/nedela", "/cluster/work/igp_psr/nedela"))
+        if euler_root.exists():
+            scans_root = euler_root
     granularities = [float(g.strip()) for g in args.granularities.split(",") if g.strip()]
     scannet_eval_benchmarks = parse_scannet_eval_benchmarks(args.scannet_eval_benchmark)
     evaluation_hooks = ScanNetEvaluationHooks(scannet_eval_benchmarks)
+
+    use_release_list = args.use_release_list
+    if isinstance(use_release_list, str):
+        local_path = Path(use_release_list)
+        euler_path = Path(use_release_list.replace("/scratch2/nedela", "/cluster/work/igp_psr/nedela"))
+        if args.scene_list_file is None:
+            if local_path.exists():
+                args.scene_list_file = local_path
+                use_release_list = False
+            elif euler_path.exists():
+                args.scene_list_file = euler_path
+                use_release_list = False
 
     scene_ids = read_scene_ids(
         scans_root=scans_root,
         scene_list_file=args.scene_list_file,
         max_scenes=args.max_scenes,
-        use_release_list=args.use_release_list,
+        use_release_list=use_release_list,
     )
 
     report_dir = args.report_dir
@@ -265,13 +281,18 @@ def main() -> None:
         report_dir=report_dir,
         extra_fieldnames=evaluation_hooks.scene_metric_fieldnames(),
     )
+    wandb_dir = args.wandb_dir
+    if not wandb_dir.exists() and "/scratch2/nedela" in str(wandb_dir):
+        euler_wandb = Path(str(wandb_dir).replace("/scratch2/nedela", "/cluster/work/igp_psr/nedela"))
+        wandb_dir = euler_wandb
+
     wandb_reporter = WandbReporter(
         enabled=args.wandb,
         project=args.wandb_project,
         entity=args.wandb_entity,
         mode=args.wandb_mode,
         run_name=f"chorus_streaming_{timestamp}",
-        wandb_dir=args.wandb_dir,
+        wandb_dir=wandb_dir,
         config={
             "scans_root": str(scans_root),
             "granularities": granularities,

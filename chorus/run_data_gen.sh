@@ -10,7 +10,13 @@
 #SBATCH --time=48:00:00
 
 # 1. Load the core Euler modules (Make sure Python is 3.12.8!)
-module load stack/2024-06 gcc/12.2.0 python/3.12.8 cuda/12.4.1
+module load stack/2024-06 gcc/12.2.0 python/3.12.8 cuda/12.4.1 eth_proxy
+
+# 1b. Ensure proxy is set for HTTP downloads (ScanNet uses http://)
+export http_proxy=http://proxy.ethz.ch:3128
+export https_proxy=http://proxy.ethz.ch:3128
+export HTTP_PROXY=http://proxy.ethz.ch:3128
+export HTTPS_PROXY=http://proxy.ethz.ch:3128
 
 # 2. Activate your Python environment from the WORK drive
 source /cluster/work/igp_psr/nedela/litept-env/bin/activate

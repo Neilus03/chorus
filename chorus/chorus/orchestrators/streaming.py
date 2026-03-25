@@ -95,6 +95,10 @@ def _print_scene_result(result: dict[str, Any]) -> None:
     if result.get("error"):
         print(f"error={result['error']}")
 
+    if result.get("download_errors"):
+        for i, err in enumerate(result["download_errors"], 1):
+            print(f"  download_error_{i}: {err}")
+
     if result.get("summary_path"):
         print(f"summary_path={result['summary_path']}")
 
@@ -398,6 +402,7 @@ def run_streaming_scannet(
                 "duration_seconds": time.perf_counter() - started,
                 "reason": availability_reason,
                 "error": availability_reason,
+                "download_errors": download_errors,
                 "downloaded": downloaded,
                 "download_attempts": download_attempts,
                 "manifest_path": str(manifest_path),

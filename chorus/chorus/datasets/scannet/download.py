@@ -30,7 +30,28 @@ def _resolve_downloader_path() -> Path:
     )
 
 
+def _install_proxy_handler():
+    """Install a urllib ProxyHandler so urlopen/urlretrieve route through the proxy."""
+    import urllib.request
+
+    http_proxy = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
+    https_proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+
+    if http_proxy or https_proxy:
+        proxies = {}
+        if http_proxy:
+            proxies["http"] = http_proxy
+        if https_proxy:
+            proxies["https"] = https_proxy
+        proxy_handler = urllib.request.ProxyHandler(proxies)
+        opener = urllib.request.build_opener(proxy_handler)
+        urllib.request.install_opener(opener)
+        print(f"[chorus] Installed proxy handler: {proxies}")
+
+
 def _load_downloader_module():
+    _install_proxy_handler()
+
     downloader_path = _resolve_downloader_path()
 
     spec = importlib.util.spec_from_file_location("scannet_dl", downloader_path)
