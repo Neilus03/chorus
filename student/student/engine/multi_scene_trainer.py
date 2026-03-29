@@ -232,11 +232,37 @@ class MultiSceneTrainer:
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "scheduler_state_dict": self.scheduler.state_dict(),
                 "best_val_metric": self.best_val_metric,
+                "best_epoch": self.best_epoch,
                 "config": self.config,
             },
             path,
         )
         log.info("  Checkpoint saved: %s", path)
+
+    def load_checkpoint(self, path: Path | str) -> None:
+        """Load training state from a checkpoint and continue training."""
+        ckpt_path = Path(path)
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+        checkpoint = torch.load(ckpt_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+        self.current_epoch = int(checkpoint.get("epoch", 0))
+        self.global_step = int(checkpoint.get("global_step", 0))
+        self.best_val_metric = float(checkpoint.get("best_val_metric", -1.0))
+        self.best_epoch = int(checkpoint.get("best_epoch", -1))
+
+        log.info(
+            "Resumed from %s (epoch=%d, global_step=%d, best_val=%.4f @ epoch %d)",
+            ckpt_path,
+            self.current_epoch,
+            self.global_step,
+            self.best_val_metric,
+            self.best_epoch,
+        )
 
     # ------------------------------------------------------------------ #
 
@@ -502,7 +528,13 @@ class MultiSceneTrainer:
         epoch_times: list[float] = []
         last_val_metrics: dict[str, Any] = {}
 
-        for epoch in range(1, self.max_epochs + 1):
+        start_epoch = self.current_epoch + 1
+        if start_epoch > self.max_epochs:
+            log.info(
+                "Checkpoint epoch %d already reached max_epochs=%d; nothing to train.",
+                self.current_epoch, self.max_epochs,
+            )
+        for epoch in range(start_epoch, self.max_epochs + 1):
             self.current_epoch = epoch
             t_epoch = time.time()
 

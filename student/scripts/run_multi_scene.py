@@ -80,6 +80,12 @@ def main() -> None:
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--max-epochs", type=int, default=None)
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Resume from checkpoint path, or use 'last'/'best' in output/checkpoints",
+    )
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument(
         "--no-train-metrics",
@@ -297,6 +303,13 @@ def main() -> None:
         granularities=granularities,
         config=cfg,
     )
+
+    if args.resume:
+        if args.resume in {"last", "best"}:
+            ckpt_path = out_dir / "checkpoints" / f"{args.resume}.pt"
+        else:
+            ckpt_path = Path(args.resume)
+        trainer.load_checkpoint(ckpt_path)
 
     final_metrics = trainer.train()
 
