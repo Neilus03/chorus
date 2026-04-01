@@ -20,12 +20,19 @@ from chorus.datasets.scannet.benchmark import (
 from chorus.datasets.scannet.adapter import ScanNetSceneAdapter
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run CHORUS on a single ScanNet scene")
+    parser = argparse.ArgumentParser(description="Run CHORUS on a single scene (dataset-agnostic)")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=os.environ.get("CHORUS_DATASET", "scannet"),
+        choices=["scannet", "structured3d"],
+        help="Dataset adapter to use",
+    )
     parser.add_argument(
         "--scene-dir",
         type=Path,
         required=True,
-        help="Path to the ScanNet scene directory, for example /scratch2/.../scene0000_00",
+        help="Path to the scene directory, for example /scratch2/.../scene0000_00",
     )
     parser.add_argument(
         "--granularities",
@@ -99,6 +106,12 @@ def _parse_args() -> argparse.Namespace:
         ),
         help="Comma-separated ScanNet oracle benchmarks to run, for example 'scannet20,scannet200'.",
     )
+    parser.add_argument(
+        "--structured3d-raw-zips-dir",
+        type=str,
+        default=os.environ.get("CHORUS_STRUCTURED3D_RAW_ZIPS_DIR", "/scratch2/nedela/structured3d_raw"),
+        help="Structured3D raw ZIP directory (only used when --dataset structured3d).",
+    )
     return parser.parse_args()
 
 
@@ -106,11 +119,33 @@ def main() -> None:
     args = _parse_args()
 
     granularities = [float(g.strip()) for g in args.granularities.split(",") if g.strip()]
-    scannet_eval_benchmarks = parse_scannet_eval_benchmarks(args.scannet_eval_benchmark)
-    adapter = ScanNetSceneAdapter(
-        scene_root=args.scene_dir,
-        eval_benchmarks=scannet_eval_benchmarks,
-    )
+    if args.dataset == "scannet":
+        scannet_eval_benchmarks = parse_scannet_eval_benchmarks(args.scannet_eval_benchmark)
+        adapter = ScanNetSceneAdapter(
+            scene_root=args.scene_dir,
+            eval_benchmarks=scannet_eval_benchmarks,
+        )
+        run_oracle_eval = not args.no_oracle_eval
+    elif args.dataset == "structured3d":
+        # Structured3D integration lives under chorus/datasets/structured3d/.
+        # This import is intentionally local to avoid making Structured3D a hard dependency
+        # for users who only run ScanNet.
+        try:
+            from chorus.datasets.structured3d.adapter import Structured3DSceneAdapter
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError(
+                "Structured3D adapter not found. Expected module: chorus.datasets.structured3d.adapter "
+                "(see chorus/datasets/structured3D/STRUCTURED3D_PLAN.md)."
+            ) from e
+
+        adapter = Structured3DSceneAdapter(
+            scene_root=args.scene_dir,
+            raw_zips_dir=args.structured3d_raw_zips_dir,
+        )
+        # Oracle evaluation is ScanNet-specific.
+        run_oracle_eval = False
+    else:
+        raise ValueError(f"Unsupported dataset: {args.dataset}")
 
     teacher = UnSAMv2Teacher(
         device=args.device,
@@ -127,7 +162,7 @@ def main() -> None:
         min_cluster_size=args.min_cluster_size,
         min_samples=args.min_samples,
         cluster_selection_epsilon=args.cluster_selection_epsilon,
-        run_oracle_eval=not args.no_oracle_eval,
+        run_oracle_eval=run_oracle_eval,
         export_training_pack=not args.no_export_training_pack,
     )
 
