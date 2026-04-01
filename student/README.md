@@ -1,6 +1,6 @@
 # Student
 
-Training and evaluation code for the **student** model: multi-granularity instance masks on 3D scans, using a LitePT backbone and a learned query decoder. This folder holds the implementation used by Chorus; older `poc*` scripts in the repo root are deprecated.
+Training and evaluation code for the **student** model: multi-granularity instance masks on 3D scans, using a LitePT backbone and a learned query decoder. This folder holds the implementation used by Chorus.
 
 ## Layout
 

@@ -1,20 +1,17 @@
 experiment:
-  name: multi_scene_100_10
+  name: multi_scene_10_10         # CHANGED
   seed: 42
   output_root: /scratch2/nedela/student_runs
 
 data:
   scans_root: /scratch2/nedela/chorus_poc/scans
-  train_split: configs/splits/train_100.txt
+  train_split: configs/splits/train_10.txt  # CHANGED (assuming this is your 10-scene split name)
   val_split: configs/splits/val_10.txt
-  # train_100.txt: 100 scenes with training_pack (val_3 excluded). Epoch = 100 steps.
   granularities: [0.2, 0.5, 0.8]
   use_colors: true
   append_xyz_to_features: false
   min_instance_points: 10
   preload: true
-  # Cap points per scene (random subsample each __getitem__) so decoder fits in ~24GB VRAM.
-  # Full scenes in this split reach ~370k points; cross-attention memory scales with size.
   max_points: 130000
 
 model:
@@ -24,18 +21,19 @@ model:
     litept_variant: litept_s_star
     in_channels: 3
     grid_size: 0.02
-    multi_scale: false
-    num_queries: 200
-    num_queries_by_granularity:
-      g02: 300
-      g05: 200
-      g08: 100
+    multi_scale: true                       # CHANGED
+    multi_scale_indices: [0, 1, 2, 3]       # ADDED (Matches your Phase 6 architecture plan)
+  num_queries: 200
+  num_queries_by_granularity:
+    g02: 300
+    g05: 200
+    g08: 100
   decoder_hidden_dim: 256
-  num_decoder_layers: 3
+  num_decoder_layers: 4                     # CHANGED
   num_decoder_heads: 8
-  query_init: learned
+  query_init: hybrid                        # CHANGED
   use_positional_guidance: true
-  learned_query_ratio: 0.5
+  learned_query_ratio: 0.25                 # CHANGED
 
 loss:
   bce_weight: 1.0
@@ -45,17 +43,19 @@ loss:
 
 train:
   device: cuda:0
-  lr: 1.0e-4
-  weight_decay: 1.0e-4
+  lr: 3.0e-4
+  # No backbone_lr_scale — both backbone and decoder are trained from scratch
+  # (no pretrained LitePT weights). Uniform LR for all parameters.
+  weight_decay: 1.0e-5
   grad_clip_norm: 1.0
-  max_epochs: 1500
+  max_epochs: 4500
   eval_every_epochs: 5
   save_every_epochs: 10
   log_every_steps: 1
   warmup_epochs: 20
 
 eval:
-  scannet_benchmark: scannet200
+  scannet_benchmark: all
   score_threshold: 0.1
   mask_threshold: 0.5
   min_points_per_proposal: 30

@@ -394,7 +394,7 @@ class MultiSceneTrainer:
             min_instance_points=self.min_instance_points,
         )
 
-        self.model.train()
+        self.model.eval()
 
         agg = val_result["aggregate"]
         log.info(
@@ -460,7 +460,7 @@ class MultiSceneTrainer:
             min_instance_points=self.min_instance_points,
         )
 
-        self.model.train()
+        self.model.eval()
 
         agg = train_result["aggregate"]
         log.info(
