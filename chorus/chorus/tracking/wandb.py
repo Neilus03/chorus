@@ -39,14 +39,23 @@ class WandbReporter:
             resolved_dir = str(Path(wandb_dir).expanduser().resolve())
             Path(resolved_dir).mkdir(parents=True, exist_ok=True)
 
-        self.run = wandb.init(
-            project=project,
-            entity=entity,
-            mode=mode,
-            name=run_name,
-            dir=resolved_dir,
-            config=config or {},
-        )
+        try:
+            self.run = wandb.init(
+                project=project,
+                entity=entity,
+                mode=mode,
+                name=run_name,
+                dir=resolved_dir,
+                config=config or {},
+            )
+        except Exception as exc:
+            # W&B should never take down a long-running data generation job.
+            # Typical failures on clusters: blocked outbound, proxy issues, service port-file errors.
+            self.enabled = False
+            self.run = None
+            self._wandb = None
+            print(f"wandb: disabled due to init failure: {exc!r}")
+            return
 
     def log_scene(self, result: dict[str, Any]) -> None:
         if not self.enabled or self.run is None:

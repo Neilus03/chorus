@@ -15,30 +15,54 @@ from chorus.core.teacher.base import TeacherModel
 from chorus.datasets.base import SceneAdapter
 
 
+def _map_scratch2_to_euler_work(p: Path) -> Path:
+    user = os.environ.get("USER", "nedela")
+    s = str(p)
+    scratch_prefix = f"/scratch2/{user}"
+    euler_prefix = f"/cluster/work/igp_psr/{user}"
+    if s.startswith(scratch_prefix + "/"):
+        return Path(euler_prefix + s[len(scratch_prefix) :])
+    return p
+
+
+def _resolve_path_for_env(p: Path) -> Path:
+    mapped = _map_scratch2_to_euler_work(p)
+    if mapped != p and mapped.exists():
+        return mapped
+    return p
+
+
 def _resolve_unsam_root() -> Path:
     repo_root = Path(__file__).resolve().parents[3]
     default_root = repo_root / "UnSAMv2"
-    return Path(
+    root = Path(
         os.path.expandvars(
             os.path.expanduser(
                 os.environ.get("UNSAM_ROOT", str(default_root))
             )
         )
     ).resolve()
+    # If a user sets UNSAM_ROOT to /scratch2/... on Euler, prefer the mapped work path.
+    root = _resolve_path_for_env(root)
+    if root.exists():
+        return root
+
+    # Convenience fallback for Euler: allow keeping UnSAMv2 on /cluster/work/...
+    user = os.environ.get("USER", "nedela")
+    euler_candidate = Path(f"/cluster/work/igp_psr/{user}/UnSAMv2").resolve()
+    if euler_candidate.exists():
+        return euler_candidate
+
+    return root
 
 
 def _resolve_checkpoint_path(unsam_root: Path) -> Path:
     user = os.environ.get("USER", "nedela")
 
-    default_scratch_ckpt = Path(
-        f"/scratch2/{user}/chorus/checkpoints/unsamv2/unsamv2_plus_ckpt.pt"
+    default_scratch_ckpt = _resolve_path_for_env(
+        Path(f"/scratch2/{user}/chorus/checkpoints/unsamv2/unsamv2_plus_ckpt.pt")
     )
-    legacy_poc_ckpt = Path(
-        f"/scratch2/{user}/chorus_poc/checkpoints/unsamv2/unsamv2_plus_ckpt.pt"
-    )
-    legacy_poc2_ckpt = Path(
-        f"/scratch2/{user}/chorus_poc2/checkpoints/unsamv2/unsamv2_plus_ckpt.pt"
-    )
+
     local_ckpt = unsam_root / "sam2" / "checkpoints" / "unsamv2_plus_ckpt.pt"
 
     default_choice = (
