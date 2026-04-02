@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,19 @@ def apply_cli_overrides(cfg: dict[str, Any], overrides: list[str]) -> None:
         for p in parts[:-1]:
             d = d.setdefault(p, {})
         d[parts[-1]] = yaml.safe_load(value)
+
+
+def _parse_cuda_index(device: str) -> int | None:
+    device = device.strip()
+    if device == "cuda":
+        return None
+    if device.startswith("cuda:"):
+        tail = device.split(":", 1)[1]
+        try:
+            return int(tail)
+        except ValueError:
+            return None
+    return None
 
 
 # ── output directory ─────────────────────────────────────────────────────
@@ -129,6 +143,14 @@ def main() -> None:
         help="dotted key=value config overrides, e.g. train.lr=3e-4",
     )
     args = parser.parse_args()
+
+    # Remap `cuda:K` -> visible GPU K as `cuda:0` when needed.
+    # This mirrors run_student_remap_device.py behavior.
+    if args.device is not None:
+        idx = _parse_cuda_index(args.device)
+        if idx is not None and idx != 0 and "CUDA_VISIBLE_DEVICES" not in os.environ:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(idx)
+            args.device = "cuda:0"
 
     # ── 1. config ──
     cfg = load_config(args.config)
