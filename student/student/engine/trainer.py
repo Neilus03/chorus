@@ -279,6 +279,11 @@ class SingleSceneTrainer:
             if run_pseudo_eval or run_full_eval:
                 self.model.eval()
                 with torch.no_grad():
+                    # Hack: Force BatchNorm to compute stats on the fly
+                    for module in self.model.modules():
+                        if isinstance(module, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d, torch.nn.SyncBatchNorm)):
+                            module.train()
+                    # --------------------------
                     pred_eval = self.model(self.points, self.features)
                     ld_eval = self.criterion(pred_eval, self.targets_by_granularity)
                 self.model.train()

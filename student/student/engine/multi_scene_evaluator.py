@@ -79,6 +79,12 @@ def evaluate_multi_scene(
     """
     model.eval()
 
+    # Hack: Force BatchNorm to compute stats on the fly
+    for module in model.modules():
+        if isinstance(module, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d, torch.nn.SyncBatchNorm)):
+            module.train()
+    # --------------------------
+
     per_scene: dict[str, dict[str, Any]] = {}
 
     all_losses: list[float] = []
