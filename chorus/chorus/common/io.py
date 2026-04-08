@@ -28,22 +28,7 @@ def _granularity_tag(granularity: float) -> str:
     return f"g{granularity}"
 
 
-def _resolve_training_pack_dir(scene_dir: Path) -> Path:
-    training_pack_dir = scene_dir / "training_pack"
-    if training_pack_dir.exists():
-        return training_pack_dir
-
-    legacy_litept_dir = scene_dir / "litept_pack"
-    if legacy_litept_dir.exists():
-        return legacy_litept_dir
-
-    return training_pack_dir
-
-
 def _validate_training_pack_scene_meta(pack_dir: Path) -> list[str]:
-    if pack_dir.name != "training_pack":
-        return []
-
     scene_meta_path = pack_dir / "scene_meta.json"
     scene_meta = load_json_if_exists(scene_meta_path)
     if scene_meta is None:
@@ -104,7 +89,9 @@ def expected_scene_output_paths(
         )
 
     if require_training_pack:
-        training_pack_dir = _resolve_training_pack_dir(scene_dir)
+        # Require the canonical `training_pack/` export dir. Legacy `litept_pack/` alone must not
+        # satisfy completion checks, or streaming will skip scenes that still need a v1 training pack.
+        training_pack_dir = scene_dir / "training_pack"
         expected.extend(
             [
                 training_pack_dir / "points.npy",
@@ -182,8 +169,7 @@ def verify_scene_completion_from_summary(
             missing_reasons.append("summary granularities could not be parsed")
 
     if require_training_pack:
-        training_pack_dir = summary.get("training_pack_dir") or summary.get("litept_pack_dir")
-        if training_pack_dir is None:
+        if not summary.get("training_pack_dir"):
             missing_reasons.append("summary missing training_pack_dir")
 
     if evaluation_hooks is not None:
@@ -208,7 +194,7 @@ def verify_scene_completion_from_summary(
         missing_reasons.extend(missing_outputs)
 
     if require_training_pack:
-        training_pack_dir = _resolve_training_pack_dir(scene_dir)
+        training_pack_dir = scene_dir / "training_pack"
         if training_pack_dir.exists():
             missing_reasons.extend(_validate_training_pack_scene_meta(training_pack_dir))
 
