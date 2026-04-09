@@ -139,6 +139,14 @@ def main() -> None:
         help="Log the full module tree after build.",
     )
     parser.add_argument(
+        "--augmentations",
+        action="store_true",
+        help=(
+            "Enable LitePT ScanNet-style train augmentations (rotate, scale, flip, "
+            "jitter, elastic, chromatic). Same as data.train_augmentations: true in YAML."
+        ),
+    )
+    parser.add_argument(
         "overrides", nargs="*",
         help="dotted key=value config overrides, e.g. train.lr=3e-4",
     )
@@ -161,6 +169,8 @@ def main() -> None:
         cfg.setdefault("train", {})["device"] = args.device
     if args.max_epochs is not None:
         cfg.setdefault("train", {})["max_epochs"] = args.max_epochs
+    if args.augmentations:
+        cfg.setdefault("data", {})["train_augmentations"] = True
 
     data_cfg = cfg["data"]
     train_cfg = cfg["train"]
@@ -197,19 +207,24 @@ def main() -> None:
     if max_pts is not None:
         log.info("max_points=%s (subsample large scenes per step)", max_pts)
 
+    train_aug = bool(data_cfg.get("train_augmentations", False))
+    if train_aug:
+        log.info("Training augmentations enabled (LitePT-style; validation unchanged)")
+
     train_ds = MultiSceneDataset(
         train_dirs, granularities,
         use_colors=data_cfg.get("use_colors", True),
         append_xyz=data_cfg.get("append_xyz_to_features", False),
         preload=data_cfg.get("preload", True),
         max_points=max_pts,
+        train_augmentations=train_aug,
     )
     val_ds = MultiSceneDataset(
         val_dirs, granularities,
         use_colors=data_cfg.get("use_colors", True),
         append_xyz=data_cfg.get("append_xyz_to_features", False),
         preload=data_cfg.get("preload", True),
-        max_points=max_pts,
+        max_points=None,
     )
 
     # ── 5. model ──

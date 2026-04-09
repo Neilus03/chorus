@@ -22,6 +22,7 @@ from student.data.training_pack import (
     _resolve_pack_dir,
     load_training_pack_scene_multi,
 )
+from student.data.point_augmentations import augment_points_litept_scannet
 from student.data.single_scene_dataset import build_input_features
 
 log = logging.getLogger(__name__)
@@ -100,6 +101,10 @@ class MultiSceneDataset(Dataset):
         points (same indices for points, features, labels, masks).  Use when
         full scenes exceed GPU memory — decoder cross-attention cost grows with
         scene size.
+    train_augmentations:
+        If True, apply LitePT ScanNet-style geometric and (when colors are used)
+        chromatic jitter on **training** samples only.  Ignores precomputed
+        feature cache so augmentations vary each epoch.
     """
 
     def __init__(
@@ -111,6 +116,7 @@ class MultiSceneDataset(Dataset):
         append_xyz: bool = False,
         preload: bool = True,
         max_points: int | None = None,
+        train_augmentations: bool = False,
     ) -> None:
         super().__init__()
         self._scene_dirs = list(scene_dirs)
@@ -118,8 +124,23 @@ class MultiSceneDataset(Dataset):
         self._use_colors = use_colors
         self._append_xyz = append_xyz
         self._max_points = max_points
+        self._train_augmentations = bool(train_augmentations)
         self._scenes: list[MultiGranTrainingPackScene] = []
-        self._features_cache: list[np.ndarray] = []
+        self._features_cache: list[np.ndarray] | None = [] if not train_augmentations else None
+
+        if self._train_augmentations:
+            try:
+                import scipy.ndimage  # noqa: F401
+            except ImportError:
+                log.warning(
+                    "train_augmentations=True but scipy is not installed; "
+                    "elastic distortion will be skipped (install scipy for full LitePT-style aug).",
+                )
+            else:
+                log.info(
+                    "train_augmentations=True (LitePT ScanNet-style: rotate, scale, "
+                    "flip, jitter, elastic, chromatic)",
+                )
 
         if preload:
             for sd in self._scene_dirs:
@@ -129,10 +150,14 @@ class MultiSceneDataset(Dataset):
                     use_colors=use_colors, append_xyz=append_xyz,
                 )
                 self._scenes.append(scene)
-                self._features_cache.append(feats)
+                if self._features_cache is not None:
+                    self._features_cache.append(feats)
                 log.info(
-                    "[%s] Preloaded: %d points, %d features",
-                    scene.scene_id, scene.num_points, feats.shape[1],
+                    "[%s] Preloaded: %d points, %d features%s",
+                    scene.scene_id,
+                    scene.num_points,
+                    feats.shape[1],
+                    " (features rebuilt each step — augmentations on)" if self._train_augmentations else "",
                 )
 
     def __len__(self) -> int:
@@ -144,22 +169,46 @@ class MultiSceneDataset(Dataset):
 
         if self._scenes:
             scene = self._scenes[idx]
-            features = self._features_cache[idx]
+            base_points = scene.points
+            base_colors = scene.colors
         else:
             scene = load_training_pack_scene_multi(
                 self._scene_dirs[idx], self._granularities,
             )
-            features = build_input_features(
-                scene.points, scene.colors,
-                use_colors=self._use_colors, append_xyz=self._append_xyz,
+            base_points = scene.points
+            base_colors = scene.colors
+
+        if self._train_augmentations:
+            aug_pts, aug_cols = augment_points_litept_scannet(
+                base_points,
+                base_colors,
+                use_colors=self._use_colors,
             )
+            features = build_input_features(
+                aug_pts,
+                aug_cols,
+                use_colors=self._use_colors,
+                append_xyz=self._append_xyz,
+            )
+            points_np = aug_pts
+        elif self._scenes and self._features_cache is not None:
+            features = self._features_cache[idx]
+            points_np = base_points
+        else:
+            features = build_input_features(
+                base_points,
+                base_colors,
+                use_colors=self._use_colors,
+                append_xyz=self._append_xyz,
+            )
+            points_np = base_points
 
         labels_by_gran = {
             g: torch.from_numpy(scene.labels_by_granularity[g]).long()
             for g in self._granularities
         }
 
-        points_t = torch.from_numpy(scene.points).float()
+        points_t = torch.from_numpy(np.asarray(points_np)).float()
         features_t = torch.from_numpy(features).float()
         valid_t = torch.from_numpy(scene.valid_points).bool()
         seen_t = torch.from_numpy(scene.seen_points).bool()
