@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from chorus.common.progress import phase_timer
 from chorus.core.pipeline.project_cluster_stage import run_project_cluster_stage
 from chorus.core.pipeline.teacher_stage import run_teacher_stage
 from chorus.core.quality.diagnostics import save_json
@@ -24,25 +25,29 @@ def run_scene_pipeline(
     print(f"Preparing scene: dataset={adapter.dataset_name}, scene={adapter.scene_id}")
     adapter.prepare()
 
-    teacher_outputs = run_teacher_stage(
-        adapter=adapter,
-        teacher=teacher,
-        granularities=granularities,
-        frame_skip=frame_skip,
-    )
+    with phase_timer(f"Teacher stage: scene={adapter.scene_id}"):
+        teacher_outputs = run_teacher_stage(
+            adapter=adapter,
+            teacher=teacher,
+            granularities=granularities,
+            frame_skip=frame_skip,
+        )
 
     cluster_outputs = []
     for teacher_output in teacher_outputs:
-        cluster_output = run_project_cluster_stage(
-            adapter=adapter,
-            teacher_output=teacher_output,
-            frame_skip=frame_skip,
-            svd_components=svd_components,
-            min_cluster_size=min_cluster_size,
-            min_samples=min_samples,
-            cluster_selection_epsilon=cluster_selection_epsilon,
-            save_outputs=True,
-        )
+        with phase_timer(
+            f"Project+Cluster stage: scene={adapter.scene_id}, granularity={teacher_output.granularity}"
+        ):
+            cluster_output = run_project_cluster_stage(
+                adapter=adapter,
+                teacher_output=teacher_output,
+                frame_skip=frame_skip,
+                svd_components=svd_components,
+                min_cluster_size=min_cluster_size,
+                min_samples=min_samples,
+                cluster_selection_epsilon=cluster_selection_epsilon,
+                save_outputs=True,
+            )
         cluster_outputs.append(cluster_output)
 
     scene_intrinsic_metrics = compute_scene_intrinsic_metrics(cluster_outputs)
@@ -50,23 +55,25 @@ def run_scene_pipeline(
     evaluation_hooks = adapter.get_evaluation_hooks()
     evaluation_summary = None
     if run_oracle_eval:
-        evaluation_summary = evaluation_hooks.evaluate_scene(
-            adapter=adapter,
-            cluster_outputs=cluster_outputs,
-        )
+        with phase_timer(f"Oracle evaluation: scene={adapter.scene_id}"):
+            evaluation_summary = evaluation_hooks.evaluate_scene(
+                adapter=adapter,
+                cluster_outputs=cluster_outputs,
+            )
 
     training_pack_dir = None
     if export_training_pack:
-        training_pack_dir = export_training_scene_pack(
-            adapter=adapter,
-            cluster_outputs=cluster_outputs,
-            teacher_name=teacher.__class__.__name__,
-            projection_type="zbuffer_rgbd",
-            embedding_type="truncated_svd",
-            clustering_type="hdbscan",
-            frame_skip=frame_skip,
-            scene_intrinsic_metrics=scene_intrinsic_metrics,
-        )
+        with phase_timer(f"Training pack export: scene={adapter.scene_id}"):
+            training_pack_dir = export_training_scene_pack(
+                adapter=adapter,
+                cluster_outputs=cluster_outputs,
+                teacher_name=teacher.__class__.__name__,
+                projection_type="zbuffer_rgbd",
+                embedding_type="truncated_svd",
+                clustering_type="hdbscan",
+                frame_skip=frame_skip,
+                scene_intrinsic_metrics=scene_intrinsic_metrics,
+            )
 
     summary = {
         "dataset": adapter.dataset_name,
