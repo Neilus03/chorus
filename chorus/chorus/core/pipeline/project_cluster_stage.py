@@ -105,6 +105,15 @@ def run_project_cluster_stage(
     num_seen_points = int(np.sum(seen_mask))
     unseen_points = int(num_points - num_seen_points)
 
+    print(
+        "Project+Cluster visibility summary: "
+        f"scene={adapter.scene_id}, granularity={teacher_output.granularity}, "
+        f"used_frames={used_frames}, seen_points={num_seen_points}/{num_points} "
+        f"({num_seen_points / max(num_points, 1):.3f}), "
+        f"point_mask_matrix_shape={point_mask_matrix.shape}, nnz={int(point_mask_matrix.nnz)}",
+        flush=True,
+    )
+
     if num_seen_points == 0:
         raise RuntimeError("No 3D points received any valid 2D mask votes. Check teacher outputs and paths.")
 
