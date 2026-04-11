@@ -1,10 +1,10 @@
 experiment:
   name: full_scannet
   seed: 42
-  output_root: /scratch2/nedela/student_runs
+  output_root: ${CHORUS_OUTPUT_ROOT:-/scratch2/nedela/student_runs}
 
 data:
-  scans_root: /scratch2/nedela/chorus_poc/scans
+  scans_root: ${SCANNET_SCANS_ROOT:-/scratch2/nedela/chorus_poc/scans}
   train_split: configs/splits/scannet_full_train.txt
   val_split: configs/splits/scannet_full_val.txt
   granularities: [0.2, 0.5, 0.8]
@@ -13,11 +13,12 @@ data:
   min_instance_points: 10
   preload: true
   max_points: 130000
+  augmentations: true
 
 model:
   backbone:
     name: litept
-    litept_root: /home/nedela/projects/LitePT
+    litept_root: ${LITEPT_ROOT:-/home/nedela/projects/LitePT}
     litept_variant: litept_s_star
     in_channels: 3
     grid_size: 0.02
