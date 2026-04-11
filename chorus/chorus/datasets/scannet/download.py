@@ -74,18 +74,47 @@ def download_scene(
     scans_root = Path(scans_root)
     scans_root.mkdir(parents=True, exist_ok=True)
 
+    # Resolve/import the downloader once per call so failures can report the exact path.
+    downloader_path = _resolve_downloader_path()
     dl = _load_downloader_module()
     out_dir = scans_root / scene_id
 
     print(f"Downloading ScanNet scene {scene_id} into {out_dir}")
 
-    dl.download_scan(
-        scan_id=scene_id,
-        out_dir=str(out_dir),
-        file_types=list(dl.FILETYPES),
-        use_v1_sens=True,
-        skip_existing=skip_existing,
-    )
+    try:
+        dl.download_scan(
+            scan_id=scene_id,
+            out_dir=str(out_dir),
+            file_types=list(dl.FILETYPES),
+            use_v1_sens=True,
+            skip_existing=skip_existing,
+        )
+    except Exception as exc:
+        # Surface actionable diagnostics; upstream may otherwise only report "download failed".
+        import traceback
+
+        proxy_env = {
+            k: os.environ.get(k)
+            for k in (
+                "http_proxy",
+                "https_proxy",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "no_proxy",
+                "NO_PROXY",
+            )
+        }
+        print(
+            "[chorus] ScanNet download failed.\n"
+            f"  scene_id={scene_id}\n"
+            f"  scans_root={scans_root}\n"
+            f"  out_dir={out_dir}\n"
+            f"  downloader_path={downloader_path}\n"
+            f"  proxy_env={proxy_env}\n"
+            f"  error={exc!r}\n"
+            + traceback.format_exc()
+        )
+        raise
 
     return out_dir
 
