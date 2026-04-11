@@ -120,7 +120,7 @@ class Structured3DSceneAdapter(SceneAdapter):
             # Structured3D poses/intrinsics can be slightly inconsistent with the fused geometry.
             # A looser tolerance makes the visibility test less brittle.
             min_depth_m=0.01,
-            z_tolerance_m=0.8,
+            z_tolerance_m=1,
             depth_scale_to_m=1.0,  # already converted in load_depth_m
             depth_aligned_to_rgb=True,
         )
