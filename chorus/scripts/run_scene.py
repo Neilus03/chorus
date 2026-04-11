@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import IO, TextIO
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -19,13 +20,34 @@ from chorus.datasets.scannet.benchmark import (
 )
 from chorus.datasets.scannet.adapter import ScanNetSceneAdapter
 
+
+class _Tee(TextIO):
+    """Write to multiple streams (e.g. terminal + log file)."""
+
+    def __init__(self, *streams: IO[str]) -> None:
+        self._streams = streams
+
+    def write(self, s: str) -> int:
+        for f in self._streams:
+            f.write(s)
+            f.flush()
+        return len(s)
+
+    def flush(self) -> None:
+        for f in self._streams:
+            f.flush()
+
+    def isatty(self) -> bool:
+        return self._streams[0].isatty() if self._streams else False
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run CHORUS on a single scene (dataset-agnostic)")
     parser.add_argument(
         "--dataset",
         type=str,
         default=os.environ.get("CHORUS_DATASET", "scannet"),
-        choices=["scannet", "structured3d"],
+        choices=["scannet", "structured3d", "scannetpp"],
         help="Dataset adapter to use",
     )
     parser.add_argument(
@@ -112,12 +134,41 @@ def _parse_args() -> argparse.Namespace:
         default=os.environ.get("CHORUS_STRUCTURED3D_RAW_ZIPS_DIR", "/scratch2/nedela/structured3d_raw"),
         help="Structured3D raw ZIP directory (only used when --dataset structured3d).",
     )
+    parser.add_argument(
+        "--scannetpp-eval-benchmark",
+        type=str,
+        default=os.environ.get("CHORUS_SCANNETPP_EVAL_BENCHMARK", "top100_instance"),
+        help="ScanNet++ oracle benchmark filter (only used when --dataset scannetpp).",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="If set, mirror stdout/stderr to this UTF-8 text file (terminal output unchanged).",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
 
+    log_fp: IO[str] | None = None
+    if args.log_file is not None:
+        args.log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_fp = open(args.log_file, "w", encoding="utf-8")
+        sys.stdout = _Tee(sys.__stdout__, log_fp)
+        sys.stderr = _Tee(sys.__stderr__, log_fp)
+
+    try:
+        _run(args)
+    finally:
+        if log_fp is not None:
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
+            log_fp.close()
+
+
+def _run(args: argparse.Namespace) -> None:
     granularities = [float(g.strip()) for g in args.granularities.split(",") if g.strip()]
     if args.dataset == "scannet":
         scannet_eval_benchmarks = parse_scannet_eval_benchmarks(args.scannet_eval_benchmark)
@@ -144,6 +195,14 @@ def main() -> None:
         )
         # Oracle evaluation is ScanNet-specific.
         run_oracle_eval = False
+    elif args.dataset == "scannetpp":
+        from chorus.datasets.scannetpp.adapter import ScanNetPPSceneAdapter
+
+        adapter = ScanNetPPSceneAdapter(
+            scene_root=args.scene_dir,
+            eval_benchmark=args.scannetpp_eval_benchmark,
+        )
+        run_oracle_eval = not args.no_oracle_eval
     else:
         raise ValueError(f"Unsupported dataset: {args.dataset}")
 

@@ -22,6 +22,7 @@ def cluster_features(
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
         cluster_selection_epsilon=cluster_selection_epsilon,
+        n_jobs=-1,
         copy=False,
     )
     with heartbeat("HDBSCAN fit_predict"):
