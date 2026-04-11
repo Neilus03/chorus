@@ -10,7 +10,8 @@ def cleanup_scene_intermediates(
     delete_rgbd: bool = True,
     delete_teacher_masks: bool = True,
     delete_svd_features: bool = True,
-    delete_raw_scannet_files: bool = True,
+    delete_raw_source_files: bool = True,
+    raw_source_suffixes: tuple[str, ...] = (".sens", ".zip"),
 ) -> dict[str, list[str]]:
     scene_dir = Path(scene_dir)
 
@@ -44,17 +45,17 @@ def cleanup_scene_intermediates(
     else:
         skipped.append("svd_features")
 
-    if delete_raw_scannet_files:
+    if delete_raw_source_files:
         for path in scene_dir.iterdir():
             if not path.is_file():
                 continue
 
             name = path.name
-            if name.endswith(".sens") or name.endswith(".zip"):
+            if any(name.endswith(suffix) for suffix in raw_source_suffixes):
                 path.unlink()
                 deleted.append(name)
     else:
-        skipped.append("raw_scannet_files")
+        skipped.append("raw_source_files")
 
     return {
         "deleted": deleted,

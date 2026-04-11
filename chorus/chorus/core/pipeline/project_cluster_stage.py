@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 from chorus.common.types import ClusterOutput, TeacherOutput
+from chorus.common.progress import log_progress, phase_timer
 from chorus.core.clustering.hdbscan_cluster import cluster_features
 from chorus.core.embedding.svd import compute_svd_features
 from chorus.core.lifting.project import project_points_to_image
@@ -46,64 +47,78 @@ def run_project_cluster_stage(
     used_frames = 0
     skipped_frames = 0
 
-    print(
+    log_progress(
         f"Project+Cluster: scene={adapter.scene_id}, granularity={teacher_output.granularity}, "
         f"frames_considered={len(frames)}, num_points={num_points}"
     )
 
-    for frame in frames:
-        mask_path = frame_id_to_mask_path.get(frame.frame_id)
-        if mask_path is None or not mask_path.exists():
-            skipped_frames += 1
-            continue
+    with phase_timer(
+        f"Project+Cluster projection loop: scene={adapter.scene_id}, granularity={teacher_output.granularity}"
+    ):
+        for frame in frames:
+            mask_path = frame_id_to_mask_path.get(frame.frame_id)
+            if mask_path is None or not mask_path.exists():
+                skipped_frames += 1
+                continue
 
-        try:
-            pose_c2w = adapter.load_pose_c2w(frame)
-        except Exception as exc:
-            print(f"Skipping frame {frame.frame_id} due to invalid pose: {exc}")
-            skipped_frames += 1
-            continue
+            try:
+                pose_c2w = adapter.load_pose_c2w(frame)
+            except Exception as exc:
+                log_progress(f"Skipping frame {frame.frame_id} due to invalid pose: {exc}")
+                skipped_frames += 1
+                continue
 
-        intrinsics = adapter.load_intrinsics(frame)
-        depth_map_m = adapter.load_depth_m(frame)
-        pred_2d_mask = np.load(mask_path)
+            intrinsics = adapter.load_intrinsics(frame)
+            depth_map_m = adapter.load_depth_m(frame)
+            pred_2d_mask = np.load(mask_path)
 
-        if pred_2d_mask.ndim != 2:
-            raise RuntimeError(f"Expected 2D mask array in {mask_path}, got shape={pred_2d_mask.shape}")
+            if pred_2d_mask.ndim != 2:
+                raise RuntimeError(f"Expected 2D mask array in {mask_path}, got shape={pred_2d_mask.shape}")
 
-        depth_map_m = _resize_depth_to_mask_shape(depth_map_m, pred_2d_mask.shape)
+            depth_map_m = _resize_depth_to_mask_shape(depth_map_m, pred_2d_mask.shape)
 
-        u, v, z, valid_indices = project_points_to_image(
-            points_3d=points_3d,
-            pose_c2w=pose_c2w,
-            intrinsics=intrinsics,
+            u, v, z, valid_indices = project_points_to_image(
+                points_3d=points_3d,
+                pose_c2w=pose_c2w,
+                intrinsics=intrinsics,
+            )
+
+            visible_indices, visible_u, visible_v = compute_visible_points(
+                u=u,
+                v=v,
+                z=z,
+                valid_indices=valid_indices,
+                depth_map_m=depth_map_m,
+                visibility_cfg=visibility_cfg,
+            )
+
+            predicted_local_ids = pred_2d_mask[visible_v, visible_u]
+
+            point_assignments.append(visible_indices)
+            mask_assignments.append(predicted_local_ids)
+            used_frames += 1
+
+    with phase_timer(
+        f"Project+Cluster sparse vote matrix build: scene={adapter.scene_id}, granularity={teacher_output.granularity}"
+    ):
+        point_mask_matrix, voting_stats = build_point_mask_matrix(
+            point_assignments=point_assignments,
+            mask_assignments=mask_assignments,
+            num_points=num_points,
         )
-
-        visible_indices, visible_u, visible_v = compute_visible_points(
-            u=u,
-            v=v,
-            z=z,
-            valid_indices=valid_indices,
-            depth_map_m=depth_map_m,
-            visibility_cfg=visibility_cfg,
-        )
-
-        predicted_local_ids = pred_2d_mask[visible_v, visible_u]
-
-        point_assignments.append(visible_indices)
-        mask_assignments.append(predicted_local_ids)
-        used_frames += 1
-
-    point_mask_matrix, voting_stats = build_point_mask_matrix(
-        point_assignments=point_assignments,
-        mask_assignments=mask_assignments,
-        num_points=num_points,
-    )
 
     votes_per_point = np.asarray(point_mask_matrix.sum(axis=1)).reshape(-1)
     seen_mask = votes_per_point > 0
     num_seen_points = int(np.sum(seen_mask))
     unseen_points = int(num_points - num_seen_points)
+
+    log_progress(
+        "Project+Cluster visibility summary: "
+        f"scene={adapter.scene_id}, granularity={teacher_output.granularity}, "
+        f"used_frames={used_frames}, seen_points={num_seen_points}/{num_points} "
+        f"({num_seen_points / max(num_points, 1):.3f}), "
+        f"point_mask_matrix_shape={point_mask_matrix.shape}, nnz={int(point_mask_matrix.nnz)}"
+    )
 
     if num_seen_points == 0:
         raise RuntimeError("No 3D points received any valid 2D mask votes. Check teacher outputs and paths.")
@@ -170,37 +185,40 @@ def run_project_cluster_stage(
     intrinsic_metrics = compute_cluster_intrinsic_metrics(cluster_output)
 
     if save_outputs:
-        labels_path = adapter.scene_root / f"chorus_instance_labels_g{teacher_output.granularity}.npy"
-        np.save(labels_path, full_labels)
+        with phase_timer(
+            f"Project+Cluster export: scene={adapter.scene_id}, granularity={teacher_output.granularity}"
+        ):
+            labels_path = adapter.scene_root / f"chorus_instance_labels_g{teacher_output.granularity}.npy"
+            np.save(labels_path, full_labels)
 
-        features_path = adapter.scene_root / f"svd_features_g{teacher_output.granularity}.npy"
-        np.save(features_path, full_features)
+            features_path = adapter.scene_root / f"svd_features_g{teacher_output.granularity}.npy"
+            np.save(features_path, full_features)
 
-        ply_path = adapter.scene_root / f"chorus_instance_result_g{teacher_output.granularity}.ply"
-        geometry_record = adapter.get_geometry_record()
-        save_labeled_mesh_ply(
-            source_ply_path=geometry_record.geometry_path,
-            labels=full_labels,
-            out_path=ply_path,
-        )
+            ply_path = adapter.scene_root / f"chorus_instance_result_g{teacher_output.granularity}.ply"
+            geometry_record = adapter.get_geometry_record()
+            save_labeled_mesh_ply(
+                source_ply_path=geometry_record.geometry_path,
+                labels=full_labels,
+                out_path=ply_path,
+            )
 
-        diagnostics_path = adapter.scene_root / f"diagnostics_g{teacher_output.granularity}.json"
-        save_json(
-            {
-                "stats": stats,
-                "intrinsic_metrics": intrinsic_metrics,
-                "labels_path": str(labels_path),
-                "features_path": str(features_path),
-                "ply_path": str(ply_path),
-            },
-            diagnostics_path,
-        )
+            diagnostics_path = adapter.scene_root / f"diagnostics_g{teacher_output.granularity}.json"
+            save_json(
+                {
+                    "stats": stats,
+                    "intrinsic_metrics": intrinsic_metrics,
+                    "labels_path": str(labels_path),
+                    "features_path": str(features_path),
+                    "ply_path": str(ply_path),
+                },
+                diagnostics_path,
+            )
 
     stats["intrinsic_metrics"] = intrinsic_metrics
     if diagnostics_path is not None:
         stats["diagnostics_path"] = str(diagnostics_path)
 
-    print(
+    log_progress(
         f"Project+Cluster complete: scene={adapter.scene_id}, granularity={teacher_output.granularity}, "
         f"clusters={stats['num_clusters']}, noise_fraction_seen={stats['noise_fraction_seen']:.3f}, "
         f"unseen_fraction={stats['unseen_points_fraction']:.3f}"

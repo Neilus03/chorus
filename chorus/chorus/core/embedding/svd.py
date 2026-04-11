@@ -5,6 +5,8 @@ from scipy.sparse import csr_matrix
 from sklearn.decomposition import TruncatedSVD
 from sklearn.preprocessing import normalize
 
+from chorus.common.progress import heartbeat, log_progress
+
 
 def compute_svd_features(
     point_mask_matrix: csr_matrix,
@@ -31,14 +33,27 @@ def compute_svd_features(
 
     effective_components = min(int(n_components), n_cols - 1)
     effective_components = max(1, effective_components)
+    nnz = int(point_mask_matrix.nnz)
+    density = float(nnz / max(n_rows * n_cols, 1))
 
-    #perform SVD on the point-mask matrix
+    log_progress(
+        "SVD input: "
+        f"rows={n_rows}, cols={n_cols}, nnz={nnz}, density={density:.6f}, "
+        f"requested_components={int(n_components)}, effective_components={effective_components}"
+    )
+
+    # perform SVD on the point-mask matrix
     svd = TruncatedSVD(n_components=effective_components, random_state=42)
-    features = svd.fit_transform(point_mask_matrix)
+    with heartbeat("SVD fit_transform"):
+        features = svd.fit_transform(point_mask_matrix)
     features = normalize(features, norm="l2", axis=1)
 
     stats = {
         "svd_components": int(effective_components),
         "explained_variance_sum": float(np.sum(svd.explained_variance_ratio_)),
     }
+    log_progress(
+        "SVD output: "
+        f"feature_shape={features.shape}, explained_variance_sum={stats['explained_variance_sum']:.4f}"
+    )
     return features, stats

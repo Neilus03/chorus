@@ -60,20 +60,20 @@ def _resolve_checkpoint_path(unsam_root: Path) -> Path:
     user = os.environ.get("USER", "nedela")
 
     default_scratch_ckpt = _resolve_path_for_env(
-        Path(f"/scratch2/{user}/chorus/checkpoints/unsamv2/unsamv2_plus_ckpt.pt")
+        Path(f"/scratch2/{user}/UnSAMv2/sam2/checkpoints/unsamv2/unsamv2_plus_ckpt.pt")
     )
 
     local_ckpt = unsam_root / "sam2" / "checkpoints" / "unsamv2_plus_ckpt.pt"
+    legacy_repo_ckpt = unsam_root / "checkpoints" / "unsamv2_plus_ckpt.pt"
+    
 
-    default_choice = (
-        default_scratch_ckpt
-        if default_scratch_ckpt.exists()
-        else (
-            legacy_poc_ckpt
-            if legacy_poc_ckpt.exists()
-            else (legacy_poc2_ckpt if legacy_poc2_ckpt.exists() else local_ckpt)
-        )
-    )
+    candidates = [
+        default_scratch_ckpt,
+        local_ckpt,
+        legacy_repo_ckpt,
+    ]
+
+    default_choice = next((p for p in candidates if p.exists()), local_ckpt)
 
     return Path(
         os.path.expandvars(
