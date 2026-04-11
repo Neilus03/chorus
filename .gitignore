@@ -18,3 +18,7 @@ poc3/
 chorus/logs/
 
 /chorus/chorus/datasets/scannetpp/data_download/
+
+student/logs/
+
+*.txt
