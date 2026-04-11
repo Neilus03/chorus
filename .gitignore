@@ -17,4 +17,4 @@ poc3/
 .chorus-venv/
 chorus/logs/
 
-chorus/datasets/scannetpp/data_download/
+/chorus/chorus/datasets/scannetpp/data_download/
