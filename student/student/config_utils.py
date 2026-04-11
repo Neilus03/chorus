@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import re
 from pathlib import Path
 from typing import Any
 
@@ -19,10 +20,47 @@ def set_seed(seed: int) -> None:
 
 
 def load_config(config_path: str | Path) -> dict[str, Any]:
+    import os
     import yaml
 
+    def _expand_env_in_str(s: str) -> str:
+        """
+        Expand env vars in strings.
+
+        Supports:
+          - $VAR / ${VAR} (via os.path.expandvars)
+          - ${VAR:-default} (bash-style default if unset/empty)
+        """
+        # First, handle ${VAR:-default} (os.path.expandvars doesn't support :-).
+        pattern = re.compile(r"\$\{([^}]+)\}")
+
+        def repl(m: re.Match[str]) -> str:
+            expr = m.group(1)
+            if ":-" in expr:
+                var, default = expr.split(":-", 1)
+                val = os.environ.get(var, "")
+                return val if val else default
+            return os.environ.get(expr, m.group(0))
+
+        out = pattern.sub(repl, s)
+        out = os.path.expandvars(out)
+        out = os.path.expanduser(out)
+        return out
+
+    def _expand(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: _expand(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_expand(v) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(_expand(v) for v in obj)
+        if isinstance(obj, str):
+            return _expand_env_in_str(obj)
+        return obj
+
     with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        cfg = yaml.safe_load(f) or {}
+    return _expand(cfg)
 
 
 def parse_granularities(data_cfg: dict[str, Any]) -> tuple[str, ...]:
