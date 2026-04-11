@@ -135,6 +135,11 @@ def main() -> None:
     parser.add_argument("--wandb-project", type=str, default="chorus-student")
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument(
+        "--wandb-offline",
+        action="store_true",
+        help="Log to Weights & Biases in offline mode (no network). Sync later with: wandb sync <run_dir>",
+    )
+    parser.add_argument(
         "--print-model", action="store_true",
         help="Log the full module tree after build.",
     )
@@ -151,6 +156,15 @@ def main() -> None:
         help="dotted key=value config overrides, e.g. train.lr=3e-4",
     )
     args = parser.parse_args()
+
+    wandb_mode_env = os.environ.get("WANDB_MODE", "").strip().lower()
+    wandb_offline = args.wandb_offline or wandb_mode_env in (
+        "offline",
+        "dryrun",
+        "dry-run",
+    )
+    if wandb_offline:
+        os.environ["WANDB_MODE"] = "offline"
 
     # Remap `cuda:K` -> visible GPU K as `cuda:0` when needed.
     # This mirrors run_student_remap_device.py behavior.
@@ -275,7 +289,7 @@ def main() -> None:
     use_wandb = not args.no_wandb and wandb is not None
     if use_wandb:
         run_name = args.wandb_name or exp_cfg.get("name", "multi_scene")
-        wandb.init(
+        init_kw: dict[str, Any] = dict(
             project=args.wandb_project,
             name=run_name,
             config={
@@ -287,6 +301,9 @@ def main() -> None:
             dir=str(out_dir),
             tags=["multi_scene", *granularities],
         )
+        if wandb_offline:
+            init_kw["settings"] = wandb.Settings(mode="offline")
+        wandb.init(**init_kw)
         wandb.define_metric("epoch")
         wandb.define_metric("global_step")
         wandb.define_metric("train/*", step_metric="epoch")
@@ -295,7 +312,13 @@ def main() -> None:
         wandb.define_metric("val_scene/*", step_metric="epoch")
         wandb.define_metric("train_eval/*", step_metric="epoch")
         wandb.define_metric("train_eval_scene/*", step_metric="epoch")
-        log.info("wandb run: %s", wandb.run.url)
+        if wandb_offline:
+            log.info(
+                "wandb offline — sync to the hub after the run: wandb sync %s",
+                wandb.run.dir,
+            )
+        else:
+            log.info("wandb run: %s", wandb.run.url)
     else:
         log.info("wandb disabled")
 

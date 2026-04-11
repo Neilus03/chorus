@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import sys
+import time
+print("0. Script started", flush=True)
+t0 = time.time()
+
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +26,33 @@ from chorus.datasets.scannet.evaluation import ScanNetEvaluationHooks
 from chorus.orchestrators.streaming import read_scene_ids, run_streaming_scannet
 from chorus.tracking.local_report import LocalTableReporter
 from chorus.tracking.wandb import WandbReporter
+print(f"3. Chorus imported in {time.time()-t0:.2f}s", flush=True)
+
+def _map_scratch2_to_euler_work(p: Path) -> Path:
+    """
+    Allow running both locally (often /scratch2/<user>/...) and on Euler
+    (/cluster/work/igp_psr/<user>/...) without hard-coding environment-specific paths.
+    This function performs a string-based mapping and avoids touching /scratch2 on
+    systems where it may be slow/unmounted.
+    """
+    user = os.environ.get("USER", "nedela")
+    s = str(p)
+    scratch_prefix = f"/scratch2/{user}"
+    euler_prefix = f"/cluster/work/igp_psr/{user}"
+    if s.startswith(scratch_prefix + "/"):
+        return Path(euler_prefix + s[len(scratch_prefix) :])
+    return p
+
+
+def _resolve_path_for_env(p: Path) -> Path:
+    """
+    Prefer an Euler work-path if p points at /scratch2/<user>/..., but fall back to
+    the original path when the mapped location doesn't exist.
+    """
+    mapped = _map_scratch2_to_euler_work(p)
+    if mapped != p and mapped.exists():
+        return mapped
+    return p
 
 
 class CombinedReporter:
@@ -190,6 +221,12 @@ def _parse_args() -> argparse.Namespace:
         help="Enable Weights & Biases reporting",
     )
     parser.add_argument(
+        "--no-wandb",
+        dest="wandb",
+        action="store_false",
+        help="Disable Weights & Biases reporting (recommended on clusters without outbound access)",
+    )
+    parser.add_argument(
         "--wandb-project",
         type=str,
         default="chorus",
@@ -204,7 +241,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--wandb-mode",
         type=str,
-        default="online",
+        default=os.environ.get("WANDB_MODE", os.environ.get("CHORUS_WANDB_MODE", "online")),
         help="W&B mode: online, offline, disabled",
     )
     parser.add_argument(
@@ -220,11 +257,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
 
-    scans_root = args.scans_root.resolve()
-    if not scans_root.exists() and "/scratch2/nedela" in str(scans_root):
-        euler_root = Path(str(scans_root).replace("/scratch2/nedela", "/cluster/work/igp_psr/nedela"))
-        if euler_root.exists():
-            scans_root = euler_root
+    scans_root = _resolve_path_for_env(args.scans_root.resolve())
     granularities = [float(g.strip()) for g in args.granularities.split(",") if g.strip()]
     scannet_eval_benchmarks = parse_scannet_eval_benchmarks(args.scannet_eval_benchmark)
     evaluation_hooks = ScanNetEvaluationHooks(scannet_eval_benchmarks)
@@ -232,7 +265,7 @@ def main() -> None:
     use_release_list = args.use_release_list
     if isinstance(use_release_list, str):
         local_path = Path(use_release_list)
-        euler_path = Path(use_release_list.replace("/scratch2/nedela", "/cluster/work/igp_psr/nedela"))
+        euler_path = _map_scratch2_to_euler_work(local_path)
         if args.scene_list_file is None:
             if local_path.exists():
                 args.scene_list_file = local_path
@@ -281,10 +314,11 @@ def main() -> None:
         report_dir=report_dir,
         extra_fieldnames=evaluation_hooks.scene_metric_fieldnames(),
     )
-    wandb_dir = args.wandb_dir
-    if not wandb_dir.exists() and "/scratch2/nedela" in str(wandb_dir):
-        euler_wandb = Path(str(wandb_dir).replace("/scratch2/nedela", "/cluster/work/igp_psr/nedela"))
-        wandb_dir = euler_wandb
+    wandb_dir = _resolve_path_for_env(args.wandb_dir)
+    if not wandb_dir.exists():
+        # Last-resort fallback: node-local scratch avoids network filesystem stalls.
+        wandb_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "chorus_wandb"
+        wandb_dir.mkdir(parents=True, exist_ok=True)
 
     wandb_reporter = WandbReporter(
         enabled=args.wandb,
