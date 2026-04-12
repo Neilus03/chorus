@@ -33,6 +33,9 @@ from chorus.datasets.scannetpp.prepare import (
     has_raw_scene_assets as scannetpp_has_raw_scene_assets,
     is_prepared as is_scannetpp_prepared,
 )
+from chorus.datasets.structured3d.adapter import Structured3DSceneAdapter
+from chorus.datasets.structured3d.benchmark import normalize_structured3d_eval_benchmark
+from chorus.datasets.structured3d.prepare import is_prepared as is_structured3d_prepared
 from chorus.eval.base import DatasetEvaluationHooks
 from chorus.orchestrators.cleanup import cleanup_scene_intermediates
 
@@ -356,6 +359,59 @@ def _build_scannetpp_availability_checker(
         )
 
     return _ensure_scannetpp_scene_available
+
+
+def read_structured3d_scene_ids(
+    scans_root: Path,
+    scene_list_file: Path | None = None,
+    max_scenes: int | None = None,
+) -> list[str]:
+    """Scene ids are directory names under ``scans_root`` (e.g. ``scene_00000``), or listed in a text file."""
+    return read_scene_ids(
+        scans_root=scans_root,
+        scene_list_file=scene_list_file,
+        max_scenes=max_scenes,
+        use_release_list=False,
+    )
+
+
+def enumerate_structured3d_scene_ids(start_index: int, count: int) -> list[str]:
+    """Return ``scene_{i:05d}`` for i in ``range(start_index, start_index + count)`` (no disk scan)."""
+    if count < 1:
+        return []
+    return [f"scene_{i:05d}" for i in range(start_index, start_index + count)]
+
+
+def _build_structured3d_availability_checker(raw_zips_dir: Path) -> SceneAvailabilityFn:
+    raw_zips_dir = Path(raw_zips_dir)
+
+    def _ensure_structured3d_scene_available(
+        scene_id: str,
+        scene_dir: Path,
+        scenes_root: Path,
+        auto_download_missing: bool,
+        max_download_retries: int,
+    ) -> tuple[bool, bool, int, list[str], str | None]:
+        del scene_id, scenes_root, max_download_retries, auto_download_missing
+        if is_structured3d_prepared(scene_dir):
+            return True, False, 0, [], None
+
+        if not raw_zips_dir.is_dir():
+            return False, False, 0, [], f"raw_zips_dir does not exist: {raw_zips_dir}"
+
+        perspective = sorted(raw_zips_dir.glob("*perspective_full*.zip"))
+        if len(perspective) == 0:
+            return (
+                False,
+                False,
+                0,
+                [],
+                f"No *perspective_full*.zip under {raw_zips_dir}; cannot run Structured3D prepare()",
+            )
+
+        return True, False, 0, [], None
+
+    return _ensure_structured3d_scene_available
 
 
 def run_streaming_dataset(
@@ -935,6 +991,68 @@ def run_streaming_scannetpp(
         reporter=reporter,
         run_summary_extra={
             "dataset_root": str(dataset_root),
+            "eval_benchmark": normalized_benchmark,
+        },
+        cleanup_raw_source_suffixes=(),
+    )
+
+
+def run_streaming_structured3d(
+    scans_root: Path,
+    raw_zips_dir: Path,
+    scene_ids: list[str],
+    teacher: TeacherModel,
+    granularities: list[float],
+    eval_benchmark: str | None = None,
+    frame_skip: int = 10,
+    svd_components: int = 32,
+    min_cluster_size: int = 100,
+    min_samples: int = 5,
+    cluster_selection_epsilon: float = 0.1,
+    run_oracle_eval: bool = True,
+    export_training_pack: bool = True,
+    overwrite_existing: bool = False,
+    continue_on_error: bool = True,
+    auto_download_missing: bool = True,
+    cleanup_after_success: bool = True,
+    download_only: bool = False,
+    max_download_retries: int = 3,
+    reporter: Any | None = None,
+) -> dict[str, Any]:
+    scans_root = Path(scans_root)
+    raw_zips_dir = Path(raw_zips_dir)
+    normalized_benchmark = normalize_structured3d_eval_benchmark(eval_benchmark)
+    raw_zips_str = str(raw_zips_dir)
+
+    return run_streaming_dataset(
+        dataset_name="structured3d",
+        scenes_root=scans_root,
+        scene_ids=scene_ids,
+        teacher=teacher,
+        granularities=granularities,
+        adapter_factory=lambda scene_dir: Structured3DSceneAdapter(
+            scene_root=scene_dir,
+            raw_zips_dir=raw_zips_str,
+            eval_benchmark=normalized_benchmark,
+        ),
+        ensure_scene_available=_build_structured3d_availability_checker(raw_zips_dir=raw_zips_dir),
+        frame_skip=frame_skip,
+        svd_components=svd_components,
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        cluster_selection_epsilon=cluster_selection_epsilon,
+        run_oracle_eval=run_oracle_eval,
+        export_training_pack=export_training_pack,
+        overwrite_existing=overwrite_existing,
+        continue_on_error=continue_on_error,
+        auto_download_missing=auto_download_missing,
+        cleanup_after_success=cleanup_after_success,
+        download_only=download_only,
+        max_download_retries=max_download_retries,
+        reporter=reporter,
+        run_summary_extra={
+            "scans_root": str(scans_root),
+            "raw_zips_dir": str(raw_zips_dir),
             "eval_benchmark": normalized_benchmark,
         },
         cleanup_raw_source_suffixes=(),
