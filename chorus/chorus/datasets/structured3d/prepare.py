@@ -45,6 +45,18 @@ def prepare_structured3d_scene(scene_id: str, raw_zips_dir: str, output_scans_ro
             "Expected files matching '*perspective_full*.zip'."
         )
 
+    # Official release puts per-pixel instance.png under Structured3D_bbox.zip, not in
+    # perspective_full_*.zip (RGB/depth/semantic only). Merge bbox so prepare can fuse GT.
+    bbox_zip = os.path.join(raw_zips_dir, "Structured3D_bbox.zip")
+    if os.path.isfile(bbox_zip):
+        zip_files.append(bbox_zip)
+    else:
+        print(
+            "Warning: Structured3D_bbox.zip not found in raw_zips_dir; "
+            "instance masks will be unavailable and gt_instance_ids.npy will not be written. "
+            "Download Structured3D_bbox.zip from the official Structured3D distribution."
+        )
+
     reader = Structured3DReader(zip_files)
 
     color_dir = scene_dir / "color"

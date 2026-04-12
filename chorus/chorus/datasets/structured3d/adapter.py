@@ -8,13 +8,21 @@ import open3d as o3d
 
 from chorus.common.types import FrameRecord, GeometryRecord, VisibilityConfig
 from chorus.datasets.base import SceneAdapter
+from chorus.eval.base import DatasetEvaluationHooks
+from chorus.datasets.structured3d.benchmark import normalize_structured3d_eval_benchmark
 from chorus.datasets.structured3d.prepare import is_prepared, prepare_structured3d_scene
 
 
 class Structured3DSceneAdapter(SceneAdapter):
-    def __init__(self, scene_root: Path, raw_zips_dir: str = "/scratch2/nedela/structured3d_raw"):
+    def __init__(
+        self,
+        scene_root: Path,
+        raw_zips_dir: str = "/scratch2/nedela/structured3d_raw",
+        eval_benchmark: str | None = None,
+    ):
         super().__init__(scene_root=scene_root)
         self.raw_zips_dir = raw_zips_dir
+        self.eval_benchmark = normalize_structured3d_eval_benchmark(eval_benchmark)
 
     @property
     def dataset_name(self) -> str:
@@ -130,4 +138,9 @@ class Structured3DSceneAdapter(SceneAdapter):
         if not path.exists():
             return None
         return np.load(path)
+
+    def get_evaluation_hooks(self) -> DatasetEvaluationHooks:
+        from chorus.datasets.structured3d.evaluation import Structured3DEvaluationHooks
+
+        return Structured3DEvaluationHooks(self.eval_benchmark)
 
