@@ -112,7 +112,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-oracle-eval",
         action="store_true",
-        help="Disable ScanNet oracle evaluation",
+        help="Disable dataset oracle evaluation (ScanNet / ScanNet++ / Structured3D)",
     )
     parser.add_argument(
         "--no-export-training-pack",
@@ -133,6 +133,12 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=os.environ.get("CHORUS_STRUCTURED3D_RAW_ZIPS_DIR", "/scratch2/nedela/structured3d_raw"),
         help="Structured3D raw ZIP directory (only used when --dataset structured3d).",
+    )
+    parser.add_argument(
+        "--structured3d-eval-benchmark",
+        type=str,
+        default=os.environ.get("CHORUS_STRUCTURED3D_EVAL_BENCHMARK", "structured3d_full"),
+        help="Structured3D oracle output suffix (only used when --dataset structured3d).",
     )
     parser.add_argument(
         "--scannetpp-eval-benchmark",
@@ -192,9 +198,9 @@ def _run(args: argparse.Namespace) -> None:
         adapter = Structured3DSceneAdapter(
             scene_root=args.scene_dir,
             raw_zips_dir=args.structured3d_raw_zips_dir,
+            eval_benchmark=args.structured3d_eval_benchmark,
         )
-        # Oracle evaluation is ScanNet-specific.
-        run_oracle_eval = False
+        run_oracle_eval = not args.no_oracle_eval
     elif args.dataset == "scannetpp":
         from chorus.datasets.scannetpp.adapter import ScanNetPPSceneAdapter
 

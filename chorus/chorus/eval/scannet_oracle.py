@@ -350,6 +350,15 @@ def evaluate_and_save_scannet_oracle(
             raise RuntimeError(
                 f"Oracle evaluation for dataset '{adapter.dataset_name}' requires GT instance ids."
             )
+        if adapter.dataset_name == "structured3d":
+            n_gt = int(gt_ids.shape[0])
+            for co in cluster_outputs:
+                if len(co.labels) != n_gt:
+                    raise RuntimeError(
+                        f"Structured3D oracle: len(gt_instance_ids)={n_gt} but cluster labels "
+                        f"len={len(co.labels)} at granularity {co.granularity}. "
+                        "Regenerate the prepared scene or verify mesh vs cluster indexing."
+                    )
 
     proposals, proposal_sources = build_proposals_from_cluster_outputs(cluster_outputs)
     if len(proposals) == 0:
