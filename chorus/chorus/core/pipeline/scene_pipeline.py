@@ -51,6 +51,9 @@ def run_scene_pipeline(
         cluster_outputs.append(cluster_output)
 
     scene_intrinsic_metrics = compute_scene_intrinsic_metrics(cluster_outputs)
+    clustering_backend = None
+    if cluster_outputs:
+        clustering_backend = cluster_outputs[0].stats.get("hdbscan_backend")
 
     evaluation_hooks = adapter.get_evaluation_hooks()
     evaluation_summary = None
@@ -71,6 +74,7 @@ def run_scene_pipeline(
                 projection_type="zbuffer_rgbd",
                 embedding_type="truncated_svd",
                 clustering_type="hdbscan",
+                clustering_backend=clustering_backend,
                 frame_skip=frame_skip,
                 scene_intrinsic_metrics=scene_intrinsic_metrics,
             )
@@ -79,6 +83,8 @@ def run_scene_pipeline(
         "dataset": adapter.dataset_name,
         "scene_id": adapter.scene_id,
         "granularities": granularities,
+        "clustering_type": "hdbscan",
+        "clustering_backend": clustering_backend,
         "teacher_outputs": [
             {
                 "granularity": float(t.granularity),
