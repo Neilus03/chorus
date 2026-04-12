@@ -9,7 +9,7 @@ Downstream code receives a structured :class:`LitePTBackboneOutput`::
     bb.scene_xyz     # [V, 3]  voxel centroids
     bb.inverse_map   # [N]     point → voxel index
 
-By default the backbone is **LitePT-S\*** (ScanNet instance-seg architecture from
+By default the backbone is **LitePT-S*** (ScanNet instance-seg architecture from
 ``configs/scannet/insseg-litept-small-v1m2.py``): deeper decoder
 ``dec_depths=(2, 2, 2, 2)`` vs LitePT-S where ``dec_depths=(0, 0, 0, 0)``. Use
 ``litept_variant="litept_s"`` only for checkpoints trained with the shallow decoder.
@@ -88,13 +88,16 @@ class LitePTBackboneOutput:
     scene_tokens: torch.Tensor  # [V, C] sparse voxel features (finest scale)
     scene_xyz: torch.Tensor     # [V, 3] voxel centroids (finest scale)
     inverse_map: torch.Tensor   # [N]    maps points → voxel token index
+    point_offsets: torch.Tensor = field(default_factory=lambda: torch.zeros(0, dtype=torch.long))
+    scene_token_offsets: torch.Tensor = field(default_factory=lambda: torch.zeros(0, dtype=torch.long))
 
     multi_scale_tokens: list[torch.Tensor] = field(default_factory=list)
     multi_scale_xyz: list[torch.Tensor] = field(default_factory=list)
+    multi_scale_offsets: list[torch.Tensor] = field(default_factory=list)
 
 
 class LitePTBackbone(nn.Module):
-    """Wraps :class:`litept.model.LitePT` for single-scene use.
+    """Wraps :class:`litept.model.LitePT` for single- or multi-scene use.
 
     Parameters
     ----------
@@ -147,12 +150,12 @@ class LitePTBackbone(nn.Module):
         self.out_channels: int = 72
 
         self._cached_voxelization: (
-            tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None
+            tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor] | None
         ) = None
 
         #  multi-scale decoder feature capture 
         self._multi_scale = bool(multi_scale)
-        self._captured: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._captured: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self._multi_scale_channels: list[int] = []
 
         if self._multi_scale and hasattr(self.model, "dec"):
@@ -168,7 +171,12 @@ class LitePTBackbone(nn.Module):
     def _make_hook(self, scale_idx: int):
         """Return a forward hook that captures (feat, coord) from a decoder substage."""
         def hook(module, input, output):
-            self._captured[scale_idx] = (output.feat, output.coord)
+            offset = getattr(
+                output,
+                "offset",
+                torch.tensor([output.feat.shape[0]], device=output.feat.device, dtype=torch.long),
+            )
+            self._captured[scale_idx] = (output.feat, output.coord, offset)
         return hook
 
     @property
@@ -212,7 +220,33 @@ class LitePTBackbone(nn.Module):
 
     # ------------------------------------------------------------------ #
 
-    def _voxelize(
+    def _normalize_offsets(
+        self,
+        point_offsets: torch.Tensor | None,
+        *,
+        num_points: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if point_offsets is None:
+            return torch.tensor([num_points], device=device, dtype=torch.long)
+
+        offsets = point_offsets.to(device=device, dtype=torch.long).flatten()
+        if offsets.numel() == 0:
+            raise ValueError("point_offsets must contain at least one scene")
+        if int(offsets[-1].item()) != num_points:
+            raise ValueError(
+                f"point_offsets[-1]={int(offsets[-1].item())} but coord has {num_points} points"
+            )
+        prev = 0
+        for end in offsets.tolist():
+            if end <= prev:
+                raise ValueError(
+                    f"point_offsets must be strictly increasing, got {offsets.tolist()}"
+                )
+            prev = end
+        return offsets
+
+    def _voxelize_single(
         self,
         coord: torch.Tensor,
         feat: torch.Tensor,
@@ -260,10 +294,51 @@ class LitePTBackbone(nn.Module):
 
     # ------------------------------------------------------------------ #
 
+    def _voxelize_batched(
+        self,
+        coord: torch.Tensor,
+        feat: torch.Tensor,
+        point_offsets: torch.Tensor,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Voxelize a concatenated multi-scene batch while preserving boundaries."""
+        inverse = torch.empty(coord.shape[0], device=coord.device, dtype=torch.long)
+        grid_parts: list[torch.Tensor] = []
+        xyz_parts: list[torch.Tensor] = []
+        feat_parts: list[torch.Tensor] = []
+        voxel_offsets: list[int] = []
+
+        start = 0
+        voxel_base = 0
+        for end in point_offsets.tolist():
+            scene_coord = coord[start:end]
+            scene_feat = feat[start:end]
+            point_dict, scene_inverse, scene_xyz = self._voxelize_single(scene_coord, scene_feat)
+
+            grid_parts.append(point_dict["grid_coord"])
+            xyz_parts.append(scene_xyz)
+            feat_parts.append(point_dict["feat"])
+            inverse[start:end] = scene_inverse + voxel_base
+
+            voxel_base += int(scene_xyz.shape[0])
+            voxel_offsets.append(voxel_base)
+            start = end
+
+        scene_xyz = torch.cat(xyz_parts, dim=0)
+        point_dict = {
+            "coord": scene_xyz,
+            "grid_coord": torch.cat(grid_parts, dim=0),
+            "feat": torch.cat(feat_parts, dim=0),
+            "offset": torch.tensor(voxel_offsets, device=coord.device, dtype=torch.long),
+        }
+        return point_dict, inverse, scene_xyz, point_dict["offset"]
+
+    # ------------------------------------------------------------------ #
+
     def forward(
         self,
         coord: torch.Tensor,
         feat: torch.Tensor,
+        point_offsets: torch.Tensor | None = None,
     ) -> LitePTBackboneOutput:
         """Run LitePT and return structured backbone output.
 
@@ -280,13 +355,32 @@ class LitePTBackbone(nn.Module):
         decoder features in coarse → fine order.
         """
         coord, feat = self._normalize_inputs(coord, feat)
+        point_offsets_t = self._normalize_offsets(
+            point_offsets,
+            num_points=coord.shape[0],
+            device=coord.device,
+        )
+        batched = point_offsets_t.numel() > 1
 
-        if self._cached_voxelization is not None and self.training:
-            point_dict, inverse, scene_xyz = self._cached_voxelization
+        if self._cached_voxelization is not None and self.training and not batched:
+            point_dict, inverse, scene_xyz, scene_token_offsets = self._cached_voxelization
         else:
-            point_dict, inverse, scene_xyz = self._voxelize(coord, feat)
-            if self.training:
-                self._cached_voxelization = (point_dict, inverse, scene_xyz)
+            if batched:
+                point_dict, inverse, scene_xyz, scene_token_offsets = self._voxelize_batched(
+                    coord,
+                    feat,
+                    point_offsets_t,
+                )
+            else:
+                point_dict, inverse, scene_xyz = self._voxelize_single(coord, feat)
+                scene_token_offsets = point_dict["offset"]
+                if self.training:
+                    self._cached_voxelization = (
+                        point_dict,
+                        inverse,
+                        scene_xyz,
+                        scene_token_offsets,
+                    )
 
         self._captured.clear()
 
@@ -294,14 +388,17 @@ class LitePTBackbone(nn.Module):
 
         scene_tokens = out.feat          # [V, C]
         point_feat = scene_tokens[inverse]  # [N, C]
+        scene_token_offsets = getattr(out, "offset", scene_token_offsets)
 
         ms_tokens: list[torch.Tensor] = []
         ms_xyz: list[torch.Tensor] = []
+        ms_offsets: list[torch.Tensor] = []
         if self._multi_scale and self._captured:
             for i in sorted(self._captured.keys()):
-                cap_feat, cap_coord = self._captured[i]
+                cap_feat, cap_coord, cap_offset = self._captured[i]
                 ms_tokens.append(cap_feat)
                 ms_xyz.append(cap_coord)
+                ms_offsets.append(cap_offset)
 
         return LitePTBackboneOutput(
             point_feat=point_feat,
@@ -309,6 +406,9 @@ class LitePTBackbone(nn.Module):
             scene_tokens=scene_tokens,
             scene_xyz=scene_xyz,
             inverse_map=inverse,
+            point_offsets=point_offsets_t,
+            scene_token_offsets=scene_token_offsets,
             multi_scale_tokens=ms_tokens,
             multi_scale_xyz=ms_xyz,
+            multi_scale_offsets=ms_offsets,
         )

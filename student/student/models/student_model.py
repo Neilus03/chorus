@@ -11,6 +11,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from student.data.batched_scene_batch import split_tensor_by_offsets
 from student.models.litept_wrapper import LitePTBackbone, LitePTBackboneOutput
 from student.models.instance_decoder import MultiHeadQueryInstanceDecoder
 
@@ -58,7 +59,9 @@ class StudentInstanceSegModel(nn.Module):
         self,
         points: torch.Tensor,
         features: torch.Tensor,
-    ) -> dict:
+        *,
+        point_offsets: torch.Tensor | None = None,
+    ) -> dict | list[dict]:
         """
         Parameters
         ----------
@@ -74,15 +77,62 @@ class StudentInstanceSegModel(nn.Module):
                 g05: {mask_logits, score_logits, query_embed}
                 g08: {mask_logits, score_logits, query_embed}
         """
-        bb: LitePTBackboneOutput = self.backbone(points, features)
-        return self.decoder(
-            point_feat=bb.point_feat,
-            point_xyz=bb.point_xyz,
-            scene_tokens=bb.scene_tokens,
-            scene_xyz=bb.scene_xyz,
-            multi_scale_tokens=bb.multi_scale_tokens or None,
-            multi_scale_xyz=bb.multi_scale_xyz or None,
+        bb: LitePTBackboneOutput = self.backbone(
+            points,
+            features,
+            point_offsets=point_offsets,
         )
+        if bb.point_offsets.numel() <= 1:
+            return self.decoder(
+                point_feat=bb.point_feat,
+                point_xyz=bb.point_xyz,
+                scene_tokens=bb.scene_tokens,
+                scene_xyz=bb.scene_xyz,
+                multi_scale_tokens=bb.multi_scale_tokens or None,
+                multi_scale_xyz=bb.multi_scale_xyz or None,
+            )
+
+        point_feats = split_tensor_by_offsets(bb.point_feat, bb.point_offsets)
+        point_xyzs = split_tensor_by_offsets(bb.point_xyz, bb.point_offsets)
+        scene_tokens = split_tensor_by_offsets(
+            bb.scene_tokens,
+            bb.scene_token_offsets,
+        )
+        scene_xyzs = split_tensor_by_offsets(
+            bb.scene_xyz,
+            bb.scene_token_offsets,
+        )
+
+        split_multi_scale_tokens = [
+            split_tensor_by_offsets(tokens, offsets)
+            for tokens, offsets in zip(bb.multi_scale_tokens, bb.multi_scale_offsets)
+        ]
+        split_multi_scale_xyz = [
+            split_tensor_by_offsets(xyz, offsets)
+            for xyz, offsets in zip(bb.multi_scale_xyz, bb.multi_scale_offsets)
+        ]
+
+        outputs: list[dict] = []
+        for scene_idx in range(bb.point_offsets.numel()):
+            multi_scale_tokens = (
+                [tokens[scene_idx] for tokens in split_multi_scale_tokens]
+                if split_multi_scale_tokens
+                else None
+            )
+            multi_scale_xyz = (
+                [xyz[scene_idx] for xyz in split_multi_scale_xyz]
+                if split_multi_scale_xyz
+                else None
+            )
+            outputs.append(self.decoder(
+                point_feat=point_feats[scene_idx],
+                point_xyz=point_xyzs[scene_idx],
+                scene_tokens=scene_tokens[scene_idx],
+                scene_xyz=scene_xyzs[scene_idx],
+                multi_scale_tokens=multi_scale_tokens,
+                multi_scale_xyz=multi_scale_xyz,
+            ))
+        return outputs
 
 
 def build_student_model(
