@@ -14,6 +14,12 @@ from student.data.multi_scene_dataset import (
     MultiSceneDataset,
     build_scene_list,
 )
+from student.data.batched_scene_batch import (
+    BatchedMultiSceneSample,
+    collate_multi_scene_samples,
+)
+from student.data.distributed_scene_sampler import BalancedDistributedSceneSampler
+from student.data.scene_batch_sampler import SceneBatchSampler
 
 __all__ = [
     "load_training_pack_scene",
@@ -24,4 +30,8 @@ __all__ = [
     "build_instance_targets_multi",
     "MultiSceneDataset",
     "build_scene_list",
+    "BatchedMultiSceneSample",
+    "collate_multi_scene_samples",
+    "BalancedDistributedSceneSampler",
+    "SceneBatchSampler",
 ]
