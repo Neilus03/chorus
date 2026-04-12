@@ -1,3 +1,6 @@
+# Older single-GPU 100/10 preset. For DDP-4 + batched scenes + Pointcept-style sphere crops use:
+#   configs/scannet_train100_val10_aug_ddp4_batched_pointcept.yaml
+
 experiment:
   name: multi_scene_100_10
   seed: 42
