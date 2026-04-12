@@ -37,6 +37,7 @@ def build_instance_targets(
     *,
     min_instance_points: int = 1,
     ignore_label: int = -1,
+    dense_instance_ids: bool = False,
 ) -> InstanceTargets:
     """Build per-instance binary masks from per-point pseudo-labels.
 
@@ -51,6 +52,10 @@ def build_instance_targets(
         Drop instances with fewer supervised points than this.
     ignore_label:
         Sentinel value for unlabeled points.
+    dense_instance_ids:
+        If True, store contiguous instance ids ``0 .. M-1`` (one per kept
+        instance) instead of raw pseudo-label values.  Metrics that add 1 to
+        ``instance_ids`` then yield per-point labels ``1 .. M``.
 
     Returns
     -------
@@ -101,6 +106,7 @@ def build_instance_targets_multi(
     *,
     min_instance_points: int = 1,
     ignore_label: int = -1,
+    dense_instance_ids: bool = False,
 ) -> dict[str, InstanceTargets]:
     """Build per-instance targets for each granularity.
 
@@ -116,6 +122,7 @@ def build_instance_targets_multi(
             supervision_mask,
             min_instance_points=min_instance_points,
             ignore_label=ignore_label,
+            dense_instance_ids=dense_instance_ids,
         )
         for g, labels in labels_by_granularity.items()
     }

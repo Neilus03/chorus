@@ -17,8 +17,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from student.data.region_sampling import sphere_crop_indices
 from student.data.training_pack import (
     MultiGranTrainingPackScene,
+    _load_scene_meta,
     _resolve_pack_dir,
     load_training_pack_scene_multi,
 )
@@ -97,10 +99,16 @@ class MultiSceneDataset(Dataset):
         Load all scenes into memory at init time.  Recommended for
         small-scale experiments (10–20 scenes).
     max_points:
-        If set, each ``__getitem__`` randomly subsamples at most this many
-        points (same indices for points, features, labels, masks).  Use when
-        full scenes exceed GPU memory — decoder cross-attention cost grows with
-        scene size.
+        If set, caps the number of points per ``__getitem__`` (same indices for
+        points, features, labels, masks).  Ignored when *subsampling_mode* is
+        ``"none"`` and neither *max_points* nor *sphere_point_max* applies.
+    subsampling_mode:
+        ``"sphere_crop"`` (default): Point-style sphere around a random point,
+        keep nearest *cap* points.  ``"randperm"``: legacy global random subset.
+        ``"none"``: never subsample (full scene each step; needs enough GPU RAM).
+    sphere_point_max:
+        Optional override for the sphere crop size; defaults to *max_points*
+        when unset.
     train_augmentations:
         If True, apply LitePT ScanNet-style geometric and (when colors are used)
         chromatic jitter on **training** samples only.  Ignores precomputed
@@ -116,6 +124,8 @@ class MultiSceneDataset(Dataset):
         append_xyz: bool = False,
         preload: bool = True,
         max_points: int | None = None,
+        subsampling_mode: str = "sphere_crop",
+        sphere_point_max: int | None = None,
         train_augmentations: bool = False,
     ) -> None:
         super().__init__()
@@ -124,9 +134,24 @@ class MultiSceneDataset(Dataset):
         self._use_colors = use_colors
         self._append_xyz = append_xyz
         self._max_points = max_points
+        self._subsampling_mode = subsampling_mode
+        self._sphere_point_max = sphere_point_max
         self._train_augmentations = bool(train_augmentations)
         self._scenes: list[MultiGranTrainingPackScene] = []
+        self._scene_point_counts: list[int] = []
         self._features_cache: list[np.ndarray] | None = [] if not train_augmentations else None
+
+        if self._subsampling_mode not in ("sphere_crop", "randperm", "none"):
+            raise ValueError(
+                f"subsampling_mode must be 'sphere_crop', 'randperm', or 'none', "
+                f"got {self._subsampling_mode!r}",
+            )
+        if self._subsampling_mode == "none" and (
+            self._max_points is not None or self._sphere_point_max is not None
+        ):
+            log.warning(
+                "subsampling_mode=none: ignoring max_points / sphere_point_max (full scenes)",
+            )
 
         if self._train_augmentations:
             try:
@@ -142,6 +167,14 @@ class MultiSceneDataset(Dataset):
                     "flip, jitter, elastic, chromatic)",
                 )
 
+        self._output_cap: int | None
+        if self._sphere_point_max is not None:
+            self._output_cap = int(self._sphere_point_max)
+        elif self._max_points is not None:
+            self._output_cap = int(self._max_points)
+        else:
+            self._output_cap = None
+
         if preload:
             for sd in self._scene_dirs:
                 scene = load_training_pack_scene_multi(sd, granularities)
@@ -150,6 +183,10 @@ class MultiSceneDataset(Dataset):
                     use_colors=use_colors, append_xyz=append_xyz,
                 )
                 self._scenes.append(scene)
+                effective_points = scene.num_points
+                if self._output_cap is not None:
+                    effective_points = min(effective_points, self._output_cap)
+                self._scene_point_counts.append(int(effective_points))
                 if self._features_cache is not None:
                     self._features_cache.append(feats)
                 log.info(
@@ -159,11 +196,44 @@ class MultiSceneDataset(Dataset):
                     feats.shape[1],
                     " (features rebuilt each step — augmentations on)" if self._train_augmentations else "",
                 )
+        else:
+            for sd in self._scene_dirs:
+                meta = _load_scene_meta(_resolve_pack_dir(sd))
+                effective_points = int(meta["num_points"])
+                if self._output_cap is not None:
+                    effective_points = min(effective_points, self._output_cap)
+                self._scene_point_counts.append(effective_points)
 
     def __len__(self) -> int:
         return len(self._scene_dirs)
 
-    def __getitem__(self, idx: int) -> dict[str, Any]:
+    def _should_subsample(self) -> bool:
+        if self._subsampling_mode == "none":
+            return False
+        return self._output_cap is not None
+
+    def _subsample_indices(self, n: int, points_np: np.ndarray) -> torch.Tensor:
+        cap = self._output_cap
+        assert cap is not None
+        if n <= cap:
+            return torch.arange(n, dtype=torch.long)
+
+        if self._subsampling_mode == "randperm":
+            return torch.randperm(n)[:cap]
+
+        if self._subsampling_mode == "sphere_crop":
+            assert self._output_cap is not None
+            rng = np.random.default_rng()
+            idx_np = sphere_crop_indices(
+                np.asarray(points_np, dtype=np.float32),
+                rng=rng,
+                point_max=int(self._output_cap),
+            )
+            return torch.from_numpy(idx_np).long()
+
+        raise RuntimeError(f"Unhandled subsampling_mode={self._subsampling_mode!r}")
+
+    def _compose_item(self, idx: int, *, subsample: bool) -> dict[str, Any]:
         if idx < 0 or idx >= len(self):
             raise IndexError(idx)
 
@@ -215,16 +285,18 @@ class MultiSceneDataset(Dataset):
         sup_t = torch.from_numpy(scene.supervision_mask).bool()
 
         n = points_t.shape[0]
-        if self._max_points is not None and n > self._max_points:
-            idx = torch.randperm(n)[: self._max_points]
-            points_t = points_t[idx]
-            features_t = features_t[idx]
-            valid_t = valid_t[idx]
-            seen_t = seen_t[idx]
-            sup_t = sup_t[idx]
-            labels_by_gran = {g: labels_by_gran[g][idx] for g in self._granularities}
+        vertex_indices: torch.Tensor | None = None
+        if subsample and self._should_subsample():
+            idx_t = self._subsample_indices(n, np.asarray(points_np, dtype=np.float32))
+            vertex_indices = idx_t.clone()
+            points_t = points_t[idx_t]
+            features_t = features_t[idx_t]
+            valid_t = valid_t[idx_t]
+            seen_t = seen_t[idx_t]
+            sup_t = sup_t[idx_t]
+            labels_by_gran = {g: labels_by_gran[g][idx_t] for g in self._granularities}
 
-        return {
+        out: dict[str, Any] = {
             "scene_id": scene.scene_id,
             "scene_dir": str(scene.scene_dir),
             "points": points_t,
@@ -236,6 +308,19 @@ class MultiSceneDataset(Dataset):
             "scene_meta": scene.scene_meta,
             "granularities": self._granularities,
         }
+        if vertex_indices is not None:
+            out["vertex_indices"] = vertex_indices
+        return out
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        return self._compose_item(idx, subsample=True)
+
+    def get_full_item(self, idx: int) -> dict[str, Any]:
+        """Same as ``__getitem__`` but without point subsampling (full scene).
+
+        For optional fragment-based evaluation that needs the full vertex list.
+        """
+        return self._compose_item(idx, subsample=False)
 
     @property
     def scene_ids(self) -> list[str]:
@@ -243,6 +328,11 @@ class MultiSceneDataset(Dataset):
         if self._scenes:
             return [s.scene_id for s in self._scenes]
         return [d.name for d in self._scene_dirs]
+
+    @property
+    def scene_point_counts(self) -> list[int]:
+        """Effective point counts after optional max-point clipping."""
+        return list(self._scene_point_counts)
 
 
 # ── smoke test ───────────────────────────────────────────────────────────
