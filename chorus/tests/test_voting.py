@@ -195,6 +195,9 @@ def test_run_project_cluster_stage_keeps_zero_vote_points_unseen_and_unlabeled(
         pose_c2w=np.eye(4, dtype=np.float32),
     )
     adapter.scene_root.mkdir(parents=True, exist_ok=True)
+    feature_dir = tmp_path / "feature_cache"
+    monkeypatch.setenv("CHORUS_SAVE_HDBSCAN_FEATURES", "1")
+    monkeypatch.setenv("CHORUS_HDBSCAN_FEATURES_DIR", str(feature_dir))
 
     mask = np.array(
         [
@@ -247,6 +250,12 @@ def test_run_project_cluster_stage_keeps_zero_vote_points_unseen_and_unlabeled(
     assert result.stats["unseen_points"] == 1
     assert result.stats["num_labeled_points"] == 2
     assert result.stats["num_noise_points_seen"] == 0
+    assert Path(result.stats["hdbscan_features_path"]).exists()
+    assert Path(result.stats["hdbscan_features_meta_path"]).exists()
+    np.testing.assert_array_equal(
+        np.load(result.stats["hdbscan_features_path"]),
+        np.array([[1.0], [1.0]], dtype=np.float32),
+    )
 
 
 def test_export_training_scene_pack_excludes_unseen_points_from_valid_points(
@@ -314,6 +323,7 @@ def test_export_training_scene_pack_excludes_unseen_points_from_valid_points(
     assert scene_meta["coordinate_units"] == "meters"
     assert scene_meta["coordinate_frame"] == "scene-level geometry coordinates from the dataset adapter"
     assert scene_meta["point_source"] == "mesh_vertices"
+    assert scene_meta["clustering_backend"] is None
     assert scene_meta["label_convention"]["ignore_unlabeled"] == -1
     assert scene_meta["optional_files_present"]["colors.npy"] is False
     assert "valid_points" in scene_meta["supervision_mask_definition"]
