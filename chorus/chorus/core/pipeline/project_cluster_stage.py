@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import cv2
@@ -23,6 +24,59 @@ def _resize_depth_to_mask_shape(depth_map_m: np.ndarray, mask_shape: tuple[int, 
     if depth_map_m.shape == (target_h, target_w):
         return depth_map_m
     return cv2.resize(depth_map_m, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+
+
+def _env_flag_enabled(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _maybe_save_hdbscan_features(
+    *,
+    adapter: SceneAdapter,
+    granularity: float,
+    features_seen: np.ndarray,
+    min_cluster_size: int,
+    min_samples: int,
+    cluster_selection_epsilon: float,
+) -> dict[str, str]:
+    if not _env_flag_enabled("CHORUS_SAVE_HDBSCAN_FEATURES", default=False):
+        return {}
+
+    output_dir_raw = os.environ.get("CHORUS_HDBSCAN_FEATURES_DIR")
+    output_dir = Path(output_dir_raw) if output_dir_raw else (adapter.scene_root / "benchmark_artifacts")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = f"hdbscan_features_scene_{adapter.scene_id}_g{granularity}"
+    features_path = output_dir / f"{stem}.npy"
+    meta_path = output_dir / f"{stem}.json"
+
+    np.save(features_path, features_seen)
+    save_json(
+        {
+            "dataset": adapter.dataset_name,
+            "scene_id": adapter.scene_id,
+            "granularity": float(granularity),
+            "features_path": str(features_path),
+            "num_samples": int(features_seen.shape[0]),
+            "num_features": int(features_seen.shape[1]) if features_seen.ndim > 1 else 1,
+            "dtype": str(features_seen.dtype),
+            "min_cluster_size": int(min_cluster_size),
+            "min_samples": int(min_samples),
+            "cluster_selection_epsilon": float(cluster_selection_epsilon),
+        },
+        meta_path,
+    )
+    log_progress(
+        "Saved HDBSCAN benchmark features: "
+        f"scene={adapter.scene_id}, granularity={granularity}, path={features_path}"
+    )
+    return {
+        "hdbscan_features_path": str(features_path),
+        "hdbscan_features_meta_path": str(meta_path),
+    }
 
 
 def run_project_cluster_stage(
@@ -129,6 +183,14 @@ def run_project_cluster_stage(
         point_mask_matrix=point_mask_matrix_seen,
         n_components=svd_components,
     )
+    feature_artifacts = _maybe_save_hdbscan_features(
+        adapter=adapter,
+        granularity=teacher_output.granularity,
+        features_seen=features_seen,
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        cluster_selection_epsilon=cluster_selection_epsilon,
+    )
 
     labels_seen, clustering_stats = cluster_features(
         features_seen,
@@ -169,6 +231,7 @@ def run_project_cluster_stage(
         "noise_fraction_all_points": float(num_noise_points_seen / max(num_points, 1)),
         **voting_stats,
         **svd_stats,
+        **feature_artifacts,
         **clustering_stats,
     }
 
