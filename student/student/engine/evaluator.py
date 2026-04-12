@@ -179,6 +179,7 @@ def evaluate_student_predictions(
     mask_threshold: float = 0.5,
     min_points: int = 30,
     eval_benchmark: str = "scannet200",
+    vertex_indices: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Full evaluation of student predictions.
 
@@ -237,12 +238,35 @@ def evaluate_student_predictions(
             scene_dir, scene_id, eval_benchmark=eval_benchmark,
         )
 
-        if real_gt.shape[0] != N:
+        real_gt_error: str | None = None
+        if vertex_indices is not None:
+            vi = vertex_indices.detach().cpu().numpy().astype(np.int64, copy=False)
+            if vi.shape[0] != N:
+                log.warning(
+                    "  vertex_indices length %d != model point count %d, skipping real GT eval",
+                    vi.shape[0], N,
+                )
+                real_gt_error = "vertex_indices length mismatch"
+            elif vi.size > 0 and (
+                int(vi.min()) < 0 or int(vi.max()) >= real_gt.shape[0]
+            ):
+                log.warning(
+                    "  vertex_indices out of range [0, %d), skipping real GT eval",
+                    real_gt.shape[0],
+                )
+                real_gt_error = "vertex_indices out of range"
+            else:
+                real_gt = real_gt[vi]
+
+        if real_gt_error is None and real_gt.shape[0] != N:
             log.warning(
                 "  GT vertex count %d != model point count %d, skipping real GT eval",
                 real_gt.shape[0], N,
             )
-            result["real_gt"] = {"error": "vertex count mismatch"}
+            real_gt_error = "vertex count mismatch"
+
+        if real_gt_error is not None:
+            result["real_gt"] = {"error": real_gt_error}
         else:
             real_ap = _evaluate_ap_against_gt(real_gt, proposals)
             real_clustering = _compute_clustering_metrics(real_gt, pred_labels)
@@ -280,6 +304,7 @@ def evaluate_student_predictions_multi(
     mask_threshold: float = 0.5,
     min_points: int = 30,
     eval_benchmark: str = "scannet200",
+    vertex_indices: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Full evaluation for each granularity head.
 
@@ -297,5 +322,6 @@ def evaluate_student_predictions_multi(
             mask_threshold=mask_threshold,
             min_points=min_points,
             eval_benchmark=eval_benchmark,
+            vertex_indices=vertex_indices,
         )
     return result

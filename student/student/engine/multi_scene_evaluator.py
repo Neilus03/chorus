@@ -10,14 +10,17 @@ from __future__ import annotations
 import logging
 import math
 import time
+from numbers import Real
 from typing import Any
 
 import torch
 import torch.nn as nn
+from torch.utils.data import Subset
 
 from student.data.multi_scene_dataset import MultiSceneDataset
 from student.data.target_builder import build_instance_targets_multi
 from student.engine.evaluator import evaluate_student_predictions_multi
+from student.engine.fragment_merge_eval import evaluate_scene_fragment_merge
 from student.metrics.pseudo_metrics import compute_pseudo_metrics_multi
 
 log = logging.getLogger(__name__)
@@ -36,9 +39,103 @@ def _safe_mean(values: list[float]) -> float:
     return sum(clean) / len(clean) if clean else 0.0
 
 
+def _append_real(values: list[float], value: Any) -> None:
+    if isinstance(value, Real):
+        values.append(float(value))
+
+
+def aggregate_multi_scene_results(
+    per_scene: dict[str, dict[str, Any]],
+    *,
+    granularities: tuple[str, ...],
+) -> dict[str, Any]:
+    """Recompute aggregate metrics from per-scene evaluation outputs."""
+    all_losses: list[float] = []
+    pseudo_ap25_all: list[float] = []
+    pseudo_ap50_all: list[float] = []
+    real_ap25_all: list[float] = []
+    real_ap50_all: list[float] = []
+    pseudo_nmi_all: list[float] = []
+    pseudo_ari_all: list[float] = []
+    real_nmi_all: list[float] = []
+    real_ari_all: list[float] = []
+    matched_iou_by_gran: dict[str, list[float]] = {g: [] for g in granularities}
+
+    for scene_data in per_scene.values():
+        _append_real(all_losses, scene_data.get("loss"))
+
+        pseudo_metrics = scene_data.get("pseudo_metrics", {})
+        if isinstance(pseudo_metrics, dict):
+            for g in granularities:
+                g_metrics = pseudo_metrics.get(g, {})
+                if isinstance(g_metrics, dict):
+                    _append_real(
+                        matched_iou_by_gran[g],
+                        g_metrics.get("matched_mean_iou"),
+                    )
+
+        eval_result = scene_data.get("eval", {})
+        if not isinstance(eval_result, dict):
+            continue
+
+        for g in granularities:
+            g_eval = eval_result.get(g, {})
+            if not isinstance(g_eval, dict):
+                continue
+
+            pseudo = g_eval.get("pseudo_gt", {})
+            if isinstance(pseudo, dict) and "AP25" in pseudo and "AP50" in pseudo:
+                _append_real(pseudo_ap25_all, pseudo.get("AP25"))
+                _append_real(pseudo_ap50_all, pseudo.get("AP50"))
+                _append_real(pseudo_nmi_all, pseudo.get("NMI"))
+                _append_real(pseudo_ari_all, pseudo.get("ARI"))
+
+            real = g_eval.get("real_gt", {})
+            if isinstance(real, dict) and "AP25" in real and "AP50" in real:
+                _append_real(real_ap25_all, real.get("AP25"))
+                _append_real(real_ap50_all, real.get("AP50"))
+                _append_real(real_nmi_all, real.get("NMI"))
+                _append_real(real_ari_all, real.get("ARI"))
+
+    aggregate: dict[str, Any] = {
+        "loss_mean": _safe_mean(all_losses),
+        "pseudo_AP25_mean": _safe_mean(pseudo_ap25_all),
+        "pseudo_AP50_mean": _safe_mean(pseudo_ap50_all),
+        "real_AP25_mean": _safe_mean(real_ap25_all),
+        "real_AP50_mean": _safe_mean(real_ap50_all),
+        "pseudo_NMI_mean": _safe_mean(pseudo_nmi_all),
+        "pseudo_ARI_mean": _safe_mean(pseudo_ari_all),
+        "real_NMI_mean": _safe_mean(real_nmi_all),
+        "real_ARI_mean": _safe_mean(real_ari_all),
+    }
+
+    all_iou_values: list[float] = []
+    for g in granularities:
+        g_mean = _safe_mean(matched_iou_by_gran[g])
+        aggregate[f"matched_mean_iou_{g}_mean"] = g_mean
+        all_iou_values.extend(matched_iou_by_gran[g])
+    aggregate["matched_mean_iou_mean"] = _safe_mean(all_iou_values)
+
+    return aggregate
+
+
+def _base_dataset_and_index(
+    dataset: MultiSceneDataset | Subset,
+    idx: int,
+) -> tuple[MultiSceneDataset, int]:
+    if isinstance(dataset, Subset):
+        base = dataset.dataset
+        if not isinstance(base, MultiSceneDataset):
+            raise TypeError("Subset base must be MultiSceneDataset for fragment eval")
+        return base, int(dataset.indices[idx])
+    if not isinstance(dataset, MultiSceneDataset):
+        raise TypeError("dataset must be MultiSceneDataset or Subset thereof")
+    return dataset, idx
+
+
 def evaluate_multi_scene(
     model: nn.Module,
-    dataset: MultiSceneDataset,
+    dataset: MultiSceneDataset | Subset,
     criterion: nn.Module,
     *,
     device: str,
@@ -48,6 +145,11 @@ def evaluate_multi_scene(
     min_points: int = 30,
     eval_benchmark: str = "scannet200",
     min_instance_points: int = 10,
+    dense_instance_ids: bool = False,
+    fragment_merge_eval: bool = False,
+    fragment_merge_num: int = 4,
+    fragment_merge_point_max: int | None = None,
+    fragment_merge_seed: int = 0,
 ) -> dict[str, Any]:
     """Evaluate model on all scenes in a dataset.
 
@@ -86,17 +188,7 @@ def evaluate_multi_scene(
     # --------------------------
 
     per_scene: dict[str, dict[str, Any]] = {}
-
-    all_losses: list[float] = []
-    pseudo_ap25_all: list[float] = []
-    pseudo_ap50_all: list[float] = []
-    real_ap25_all: list[float] = []
-    real_ap50_all: list[float] = []
-    pseudo_nmi_all: list[float] = []
-    pseudo_ari_all: list[float] = []
-    real_nmi_all: list[float] = []
-    real_ari_all: list[float] = []
-    matched_iou_by_gran: dict[str, list[float]] = {g: [] for g in granularities}
+    frag_pm = fragment_merge_point_max if fragment_merge_point_max is not None else 50_000
 
     for idx in range(len(dataset)):
         sample = dataset[idx]
@@ -110,6 +202,7 @@ def evaluate_multi_scene(
             sample["labels_by_granularity"],
             sample["supervision_mask"],
             min_instance_points=min_instance_points,
+            dense_instance_ids=dense_instance_ids,
         )
 
         _clear_backbone_cache(model)
@@ -119,7 +212,6 @@ def evaluate_multi_scene(
             loss_result = criterion(pred, targets_by_gran)
 
         loss_val = loss_result["loss_total"].item()
-        all_losses.append(loss_val)
 
         with torch.no_grad():
             pseudo_metrics = compute_pseudo_metrics_multi(
@@ -128,37 +220,36 @@ def evaluate_multi_scene(
                 mask_threshold=mask_threshold,
             )
 
-        for g in granularities:
-            matched_iou_by_gran[g].append(
-                pseudo_metrics[g]["matched_mean_iou"]
-            )
-
         eval_result: dict[str, Any] = {}
         try:
-            eval_result = evaluate_student_predictions_multi(
-                pred, targets_by_gran,
-                scene_dir=sample["scene_dir"],
-                scene_id=scene_id,
-                score_threshold=score_threshold,
-                mask_threshold=mask_threshold,
-                min_points=min_points,
-                eval_benchmark=eval_benchmark,
-            )
-
-            for g in granularities:
-                g_eval = eval_result.get(g, {})
-                pseudo = g_eval.get("pseudo_gt", {})
-                if isinstance(pseudo, dict) and "AP25" in pseudo:
-                    pseudo_ap25_all.append(pseudo["AP25"])
-                    pseudo_ap50_all.append(pseudo["AP50"])
-                    pseudo_nmi_all.append(pseudo.get("NMI", float("nan")))
-                    pseudo_ari_all.append(pseudo.get("ARI", float("nan")))
-                real = g_eval.get("real_gt", {})
-                if isinstance(real, dict) and "AP25" in real:
-                    real_ap25_all.append(real["AP25"])
-                    real_ap50_all.append(real["AP50"])
-                    real_nmi_all.append(real.get("NMI", float("nan")))
-                    real_ari_all.append(real.get("ARI", float("nan")))
+            if fragment_merge_eval:
+                base_ds, real_idx = _base_dataset_and_index(dataset, idx)
+                eval_result = evaluate_scene_fragment_merge(
+                    model,
+                    base_ds,
+                    real_idx,
+                    device=device,
+                    granularities=granularities,
+                    score_threshold=score_threshold,
+                    mask_threshold=mask_threshold,
+                    min_points=min_points,
+                    eval_benchmark=eval_benchmark,
+                    fragment_num=fragment_merge_num,
+                    fragment_point_max=frag_pm,
+                    fragment_seed=fragment_merge_seed,
+                )
+            else:
+                vi = sample.get("vertex_indices")
+                eval_result = evaluate_student_predictions_multi(
+                    pred, targets_by_gran,
+                    scene_dir=sample["scene_dir"],
+                    scene_id=scene_id,
+                    score_threshold=score_threshold,
+                    mask_threshold=mask_threshold,
+                    min_points=min_points,
+                    eval_benchmark=eval_benchmark,
+                    vertex_indices=vi,
+                )
 
         except Exception as e:
             log.warning("  Full eval failed for %s: %s", scene_id, e)
@@ -172,24 +263,10 @@ def evaluate_multi_scene(
             "eval": eval_result,
         }
 
-    # ── aggregate across scenes ──
-    aggregate: dict[str, Any] = {
-        "loss_mean": _safe_mean(all_losses),
-        "pseudo_AP25_mean": _safe_mean(pseudo_ap25_all),
-        "pseudo_AP50_mean": _safe_mean(pseudo_ap50_all),
-        "real_AP25_mean": _safe_mean(real_ap25_all),
-        "real_AP50_mean": _safe_mean(real_ap50_all),
-        "pseudo_NMI_mean": _safe_mean(pseudo_nmi_all),
-        "pseudo_ARI_mean": _safe_mean(pseudo_ari_all),
-        "real_NMI_mean": _safe_mean(real_nmi_all),
-        "real_ARI_mean": _safe_mean(real_ari_all),
+    return {
+        "per_scene": per_scene,
+        "aggregate": aggregate_multi_scene_results(
+            per_scene,
+            granularities=granularities,
+        ),
     }
-
-    all_iou_values: list[float] = []
-    for g in granularities:
-        g_mean = _safe_mean(matched_iou_by_gran[g])
-        aggregate[f"matched_mean_iou_{g}_mean"] = g_mean
-        all_iou_values.extend(matched_iou_by_gran[g])
-    aggregate["matched_mean_iou_mean"] = _safe_mean(all_iou_values)
-
-    return {"per_scene": per_scene, "aggregate": aggregate}

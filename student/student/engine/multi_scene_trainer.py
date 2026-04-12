@@ -10,19 +10,32 @@ from __future__ import annotations
 import json
 import logging
 import random
+import statistics
 import time
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from torch.nn.utils import clip_grad_norm_
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, RandomSampler, Subset
+from torch.utils.data.distributed import DistributedSampler
 
+from student.data.batched_scene_batch import (
+    BatchedMultiSceneSample,
+    collate_multi_scene_samples,
+)
+from student.data.distributed_scene_sampler import BalancedDistributedSceneSampler
 from student.data.multi_scene_dataset import MultiSceneDataset
+from student.data.scene_batch_sampler import SceneBatchSampler
 from student.data.target_builder import build_instance_targets_multi
-from student.engine.multi_scene_evaluator import evaluate_multi_scene
+from student.engine.multi_scene_evaluator import (
+    aggregate_multi_scene_results,
+    evaluate_multi_scene,
+)
 from student.losses.mask_set_loss import MultiGranCriterion
 
 log = logging.getLogger(__name__)
@@ -35,6 +48,16 @@ except ImportError:
 
 def _wandb_active() -> bool:
     return wandb is not None and wandb.run is not None
+
+
+def _dist_ready() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
 
 
 class MultiSceneTrainer:
@@ -109,6 +132,29 @@ class MultiSceneTrainer:
         warmup_epochs: int = 5,
         granularities: tuple[str, ...] = ("g02", "g05", "g08"),
         config: dict[str, Any] | None = None,
+        num_workers: int = 0,
+        log_every_steps: int = 1,
+        batch_scenes_per_step: int = 1,
+        balance_train_by_points: bool = False,
+        drop_last_train: bool = False,
+        sync_step_metrics: bool = True,
+        log_scene_ids: bool = False,
+        profile_train_steps: bool = False,
+        profile_every_steps: int = 1,
+        max_total_points_per_batch: int | None = None,
+        batch_assembly_policy: str = "sequential",
+        decoder_loss_mode: str = "scene_local",
+        sampler_seed: int = 0,
+        distributed: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
+        local_rank: int = 0,
+        is_main_process: bool = True,
+        dense_instance_ids: bool = False,
+        fragment_merge_eval: bool = False,
+        fragment_merge_num: int = 4,
+        fragment_merge_point_max: int | None = None,
+        fragment_merge_seed: int = 0,
     ) -> None:
         self.device = device
         self.lr = lr
@@ -128,15 +174,61 @@ class MultiSceneTrainer:
         self.min_instance_points = min_instance_points
         self.granularities = granularities
         self.config = config
+        self.num_workers = max(int(num_workers), 0)
+        self.log_every_steps = max(int(log_every_steps), 1)
+        self.batch_scenes_per_step = max(int(batch_scenes_per_step), 1)
+        self.balance_train_by_points = bool(balance_train_by_points)
+        self.drop_last_train = bool(drop_last_train)
+        self.sync_step_metrics = bool(sync_step_metrics)
+        self.log_scene_ids = bool(log_scene_ids)
+        self.profile_train_steps = bool(profile_train_steps)
+        self.profile_every_steps = max(int(profile_every_steps), 1)
+        self.max_total_points_per_batch = (
+            None
+            if max_total_points_per_batch is None
+            else max(int(max_total_points_per_batch), 1)
+        )
+        self.batch_assembly_policy = str(batch_assembly_policy)
+        self.decoder_loss_mode = str(decoder_loss_mode)
+        self.sampler_seed = int(sampler_seed)
+        self.distributed = bool(distributed)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.local_rank = int(local_rank)
+        self.is_main_process = bool(is_main_process)
+        self.dense_instance_ids = bool(dense_instance_ids)
+        self.fragment_merge_eval = bool(fragment_merge_eval)
+        self.fragment_merge_num = int(fragment_merge_num)
+        self.fragment_merge_point_max = fragment_merge_point_max
+        self.fragment_merge_seed = int(fragment_merge_seed)
 
-        self.model = model.to(device)
+        if self.decoder_loss_mode != "scene_local":
+            raise ValueError(
+                f"Unsupported decoder_loss_mode={self.decoder_loss_mode!r}; only 'scene_local' is implemented"
+            )
+
+        base_model = model.to(device)
+        if self.distributed:
+            ddp_kwargs: dict[str, Any] = {
+                "broadcast_buffers": False,
+                # Some decoder/head parameters can be legitimately unused on a
+                # given scene, so plain DDP reduction can deadlock/fail on the
+                # next step without unused-parameter detection enabled.
+                "find_unused_parameters": True,
+            }
+            if str(device).startswith("cuda"):
+                ddp_kwargs["device_ids"] = [self.local_rank]
+                ddp_kwargs["output_device"] = self.local_rank
+            self.model: nn.Module = DistributedDataParallel(base_model, **ddp_kwargs)
+        else:
+            self.model = base_model
         self.criterion = criterion
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
 
         # Uniform LR — training from scratch, no pretrained backbone weights
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=lr, weight_decay=weight_decay,
+            _unwrap_model(self.model).parameters(), lr=lr, weight_decay=weight_decay,
         )
 
         # Linear warmup → cosine annealing
@@ -157,12 +249,41 @@ class MultiSceneTrainer:
                 self.optimizer, T_max=max(max_epochs, 1),
             )
 
+        self.train_sampler = (
+            BalancedDistributedSceneSampler(
+                train_dataset.scene_point_counts,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=True,
+                seed=self.sampler_seed,
+                drop_last=self.drop_last_train,
+            )
+            if self.distributed and self.balance_train_by_points
+            else DistributedSampler(
+                train_dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=True,
+                drop_last=self.drop_last_train,
+            )
+            if self.distributed
+            else RandomSampler(train_dataset)
+        )
+        self.train_batch_sampler = SceneBatchSampler(
+            self.train_sampler,
+            train_dataset.scene_point_counts,
+            max_scenes_per_batch=self.batch_scenes_per_step,
+            max_total_points=self.max_total_points_per_batch,
+            batch_policy=self.batch_assembly_policy,
+            drop_last=self.drop_last_train,
+        )
         self.train_loader = DataLoader(
             train_dataset,
-            batch_size=1,
-            shuffle=True,
-            collate_fn=lambda batch: batch[0],
-            num_workers=0,
+            batch_sampler=self.train_batch_sampler,
+            collate_fn=collate_multi_scene_samples,
+            num_workers=self.num_workers,
+            pin_memory=str(device).startswith("cuda"),
+            persistent_workers=self.num_workers > 0,
         )
 
         self.ckpt_dir = self.output_dir / "checkpoints"
@@ -176,6 +297,129 @@ class MultiSceneTrainer:
         self.best_val_metrics: dict[str, Any] = {}
 
     # ------------------------------------------------------------------ #
+
+    def _dist_barrier(self) -> None:
+        if self.distributed and _dist_ready():
+            dist.barrier()
+
+    def _model_module(self) -> nn.Module:
+        return _unwrap_model(self.model)
+
+    def _sync_device(self) -> None:
+        if str(self.device).startswith("cuda"):
+            torch.cuda.synchronize(self.device)
+
+    def _gather_scene_ids(self, scene_ids: list[str]) -> list[list[str]]:
+        if not self.distributed:
+            return [scene_ids]
+        gathered: list[list[str] | None] = [None] * self.world_size
+        dist.all_gather_object(gathered, scene_ids)
+        return [list(x or []) for x in gathered]
+
+    def _reduce_mean_metrics(self, metrics: dict[str, float]) -> dict[str, float]:
+        if not self.distributed:
+            return metrics
+        names = list(metrics.keys())
+        values = torch.tensor(
+            [metrics[name] for name in names],
+            device=self.device,
+            dtype=torch.float64,
+        )
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+        values /= self.world_size
+        return {name: values[idx].item() for idx, name in enumerate(names)}
+
+    def _shard_eval_dataset(
+        self,
+        dataset: MultiSceneDataset | Subset,
+    ) -> MultiSceneDataset | Subset:
+        if not self.distributed:
+            return dataset
+        shard_indices = list(range(self.rank, len(dataset), self.world_size))
+        return Subset(dataset, shard_indices)
+
+    def _gather_eval_per_scene(
+        self,
+        per_scene: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        if not self.distributed:
+            return per_scene
+        gathered: list[dict[str, dict[str, Any]] | None] = [None] * self.world_size
+        dist.all_gather_object(gathered, per_scene)
+        if not self.is_main_process:
+            return {}
+
+        merged: dict[str, dict[str, Any]] = {}
+        for shard in gathered:
+            if not shard:
+                continue
+            overlap = set(merged).intersection(shard)
+            if overlap:
+                duplicate_scene_ids = ", ".join(sorted(overlap))
+                raise RuntimeError(
+                    "Distributed evaluation gathered duplicate scene ids: "
+                    f"{duplicate_scene_ids}"
+                )
+            merged.update(shard)
+
+        return {
+            scene_id: merged[scene_id]
+            for scene_id in sorted(merged)
+        }
+
+    def _evaluate_dataset(
+        self,
+        dataset: MultiSceneDataset | Subset,
+        *,
+        epoch: int,
+        stage_name: str,
+    ) -> dict[str, Any]:
+        if self.is_main_process:
+            if self.distributed:
+                log.info(
+                    "%s at epoch %d ... (%d total scenes across %d ranks)",
+                    stage_name,
+                    epoch,
+                    len(dataset),
+                    self.world_size,
+                )
+            else:
+                log.info("%s at epoch %d ...", stage_name, epoch)
+
+        shard_dataset = self._shard_eval_dataset(dataset)
+        local_result = evaluate_multi_scene(
+            model=self._model_module(),
+            dataset=shard_dataset,  # type: ignore[arg-type]
+            criterion=self.criterion,
+            device=self.device,
+            granularities=self.granularities,
+            score_threshold=self.score_threshold,
+            mask_threshold=self.mask_threshold,
+            min_points=self.min_points_per_proposal,
+            eval_benchmark=self.eval_benchmark,
+            min_instance_points=self.min_instance_points,
+            dense_instance_ids=self.dense_instance_ids,
+            fragment_merge_eval=self.fragment_merge_eval,
+            fragment_merge_num=self.fragment_merge_num,
+            fragment_merge_point_max=self.fragment_merge_point_max,
+            fragment_merge_seed=self.fragment_merge_seed,
+        )
+
+        self._model_module().eval()
+        if not self.distributed:
+            return local_result
+
+        merged_per_scene = self._gather_eval_per_scene(local_result["per_scene"])
+        if not self.is_main_process:
+            return {}
+
+        return {
+            "per_scene": merged_per_scene,
+            "aggregate": aggregate_multi_scene_results(
+                merged_per_scene,
+                granularities=self.granularities,
+            ),
+        }
 
     def _make_train_eval_subset(self, epoch: int) -> Subset:
         """Create a small training-scene subset for metric evaluation."""
@@ -214,21 +458,223 @@ class MultiSceneTrainer:
 
     def _clear_backbone_cache(self) -> None:
         """Invalidate LitePT voxelization cache before processing a new scene."""
-        backbone = getattr(self.model, "backbone", None)
+        backbone = getattr(self._model_module(), "backbone", None)
         if backbone is not None and hasattr(backbone, "_cached_voxelization"):
             backbone._cached_voxelization = None
 
+    def _build_targets_for_batch(
+        self,
+        batch: BatchedMultiSceneSample,
+    ) -> list[dict[str, Any]]:
+        targets_by_scene: list[dict[str, Any]] = []
+        for scene_idx in range(batch.num_scenes):
+            labels_by_granularity = {
+                g: batch.labels_by_granularity[g][scene_idx]
+                for g in self.granularities
+            }
+            targets_by_scene.append(build_instance_targets_multi(
+                labels_by_granularity,
+                batch.supervision_masks[scene_idx],
+                min_instance_points=self.min_instance_points,
+                dense_instance_ids=self.dense_instance_ids,
+            ))
+        return targets_by_scene
+
+    def _aggregate_scene_loss_results(
+        self,
+        scene_results: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not scene_results:
+            raise ValueError("scene_results must not be empty")
+
+        result: dict[str, Any] = {
+            "loss_total": torch.stack([x["loss_total"] for x in scene_results]).mean(),
+            "scene_loss_totals": [
+                float(x["loss_total"].detach().item()) for x in scene_results
+            ],
+            "heads": {},
+        }
+        for g in self.granularities:
+            result["heads"][g] = {
+                "loss_total": torch.stack([
+                    x["heads"][g]["loss_total"].detach() for x in scene_results
+                ]).mean(),
+                "loss_mask_bce": torch.stack([
+                    x["heads"][g]["loss_mask_bce"] for x in scene_results
+                ]).mean(),
+                "loss_mask_dice": torch.stack([
+                    x["heads"][g]["loss_mask_dice"] for x in scene_results
+                ]).mean(),
+                "loss_score": torch.stack([
+                    x["heads"][g]["loss_score"] for x in scene_results
+                ]).mean(),
+            }
+
+        aux_values = [x["loss_aux"] for x in scene_results if "loss_aux" in x]
+        if aux_values:
+            result["loss_aux"] = torch.stack(aux_values).mean()
+        return result
+
+    def _compute_step_loss(
+        self,
+        pred: dict[str, Any] | list[dict[str, Any]],
+        targets_by_scene: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if isinstance(pred, list):
+            if len(pred) != len(targets_by_scene):
+                raise ValueError(
+                    f"Got {len(pred)} scene predictions but {len(targets_by_scene)} targets"
+                )
+            return self._aggregate_scene_loss_results([
+                self.criterion(scene_pred, scene_targets)
+                for scene_pred, scene_targets in zip(pred, targets_by_scene)
+            ])
+
+        if len(targets_by_scene) != 1:
+            raise ValueError(
+                f"Single-scene prediction requires exactly one target set, got {len(targets_by_scene)}"
+            )
+        loss_result = self.criterion(pred, targets_by_scene[0])
+        loss_result["scene_loss_totals"] = [
+            float(loss_result["loss_total"].detach().item())
+        ]
+        return loss_result
+
+    def _summarize_profile_rows(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not rows:
+            return {}
+
+        def _mean(key: str) -> float:
+            values = [float(row[key]) for row in rows]
+            return sum(values) / len(values)
+
+        summary: dict[str, Any] = {
+            "num_profile_rows": len(rows),
+            "data_wait_ms_mean": _mean("data_wait_ms"),
+            "target_build_ms_mean": _mean("target_build_ms"),
+            "forward_ms_mean": _mean("forward_ms"),
+            "loss_ms_mean": _mean("loss_ms"),
+            "backward_ms_mean": _mean("backward_ms"),
+            "optim_ms_mean": _mean("optim_ms"),
+            "metrics_sync_ms_mean": _mean("metrics_sync_ms"),
+            "step_total_ms_mean": _mean("step_total_ms"),
+            "step_total_ms_median": statistics.median(
+                [float(row["step_total_ms"]) for row in rows]
+            ),
+            "step_total_ms_max": max(float(row["step_total_ms"]) for row in rows),
+            "num_points_total_mean": _mean("num_points_total"),
+            "num_points_total_median": statistics.median(
+                [float(row["num_points_total"]) for row in rows]
+            ),
+            "num_points_total_max": max(float(row["num_points_total"]) for row in rows),
+            "num_points_max_scene_mean": _mean("num_points_max_scene"),
+            "num_points_max_scene_median": statistics.median(
+                [float(row["num_points_max_scene"]) for row in rows]
+            ),
+            "num_points_max_scene_max": max(
+                float(row["num_points_max_scene"]) for row in rows
+            ),
+        }
+
+        per_rank_means: dict[int, float] = {}
+        for rank in sorted({int(row["rank"]) for row in rows}):
+            rank_rows = [row for row in rows if int(row["rank"]) == rank]
+            per_rank_means[rank] = sum(
+                float(row["step_total_ms"]) for row in rank_rows
+            ) / max(len(rank_rows), 1)
+        if per_rank_means:
+            mean_rank_step_ms = sum(per_rank_means.values()) / len(per_rank_means)
+            summary["per_rank_mean_step_ms"] = {
+                str(rank): value for rank, value in per_rank_means.items()
+            }
+            summary["max_rank_step_ms_over_mean"] = (
+                max(per_rank_means.values()) / max(mean_rank_step_ms, 1e-8)
+            )
+
+        return summary
+
+    def _finalize_train_timing(
+        self,
+        epoch: int,
+        local_rows: list[dict[str, Any]],
+    ) -> None:
+        if not self.profile_train_steps:
+            return
+
+        gathered: list[list[dict[str, Any]] | None]
+        if self.distributed:
+            gathered = [None] * self.world_size
+            dist.all_gather_object(gathered, local_rows)
+        else:
+            gathered = [local_rows]
+
+        if not self.is_main_process:
+            return
+
+        all_rows: list[dict[str, Any]] = []
+        for shard in gathered:
+            if shard:
+                all_rows.extend(shard)
+        if not all_rows:
+            return
+
+        all_rows.sort(key=lambda row: (int(row["global_step"]), int(row["rank"])))
+        for row in all_rows:
+            self._log_row({"train_step_profile": True, **row})
+
+        summary = self._summarize_profile_rows(all_rows)
+        summary.update({
+            "epoch": epoch,
+            "train_step_profile_summary": True,
+            "world_size": self.world_size,
+        })
+        self._log_row(summary)
+        log.info(
+            "  [train profile epoch %d] step_total mean/median/max = %.1f / %.1f / %.1f ms  imbalance=%.3f",
+            epoch,
+            summary.get("step_total_ms_mean", 0.0),
+            summary.get("step_total_ms_median", 0.0),
+            summary.get("step_total_ms_max", 0.0),
+            summary.get("max_rank_step_ms_over_mean", 1.0),
+        )
+
+        if _wandb_active():
+            wandb.log({
+                "epoch": epoch,
+                "global_step": self.global_step,
+                "train_profile/step_total_ms_mean": summary.get("step_total_ms_mean", 0.0),
+                "train_profile/step_total_ms_median": summary.get("step_total_ms_median", 0.0),
+                "train_profile/step_total_ms_max": summary.get("step_total_ms_max", 0.0),
+                "train_profile/data_wait_ms_mean": summary.get("data_wait_ms_mean", 0.0),
+                "train_profile/target_build_ms_mean": summary.get("target_build_ms_mean", 0.0),
+                "train_profile/forward_ms_mean": summary.get("forward_ms_mean", 0.0),
+                "train_profile/loss_ms_mean": summary.get("loss_ms_mean", 0.0),
+                "train_profile/backward_ms_mean": summary.get("backward_ms_mean", 0.0),
+                "train_profile/optim_ms_mean": summary.get("optim_ms_mean", 0.0),
+                "train_profile/metrics_sync_ms_mean": summary.get("metrics_sync_ms_mean", 0.0),
+                "train_profile/max_rank_step_ms_over_mean": summary.get(
+                    "max_rank_step_ms_over_mean", 1.0
+                ),
+            })
+
     def _log_row(self, row: dict[str, Any]) -> None:
+        if not self.is_main_process:
+            return
         with self.log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, default=str) + "\n")
 
     def _save_checkpoint(self, tag: str) -> None:
+        if not self.is_main_process:
+            return
         path = self.ckpt_dir / f"{tag}.pt"
         torch.save(
             {
                 "epoch": self.current_epoch,
                 "global_step": self.global_step,
-                "model_state_dict": self.model.state_dict(),
+                "model_state_dict": self._model_module().state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "scheduler_state_dict": self.scheduler.state_dict(),
                 "best_val_metric": self.best_val_metric,
@@ -246,7 +692,13 @@ class MultiSceneTrainer:
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
         checkpoint = torch.load(ckpt_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        model_state_dict = checkpoint["model_state_dict"]
+        if any(key.startswith("module.") for key in model_state_dict):
+            model_state_dict = {
+                key.removeprefix("module."): value
+                for key, value in model_state_dict.items()
+            }
+        self._model_module().load_state_dict(model_state_dict)
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
@@ -269,109 +721,269 @@ class MultiSceneTrainer:
     def _train_one_epoch(self, epoch: int) -> dict[str, Any]:
         """Train on all scenes once.  Returns epoch-level metrics."""
         self.model.train()
+        if hasattr(self.train_batch_sampler, "set_epoch"):
+            self.train_batch_sampler.set_epoch(epoch)
+        elif hasattr(self.train_sampler, "set_epoch"):
+            self.train_sampler.set_epoch(epoch)
         scene_losses: list[float] = []
+        profile_rows: list[dict[str, Any]] = []
 
-        for sample in self.train_loader:
+        train_iter = iter(self.train_loader)
+        while True:
+            data_wait_start = time.perf_counter()
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                break
+
+            if not isinstance(batch, BatchedMultiSceneSample):
+                raise TypeError(
+                    f"Expected BatchedMultiSceneSample from train_loader, got {type(batch)!r}"
+                )
+
             self.global_step += 1
-            t0 = time.time()
+            data_wait_ms = (time.perf_counter() - data_wait_start) * 1000.0
 
-            scene_id = sample["scene_id"]
-            points = sample["points"].to(self.device)
-            features = sample["features"].to(self.device)
-
-            targets_by_gran = build_instance_targets_multi(
-                sample["labels_by_granularity"],
-                sample["supervision_mask"],
-                min_instance_points=self.min_instance_points,
+            profile_this_step = (
+                self.profile_train_steps
+                and self.global_step % self.profile_every_steps == 0
             )
+            if profile_this_step:
+                self._sync_device()
+            step_start = time.perf_counter()
+
+            scene_ids_local = list(batch.scene_ids)
+            point_counts = batch.point_counts
+            num_points_total = sum(point_counts)
+            num_points_max_scene = max(point_counts) if point_counts else 0
+
+            points = batch.points.to(self.device, non_blocking=True)
+            features = batch.features.to(self.device, non_blocking=True)
+            point_offsets = batch.point_offsets.to(self.device, non_blocking=True)
+
+            target_start = time.perf_counter()
+            targets_by_scene = self._build_targets_for_batch(batch)
+            target_build_ms = (time.perf_counter() - target_start) * 1000.0
 
             self._clear_backbone_cache()
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
 
-            pred = self.model(points, features)
-            loss_result = self.criterion(pred, targets_by_gran)
+            if profile_this_step:
+                self._sync_device()
+            forward_start = time.perf_counter()
+            pred = self.model(
+                points,
+                features,
+                point_offsets=point_offsets,
+            )
+            if profile_this_step:
+                self._sync_device()
+            forward_ms = (time.perf_counter() - forward_start) * 1000.0
 
+            if profile_this_step:
+                self._sync_device()
+            loss_start = time.perf_counter()
+            loss_result = self._compute_step_loss(pred, targets_by_scene)
+            if profile_this_step:
+                self._sync_device()
+            loss_ms = (time.perf_counter() - loss_start) * 1000.0
+
+            if profile_this_step:
+                self._sync_device()
+            backward_start = time.perf_counter()
             loss_result["loss_total"].backward()
+            if profile_this_step:
+                self._sync_device()
+            backward_ms = (time.perf_counter() - backward_start) * 1000.0
+
+            if profile_this_step:
+                self._sync_device()
+            optim_start = time.perf_counter()
             grad_norm = clip_grad_norm_(
-                self.model.parameters(), self.grad_clip_norm,
+                self._model_module().parameters(), self.grad_clip_norm,
             ).item()
             self.optimizer.step()
+            if profile_this_step:
+                self._sync_device()
+            optim_ms = (time.perf_counter() - optim_start) * 1000.0
 
-            loss_total = loss_result["loss_total"].item()
-            step_ms = (time.time() - t0) * 1000
-            scene_losses.append(loss_total)
+            loss_total = float(loss_result["loss_total"].detach().item())
+            scene_losses.extend(loss_result["scene_loss_totals"])
+            step_total_ms = (time.perf_counter() - step_start) * 1000.0
 
-            per_head_str = "  ".join(
-                f"{g}={loss_result['heads'][g]['loss_total'].item():.4f}"
-                for g in self.granularities
-            )
-            log.info(
-                "  epoch %d  step %d  scene=%s  loss=%.4f  [%s]  gnorm=%.3f  %.0fms",
-                epoch, self.global_step, scene_id, loss_total,
-                per_head_str, grad_norm, step_ms,
-            )
-
-            row: dict[str, Any] = {
-                "epoch": epoch,
-                "global_step": self.global_step,
-                "scene_id": scene_id,
-                "loss_total": loss_total,
-                "grad_norm": grad_norm,
-                "step_ms": step_ms,
-            }
-            for g in self.granularities:
-                ld_g = loss_result["heads"][g]
-                row[f"loss_{g}"] = ld_g["loss_total"].item()
-                row[f"loss_mask_bce_{g}"] = ld_g["loss_mask_bce"].item()
-                row[f"loss_mask_dice_{g}"] = ld_g["loss_mask_dice"].item()
-                row[f"loss_score_{g}"] = ld_g["loss_score"].item()
-            self._log_row(row)
-
-            if _wandb_active():
-                wb: dict[str, Any] = {
-                    "global_step": self.global_step,
-                    "epoch": epoch,
-                    "train_scene/loss": loss_total,
-                    "train_scene/grad_norm": grad_norm,
-                    "train_scene/step_ms": step_ms,
+            metrics_sync_ms = 0.0
+            should_log_step = self.global_step % self.log_every_steps == 0
+            if should_log_step:
+                step_metrics: dict[str, float] = {
+                    "loss_total": loss_total,
+                    "grad_norm": grad_norm,
+                    "step_ms": step_total_ms,
+                    "num_scenes": float(len(scene_ids_local)),
+                    "num_points_total": float(num_points_total),
+                    "num_points_max_scene": float(num_points_max_scene),
                 }
                 for g in self.granularities:
                     ld_g = loss_result["heads"][g]
-                    wb[f"train_scene/loss_{g}"] = ld_g["loss_total"].item()
-                    wb[f"train_scene/loss_mask_bce_{g}"] = ld_g["loss_mask_bce"].item()
-                    wb[f"train_scene/loss_mask_dice_{g}"] = ld_g["loss_mask_dice"].item()
-                    wb[f"train_scene/loss_score_{g}"] = ld_g["loss_score"].item()
+                    step_metrics[f"loss_{g}"] = ld_g["loss_total"].item()
+                    step_metrics[f"loss_mask_bce_{g}"] = ld_g["loss_mask_bce"].item()
+                    step_metrics[f"loss_mask_dice_{g}"] = ld_g["loss_mask_dice"].item()
+                    step_metrics[f"loss_score_{g}"] = ld_g["loss_score"].item()
                 if "loss_aux" in loss_result:
-                    wb["train_scene/loss_aux"] = loss_result["loss_aux"].item()
-                wandb.log(wb)
+                    step_metrics["loss_aux"] = loss_result["loss_aux"].item()
+
+                if self.distributed and self.sync_step_metrics:
+                    sync_start = time.perf_counter()
+                    step_metrics = self._reduce_mean_metrics(step_metrics)
+                    metrics_sync_ms += (time.perf_counter() - sync_start) * 1000.0
+
+                scene_ids_by_rank = [scene_ids_local]
+                if self.distributed and self.log_scene_ids:
+                    sync_start = time.perf_counter()
+                    scene_ids_by_rank = self._gather_scene_ids(scene_ids_local)
+                    metrics_sync_ms += (time.perf_counter() - sync_start) * 1000.0
+
+                if self.is_main_process:
+                    per_head_str = "  ".join(
+                        f"{g}={step_metrics[f'loss_{g}']:.4f}"
+                        for g in self.granularities
+                    )
+                    if self.distributed and self.log_scene_ids:
+                        scene_label = " | ".join(
+                            ",".join(rank_scene_ids) for rank_scene_ids in scene_ids_by_rank
+                        )
+                    else:
+                        scene_label = ",".join(scene_ids_local)
+                    log.info(
+                        "  epoch %d  step %d  scenes=%s  loss=%.4f  [%s]  "
+                        "gnorm=%.3f  %.0fms  pts=%d  max_scene_pts=%d",
+                        epoch,
+                        self.global_step,
+                        scene_label,
+                        step_metrics["loss_total"],
+                        per_head_str,
+                        step_metrics["grad_norm"],
+                        step_metrics["step_ms"],
+                        int(step_metrics["num_points_total"]),
+                        int(step_metrics["num_points_max_scene"]),
+                    )
+
+                    row: dict[str, Any] = {
+                        "epoch": epoch,
+                        "global_step": self.global_step,
+                        "scene_ids": scene_ids_local,
+                        "loss_total": step_metrics["loss_total"],
+                        "grad_norm": step_metrics["grad_norm"],
+                        "step_ms": step_metrics["step_ms"],
+                        "num_scenes": int(step_metrics["num_scenes"]),
+                        "num_points_total": int(step_metrics["num_points_total"]),
+                        "num_points_max_scene": int(step_metrics["num_points_max_scene"]),
+                        "metrics_synced": self.distributed and self.sync_step_metrics,
+                        "world_size": self.world_size,
+                    }
+                    if self.distributed and self.log_scene_ids:
+                        row["scene_ids_by_rank"] = scene_ids_by_rank
+                    for g in self.granularities:
+                        row[f"loss_{g}"] = step_metrics[f"loss_{g}"]
+                        row[f"loss_mask_bce_{g}"] = step_metrics[f"loss_mask_bce_{g}"]
+                        row[f"loss_mask_dice_{g}"] = step_metrics[f"loss_mask_dice_{g}"]
+                        row[f"loss_score_{g}"] = step_metrics[f"loss_score_{g}"]
+                    if "loss_aux" in step_metrics:
+                        row["loss_aux"] = step_metrics["loss_aux"]
+                    self._log_row(row)
+
+                    if _wandb_active():
+                        wb: dict[str, Any] = {
+                            "global_step": self.global_step,
+                            "epoch": epoch,
+                            "train_step/loss": step_metrics["loss_total"],
+                            "train_step/grad_norm": step_metrics["grad_norm"],
+                            "train_step/step_ms": step_metrics["step_ms"],
+                            "train_step/num_scenes": step_metrics["num_scenes"],
+                            "train_step/num_points_total": step_metrics["num_points_total"],
+                            "train_step/num_points_max_scene": step_metrics["num_points_max_scene"],
+                            "train_scene/loss": step_metrics["loss_total"],
+                            "train_scene/grad_norm": step_metrics["grad_norm"],
+                            "train_scene/step_ms": step_metrics["step_ms"],
+                        }
+                        for g in self.granularities:
+                            wb[f"train_scene/loss_{g}"] = step_metrics[f"loss_{g}"]
+                            wb[f"train_scene/loss_mask_bce_{g}"] = step_metrics[f"loss_mask_bce_{g}"]
+                            wb[f"train_scene/loss_mask_dice_{g}"] = step_metrics[f"loss_mask_dice_{g}"]
+                            wb[f"train_scene/loss_score_{g}"] = step_metrics[f"loss_score_{g}"]
+                        if "loss_aux" in step_metrics:
+                            wb["train_scene/loss_aux"] = step_metrics["loss_aux"]
+                        wandb.log(wb)
+
+            if profile_this_step:
+                profile_rows.append({
+                    "epoch": epoch,
+                    "global_step": self.global_step,
+                    "rank": self.rank,
+                    "scene_ids": scene_ids_local,
+                    "num_scenes": len(scene_ids_local),
+                    "num_points_total": num_points_total,
+                    "num_points_max_scene": num_points_max_scene,
+                    "data_wait_ms": data_wait_ms,
+                    "target_build_ms": target_build_ms,
+                    "forward_ms": forward_ms,
+                    "loss_ms": loss_ms,
+                    "backward_ms": backward_ms,
+                    "optim_ms": optim_ms,
+                    "metrics_sync_ms": metrics_sync_ms,
+                    "step_total_ms": step_total_ms,
+                })
+
+        self._finalize_train_timing(epoch, profile_rows)
 
         # ── epoch summary ──
+        loss_sum = sum(scene_losses)
+        loss_count = len(scene_losses)
+        loss_min = min(scene_losses) if scene_losses else 0.0
+        loss_max = max(scene_losses) if scene_losses else 0.0
+        if self.distributed:
+            sum_count = torch.tensor(
+                [loss_sum, loss_count],
+                device=self.device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(sum_count, op=dist.ReduceOp.SUM)
+            loss_sum = float(sum_count[0].item())
+            loss_count = int(sum_count[1].item())
+
+            min_tensor = torch.tensor(loss_min, device=self.device, dtype=torch.float64)
+            max_tensor = torch.tensor(loss_max, device=self.device, dtype=torch.float64)
+            dist.all_reduce(min_tensor, op=dist.ReduceOp.MIN)
+            dist.all_reduce(max_tensor, op=dist.ReduceOp.MAX)
+            loss_min = float(min_tensor.item())
+            loss_max = float(max_tensor.item())
+
         epoch_metrics = {
             "epoch": epoch,
-            "loss_mean": sum(scene_losses) / len(scene_losses),
-            "loss_min": min(scene_losses),
-            "loss_max": max(scene_losses),
+            "loss_mean": loss_sum / max(loss_count, 1),
+            "loss_min": loss_min,
+            "loss_max": loss_max,
             "lr": self.optimizer.param_groups[0]["lr"],
         }
-        log.info(
-            "Epoch %d/%d  loss_mean=%.4f  loss_range=[%.4f, %.4f]  lr=%.2e",
-            epoch, self.max_epochs,
-            epoch_metrics["loss_mean"],
-            epoch_metrics["loss_min"],
-            epoch_metrics["loss_max"],
-            epoch_metrics["lr"],
-        )
-        self._log_row({"epoch_summary": True, **epoch_metrics})
+        if self.is_main_process:
+            log.info(
+                "Epoch %d/%d  loss_mean=%.4f  loss_range=[%.4f, %.4f]  lr=%.2e",
+                epoch, self.max_epochs,
+                epoch_metrics["loss_mean"],
+                epoch_metrics["loss_min"],
+                epoch_metrics["loss_max"],
+                epoch_metrics["lr"],
+            )
+            self._log_row({"epoch_summary": True, **epoch_metrics})
 
-        if _wandb_active():
-            wandb.log({
-                "epoch": epoch,
-                "global_step": self.global_step,
-                "train/loss_mean": epoch_metrics["loss_mean"],
-                "train/loss_min": epoch_metrics["loss_min"],
-                "train/loss_max": epoch_metrics["loss_max"],
-                "train/lr": epoch_metrics["lr"],
-            })
+            if _wandb_active():
+                wandb.log({
+                    "epoch": epoch,
+                    "global_step": self.global_step,
+                    "train/loss_mean": epoch_metrics["loss_mean"],
+                    "train/loss_min": epoch_metrics["loss_min"],
+                    "train/loss_max": epoch_metrics["loss_max"],
+                    "train/lr": epoch_metrics["lr"],
+                })
 
         return epoch_metrics
 
@@ -379,22 +991,13 @@ class MultiSceneTrainer:
 
     def _validate(self, epoch: int) -> dict[str, Any]:
         """Run full evaluation on all validation scenes."""
-        log.info("Validation at epoch %d ...", epoch)
-
-        val_result = evaluate_multi_scene(
-            model=self.model,
-            dataset=self.val_dataset,
-            criterion=self.criterion,
-            device=self.device,
-            granularities=self.granularities,
-            score_threshold=self.score_threshold,
-            mask_threshold=self.mask_threshold,
-            min_points=self.min_points_per_proposal,
-            eval_benchmark=self.eval_benchmark,
-            min_instance_points=self.min_instance_points,
+        val_result = self._evaluate_dataset(
+            self.val_dataset,
+            epoch=epoch,
+            stage_name="Validation",
         )
-
-        self.model.eval()
+        if not self.is_main_process:
+            return {}
 
         agg = val_result["aggregate"]
         log.info(
@@ -444,23 +1047,14 @@ class MultiSceneTrainer:
 
     def _train_eval(self, epoch: int) -> dict[str, Any]:
         """Evaluate metrics on a subset of training scenes."""
-        log.info("Train-eval at epoch %d ...", epoch)
-
         train_subset = self._make_train_eval_subset(epoch)
-        train_result = evaluate_multi_scene(
-            model=self.model,
-            dataset=train_subset,  # type: ignore[arg-type]
-            criterion=self.criterion,
-            device=self.device,
-            granularities=self.granularities,
-            score_threshold=self.score_threshold,
-            mask_threshold=self.mask_threshold,
-            min_points=self.min_points_per_proposal,
-            eval_benchmark=self.eval_benchmark,
-            min_instance_points=self.min_instance_points,
+        train_result = self._evaluate_dataset(
+            train_subset,
+            epoch=epoch,
+            stage_name="Train-eval",
         )
-
-        self.model.eval()
+        if not self.is_main_process:
+            return {}
 
         agg = train_result["aggregate"]
         log.info(
@@ -514,15 +1108,16 @@ class MultiSceneTrainer:
 
     def train(self) -> dict[str, Any]:
         """Run the full training loop.  Returns final metrics dict."""
-        log.info(
-            "Starting training: %d epochs, %d train scenes, %d val scenes, "
-            "%d granularities (%s)",
-            self.max_epochs,
-            len(self.train_dataset),
-            len(self.val_dataset),
-            len(self.granularities),
-            ", ".join(self.granularities),
-        )
+        if self.is_main_process:
+            log.info(
+                "Starting training: %d epochs, %d train scenes, %d val scenes, "
+                "%d granularities (%s)",
+                self.max_epochs,
+                len(self.train_dataset),
+                len(self.val_dataset),
+                len(self.granularities),
+                ", ".join(self.granularities),
+            )
 
         t_start = time.time()
         epoch_times: list[float] = []
@@ -530,10 +1125,11 @@ class MultiSceneTrainer:
 
         start_epoch = self.current_epoch + 1
         if start_epoch > self.max_epochs:
-            log.info(
-                "Checkpoint epoch %d already reached max_epochs=%d; nothing to train.",
-                self.current_epoch, self.max_epochs,
-            )
+            if self.is_main_process:
+                log.info(
+                    "Checkpoint epoch %d already reached max_epochs=%d; nothing to train.",
+                    self.current_epoch, self.max_epochs,
+                )
         for epoch in range(start_epoch, self.max_epochs + 1):
             self.current_epoch = epoch
             t_epoch = time.time()
@@ -544,37 +1140,49 @@ class MultiSceneTrainer:
             epoch_times.append(time.time() - t_epoch)
 
             if epoch % self.eval_every_epochs == 0 or epoch == self.max_epochs:
+                self._dist_barrier()
                 val_metrics = self._validate(epoch)
-                last_val_metrics = val_metrics
+                if self.is_main_process:
+                    last_val_metrics = val_metrics
 
-                ap50 = val_metrics["aggregate"].get("pseudo_AP50_mean", 0.0)
-                if ap50 > self.best_val_metric:
-                    self.best_val_metric = ap50
-                    self.best_epoch = epoch
-                    self.best_val_metrics = val_metrics
-                    self._save_checkpoint("best")
-                    log.info(
-                        "  New best val pseudo AP50: %.4f at epoch %d",
-                        ap50, epoch,
-                    )
+                    ap50 = val_metrics["aggregate"].get("pseudo_AP50_mean", 0.0)
+                    if ap50 > self.best_val_metric:
+                        self.best_val_metric = ap50
+                        self.best_epoch = epoch
+                        self.best_val_metrics = val_metrics
+                        self._save_checkpoint("best")
+                        log.info(
+                            "  New best val pseudo AP50: %.4f at epoch %d",
+                            ap50, epoch,
+                        )
+                self._dist_barrier()
 
             if (
                 self.train_eval_every_epochs is not None
                 and (epoch % self.train_eval_every_epochs == 0 or epoch == self.max_epochs)
             ):
+                self._dist_barrier()
                 self._train_eval(epoch)
+                self._dist_barrier()
 
             if epoch % self.save_every_epochs == 0:
-                self._save_checkpoint("last")
+                self._dist_barrier()
+                if self.is_main_process:
+                    self._save_checkpoint("last")
+                self._dist_barrier()
 
-        self._save_checkpoint("last")
+        self._dist_barrier()
+        if self.is_main_process:
+            self._save_checkpoint("last")
+        self._dist_barrier()
 
         total_time = time.time() - t_start
-        log.info(
-            "Training done: %d epochs in %.1fs (%.1fs/epoch)",
-            self.max_epochs, total_time,
-            total_time / max(self.max_epochs, 1),
-        )
+        if self.is_main_process:
+            log.info(
+                "Training done: %d epochs in %.1fs (%.1fs/epoch)",
+                self.max_epochs, total_time,
+                total_time / max(self.max_epochs, 1),
+            )
 
         return {
             "final_val_metrics": last_val_metrics,
