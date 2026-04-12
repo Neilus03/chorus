@@ -20,6 +20,7 @@ def export_training_scene_pack(
     projection_type: str = "zbuffer_rgbd",
     embedding_type: str = "truncated_svd",
     clustering_type: str = "hdbscan",
+    clustering_backend: str | None = None,
     frame_skip: int | None = None,
     scene_intrinsic_metrics: dict[str, Any] | None = None,
 ) -> Path:
@@ -110,6 +111,7 @@ def export_training_scene_pack(
         "projection_type": projection_type,
         "embedding_type": embedding_type,
         "clustering_type": clustering_type,
+        "clustering_backend": clustering_backend,
         "cluster_stats": cluster_stats,
         "scene_intrinsic_metrics": scene_intrinsic_metrics if scene_intrinsic_metrics is not None else {},
     }
