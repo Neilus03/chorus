@@ -99,6 +99,7 @@ def _validate_scene_arrays(
     num_points_declared: int,
     points: np.ndarray,
     colors: np.ndarray | None,
+    normals: np.ndarray | None,
     labels: np.ndarray,
     valid_points: np.ndarray,
     seen_points: np.ndarray,
@@ -114,6 +115,11 @@ def _validate_scene_arrays(
         raise ValueError(
             f"colors.npy has {colors.shape[0]} rows, expected {N}"
         )
+    if normals is not None:
+        if normals.shape != (N, 3):
+            raise ValueError(
+                f"normals.npy shape {normals.shape}, expected ({N}, 3)"
+            )
 
     for name, arr in [
         ("labels", labels),
@@ -171,6 +177,7 @@ class TrainingPackScene:
 
     points: np.ndarray               # (N, 3) float
     colors: np.ndarray | None        # (N, 3) float/uint8 or None
+    normals: np.ndarray | None     # (N, 3) float — optional vertex normals
     labels: np.ndarray               # (N,)   int  — single granularity
     valid_points: np.ndarray         # (N,)   bool
     seen_points: np.ndarray          # (N,)   bool
@@ -198,6 +205,7 @@ class MultiGranTrainingPackScene:
 
     points: np.ndarray               # (N, 3) float
     colors: np.ndarray | None        # (N, 3) float/uint8 or None
+    normals: np.ndarray | None       # (N, 3) float — optional vertex normals
     labels_by_granularity: dict[str, np.ndarray]  # {"g02": (N,), ...}
     valid_points: np.ndarray         # (N,)   bool
     seen_points: np.ndarray          # (N,)   bool
@@ -248,6 +256,16 @@ def load_training_pack_scene(
             )
         colors = np.load(colors_path)
 
+    normals_path = pack_dir / "normals.npy"
+    has_normals = opt.get("normals.npy", normals_path.exists())
+    normals: np.ndarray | None = None
+    if has_normals:
+        if not normals_path.exists():
+            raise FileNotFoundError(
+                "scene_meta declares normals.npy present but file is missing"
+            )
+        normals = np.load(normals_path).astype(np.float32, copy=False)
+
     # ── labels ──
     label_path = _resolve_label_file(meta, granularity, pack_dir)
     labels = np.load(label_path)
@@ -261,6 +279,7 @@ def load_training_pack_scene(
         num_points_declared=num_points_declared,
         points=points,
         colors=colors,
+        normals=normals,
         labels=labels,
         valid_points=valid_points,
         seen_points=seen_points,
@@ -280,6 +299,7 @@ def load_training_pack_scene(
         training_pack_dir=pack_dir,
         points=points,
         colors=colors,
+        normals=normals,
         labels=labels,
         valid_points=valid_points,
         seen_points=seen_points,
@@ -335,6 +355,16 @@ def load_training_pack_scene_multi(
             )
         colors = np.load(colors_path)
 
+    normals_path = pack_dir / "normals.npy"
+    has_normals = opt.get("normals.npy", normals_path.exists())
+    normals_m: np.ndarray | None = None
+    if has_normals:
+        if not normals_path.exists():
+            raise FileNotFoundError(
+                "scene_meta declares normals.npy present but file is missing"
+            )
+        normals_m = np.load(normals_path).astype(np.float32, copy=False)
+
     valid_points = np.load(pack_dir / "valid_points.npy").astype(bool)
     seen_points = _load_seen_points_with_legacy_fallback(pack_dir, valid_points)
     supervision_mask = np.load(pack_dir / "supervision_mask.npy").astype(bool)
@@ -348,6 +378,7 @@ def load_training_pack_scene_multi(
             num_points_declared=num_points_declared,
             points=points,
             colors=colors,
+            normals=normals_m,
             labels=labels,
             valid_points=valid_points,
             seen_points=seen_points,
@@ -366,6 +397,7 @@ def load_training_pack_scene_multi(
         training_pack_dir=pack_dir,
         points=points,
         colors=colors,
+        normals=normals_m,
         labels_by_granularity=labels_by_gran,
         valid_points=valid_points,
         seen_points=seen_points,

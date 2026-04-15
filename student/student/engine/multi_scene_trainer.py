@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.utils import clip_grad_norm_
 from torch.nn.parallel import DistributedDataParallel
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import LinearLR, MultiStepLR, SequentialLR
 from torch.utils.data import DataLoader, RandomSampler, Subset
 from torch.utils.data.distributed import DistributedSampler
 
@@ -231,22 +231,33 @@ class MultiSceneTrainer:
             _unwrap_model(self.model).parameters(), lr=lr, weight_decay=weight_decay,
         )
 
-        # Linear warmup → cosine annealing
+        # Linear warmup → MultiStepLR
         if warmup_epochs > 0 and max_epochs > warmup_epochs:
             warmup_sched = LinearLR(
                 self.optimizer, start_factor=0.001, total_iters=warmup_epochs,
             )
-            cosine_sched = CosineAnnealingLR(
-                self.optimizer, T_max=max_epochs - warmup_epochs,
+            # MultiStepLR milestones are relative to the scheduler's own epoch
+            # counter. With SequentialLR, the second scheduler starts counting at
+            # 0 after warmup, so we offset to keep drops at global epochs 600/800.
+            base_milestones = [600, 800]
+            adjusted_milestones = sorted({
+                max(1, m - warmup_epochs) for m in base_milestones if m > warmup_epochs
+            })
+            multistep_sched = MultiStepLR(
+                self.optimizer,
+                milestones=adjusted_milestones,
+                gamma=0.1,
             )
             self.scheduler: torch.optim.lr_scheduler.LRScheduler = SequentialLR(
                 self.optimizer,
-                schedulers=[warmup_sched, cosine_sched],
+                schedulers=[warmup_sched, multistep_sched],
                 milestones=[warmup_epochs],
             )
         else:
-            self.scheduler = CosineAnnealingLR(
-                self.optimizer, T_max=max(max_epochs, 1),
+            self.scheduler = MultiStepLR(
+                self.optimizer,
+                milestones=[600, 800],
+                gamma=0.1,
             )
 
         self.train_sampler = (

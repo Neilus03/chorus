@@ -33,16 +33,21 @@ def build_input_features(
     *,
     use_colors: bool = True,
     append_xyz: bool = False,
+    use_normals: bool = False,
+    normals: np.ndarray | None = None,
 ) -> np.ndarray:
     """Build the (N, C) input feature matrix for LitePT.
 
     Rules (first version — no learned transforms):
-        * ``use_colors=True`` and colors exist → RGB  (C=3)
-        * ``use_colors=True`` but no colors    → zeros (C=3)
-        * ``use_colors=False``                 → zeros (C=3), unless append_xyz
-        * ``append_xyz=True``                  → append XYZ coords
+        * ``use_colors=True`` and colors exist → RGB  (3 channels)
+        * ``use_colors=True`` but no colors    → zeros (3)
+        * ``use_colors=False``                 → zeros (3), unless only-xyz mode below
+        * ``use_normals=True``                 → append normal vectors (3), or zeros if *normals* is None
+        * ``append_xyz=True``                  → append XYZ coords (3)
 
-    Returns float32 array of shape (N, C) where C ∈ {3, 6}.
+    Channel order matches LitePT ScanNet: **RGB, then normals, then optional XYZ**.
+
+    Returns float32 array of shape (N, C) where C ∈ {3, 6, 9, ...}.
     """
     N = points.shape[0]
     parts: list[np.ndarray] = []
@@ -54,6 +59,12 @@ def build_input_features(
         parts.append(c)
     elif not append_xyz or use_colors:
         parts.append(np.zeros((N, 3), dtype=np.float32))
+
+    if use_normals:
+        if normals is not None:
+            parts.append(normals.astype(np.float32, copy=False))
+        else:
+            parts.append(np.zeros((N, 3), dtype=np.float32))
 
     if append_xyz:
         parts.append(points.astype(np.float32))
@@ -92,6 +103,7 @@ class SingleSceneTrainingPackDataset(Dataset):
         *,
         use_colors: bool = True,
         append_xyz: bool = False,
+        use_normals: bool = False,
     ) -> None:
         super().__init__()
         self.scene: TrainingPackScene = load_training_pack_scene(
@@ -100,12 +112,15 @@ class SingleSceneTrainingPackDataset(Dataset):
         self.granularity = granularity
         self._use_colors = use_colors
         self._append_xyz = append_xyz
+        self._use_normals = use_normals
 
         self._features = build_input_features(
             self.scene.points,
             self.scene.colors,
             use_colors=use_colors,
             append_xyz=append_xyz,
+            use_normals=use_normals,
+            normals=self.scene.normals if use_normals else None,
         )
 
         print_training_pack_summary(self.scene)
@@ -172,6 +187,7 @@ class MultiGranSceneDataset(Dataset):
         *,
         use_colors: bool = True,
         append_xyz: bool = False,
+        use_normals: bool = False,
     ) -> None:
         super().__init__()
         self.scene: MultiGranTrainingPackScene = load_training_pack_scene_multi(
@@ -180,12 +196,15 @@ class MultiGranSceneDataset(Dataset):
         self.granularities = granularities
         self._use_colors = use_colors
         self._append_xyz = append_xyz
+        self._use_normals = use_normals
 
         self._features = build_input_features(
             self.scene.points,
             self.scene.colors,
             use_colors=use_colors,
             append_xyz=append_xyz,
+            use_normals=use_normals,
+            normals=self.scene.normals if use_normals else None,
         )
 
         log.info(

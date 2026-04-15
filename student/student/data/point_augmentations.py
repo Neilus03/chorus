@@ -41,6 +41,7 @@ def _random_rotate(
     axis: str,
     center: np.ndarray | list[float] | None,
     p: float,
+    normals: np.ndarray | None = None,
 ) -> None:
     if random.random() > p:
         return
@@ -58,6 +59,8 @@ def _random_rotate(
     coord -= c
     coord[:] = coord @ rot_t.T
     coord += c
+    if normals is not None:
+        normals[:] = normals @ rot_t.T
 
 
 def _random_scale(coord: np.ndarray, scale: tuple[float, float]) -> None:
@@ -65,11 +68,19 @@ def _random_scale(coord: np.ndarray, scale: tuple[float, float]) -> None:
     coord *= s
 
 
-def _random_flip(coord: np.ndarray, p: float) -> None:
+def _random_flip(
+    coord: np.ndarray,
+    p: float,
+    normals: np.ndarray | None = None,
+) -> None:
     if np.random.rand() < p:
         coord[:, 0] *= -1.0
+        if normals is not None:
+            normals[:, 0] *= -1.0
     if np.random.rand() < p:
         coord[:, 1] *= -1.0
+        if normals is not None:
+            normals[:, 1] *= -1.0
 
 
 def _random_jitter(coord: np.ndarray, sigma: float, clip: float) -> None:
@@ -133,11 +144,16 @@ def augment_points_litept_scannet(
     colors: np.ndarray | None,
     *,
     use_colors: bool = True,
-) -> tuple[np.ndarray, np.ndarray | None]:
+    normals: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
     """Copy inputs, apply LitePT ScanNet-style train augmentations, return augmented arrays.
 
     Order matches ``configs/scannet/insseg-litept-small-v1m2.py``: z/x/y rotate,
     scale, flip, jitter, elastic, chromatic jitter.
+
+    When *normals* is provided, the same **rigid** rotations and axis flips are
+    applied to normals. Uniform scale leaves directions unchanged. **Jitter and
+    elastic** warp positions only (v1 approximation — normals not updated).
     """
     coord = np.asarray(points, dtype=np.float32).copy()
     color: np.ndarray | None
@@ -148,11 +164,17 @@ def augment_points_litept_scannet(
     else:
         color = None
 
-    _random_rotate(coord, (-1.0, 1.0), "z", [0.0, 0.0, 0.0], p=0.5)
-    _random_rotate(coord, (-1.0 / 64.0, 1.0 / 64.0), "x", None, p=0.5)
-    _random_rotate(coord, (-1.0 / 64.0, 1.0 / 64.0), "y", None, p=0.5)
+    nrm: np.ndarray | None
+    if normals is not None:
+        nrm = np.asarray(normals, dtype=np.float32).copy()
+    else:
+        nrm = None
+
+    _random_rotate(coord, (-1.0, 1.0), "z", [0.0, 0.0, 0.0], p=0.5, normals=nrm)
+    _random_rotate(coord, (-1.0 / 64.0, 1.0 / 64.0), "x", None, p=0.5, normals=nrm)
+    _random_rotate(coord, (-1.0 / 64.0, 1.0 / 64.0), "y", None, p=0.5, normals=nrm)
     _random_scale(coord, (0.9, 1.1))
-    _random_flip(coord, p=0.5)
+    _random_flip(coord, p=0.5, normals=nrm)
     _random_jitter(coord, sigma=0.005, clip=0.02)
 
     if _HAS_SCIPY:
@@ -160,7 +182,7 @@ def augment_points_litept_scannet(
     if color is not None:
         _chromatic_jitter_float01(color, p=0.95, std=0.05)
 
-    return coord, color
+    return coord, color, nrm
 
 
 LITEP_SCANNET_DEFAULTS: dict[str, Any] = {
