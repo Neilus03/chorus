@@ -30,6 +30,26 @@ from student.data.single_scene_dataset import build_input_features
 log = logging.getLogger(__name__)
 
 
+def _normals_array_for_scene(
+    scene: MultiGranTrainingPackScene,
+    *,
+    use_normals: bool,
+    warned_ids: set[str],
+) -> np.ndarray | None:
+    """Return per-point normals for augmentation/features, or None if disabled."""
+    if not use_normals:
+        return None
+    if scene.normals is not None:
+        return np.asarray(scene.normals, dtype=np.float32)
+    if scene.scene_id not in warned_ids:
+        warned_ids.add(scene.scene_id)
+        log.warning(
+            "[%s] use_normals=True but normals.npy missing; using zeros",
+            scene.scene_id,
+        )
+    return np.zeros((scene.num_points, 3), dtype=np.float32)
+
+
 def build_scene_list(
     scene_list_file: Path,
     scans_root: Path,
@@ -95,6 +115,8 @@ class MultiSceneDataset(Dataset):
         Use RGB from ``colors.npy`` as input features.
     append_xyz:
         Append XYZ coordinates to the feature vector.
+    use_normals:
+        If True, concatenate mesh normals (from ``normals.npy`` or zeros if missing).
     preload:
         Load all scenes into memory at init time.  Recommended for
         small-scale experiments (10–20 scenes).
@@ -122,6 +144,7 @@ class MultiSceneDataset(Dataset):
         *,
         use_colors: bool = True,
         append_xyz: bool = False,
+        use_normals: bool = False,
         preload: bool = True,
         max_points: int | None = None,
         subsampling_mode: str = "sphere_crop",
@@ -133,6 +156,8 @@ class MultiSceneDataset(Dataset):
         self._granularities = granularities
         self._use_colors = use_colors
         self._append_xyz = append_xyz
+        self._use_normals = bool(use_normals)
+        self._missing_normals_warned: set[str] = set()
         self._max_points = max_points
         self._subsampling_mode = subsampling_mode
         self._sphere_point_max = sphere_point_max
@@ -178,9 +203,17 @@ class MultiSceneDataset(Dataset):
         if preload:
             for sd in self._scene_dirs:
                 scene = load_training_pack_scene_multi(sd, granularities)
+                n_arr = _normals_array_for_scene(
+                    scene,
+                    use_normals=self._use_normals,
+                    warned_ids=self._missing_normals_warned,
+                )
                 feats = build_input_features(
                     scene.points, scene.colors,
-                    use_colors=use_colors, append_xyz=append_xyz,
+                    use_colors=use_colors,
+                    append_xyz=append_xyz,
+                    use_normals=self._use_normals,
+                    normals=n_arr if self._use_normals else None,
                 )
                 self._scenes.append(scene)
                 effective_points = scene.num_points
@@ -248,17 +281,26 @@ class MultiSceneDataset(Dataset):
             base_points = scene.points
             base_colors = scene.colors
 
+        n_arr = _normals_array_for_scene(
+            scene,
+            use_normals=self._use_normals,
+            warned_ids=self._missing_normals_warned,
+        )
+
         if self._train_augmentations:
-            aug_pts, aug_cols = augment_points_litept_scannet(
+            aug_pts, aug_cols, aug_nrm = augment_points_litept_scannet(
                 base_points,
                 base_colors,
                 use_colors=self._use_colors,
+                normals=n_arr,
             )
             features = build_input_features(
                 aug_pts,
                 aug_cols,
                 use_colors=self._use_colors,
                 append_xyz=self._append_xyz,
+                use_normals=self._use_normals,
+                normals=aug_nrm if self._use_normals else None,
             )
             points_np = aug_pts
         elif self._scenes and self._features_cache is not None:
@@ -270,6 +312,8 @@ class MultiSceneDataset(Dataset):
                 base_colors,
                 use_colors=self._use_colors,
                 append_xyz=self._append_xyz,
+                use_normals=self._use_normals,
+                normals=n_arr if self._use_normals else None,
             )
             points_np = base_points
 

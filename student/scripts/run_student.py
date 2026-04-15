@@ -144,6 +144,7 @@ def main() -> None:
         granularities=granularities,
         use_colors=data_cfg.get("use_colors", True),
         append_xyz=data_cfg.get("append_xyz_to_features", False),
+        use_normals=data_cfg.get("use_normals", False),
     )
     sample = ds[0]
 

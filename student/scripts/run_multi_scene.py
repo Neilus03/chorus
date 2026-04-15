@@ -381,10 +381,13 @@ def main() -> None:
         if train_aug:
             log.info("Training augmentations enabled (LitePT-style; validation unchanged)")
 
+        use_normals = bool(data_cfg.get("use_normals", False))
+
         train_ds = MultiSceneDataset(
             train_dirs, granularities,
             use_colors=data_cfg.get("use_colors", True),
             append_xyz=data_cfg.get("append_xyz_to_features", False),
+            use_normals=use_normals,
             preload=data_cfg.get("preload", True),
             max_points=max_pts,
             subsampling_mode=data_cfg.get("subsampling_mode", "sphere_crop"),
@@ -396,6 +399,7 @@ def main() -> None:
             val_dirs, granularities,
             use_colors=data_cfg.get("use_colors", True),
             append_xyz=data_cfg.get("append_xyz_to_features", False),
+            use_normals=use_normals,
             preload=data_cfg.get("preload", True),
             max_points=val_max_pts,
             subsampling_mode=data_cfg.get("val_subsampling_mode", data_cfg.get("subsampling_mode", "sphere_crop")),
@@ -414,6 +418,16 @@ def main() -> None:
         )
 
         # ── 5. model ──
+        if use_normals:
+            mbb = cfg.setdefault("model", {}).setdefault("backbone", {})
+            if mbb.get("in_channels", 3) == 3:
+                append_xyz = bool(data_cfg.get("append_xyz_to_features", False))
+                mbb["in_channels"] = 9 if append_xyz else 6
+                log.info(
+                    "use_normals=True: model.backbone.in_channels=%d (auto)",
+                    mbb["in_channels"],
+                )
+
         bb_cfg = model_cfg["backbone"]
         num_queries, num_queries_by_granularity = resolve_num_queries(model_cfg, bb_cfg)
         log.info("Building model ...")

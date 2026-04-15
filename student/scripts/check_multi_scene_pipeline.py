@@ -138,17 +138,18 @@ def main() -> None:
 
     # ── 3. Sample dict structure ─────────────────────────────────
     sep("3. SAMPLE DICT STRUCTURE")
-    expected_keys = {
+    required_keys = {
         "scene_id", "scene_dir", "points", "features",
         "labels_by_granularity", "valid_points", "seen_points",
         "supervision_mask", "scene_meta", "granularities",
     }
+    optional_keys = {"vertex_indices"}
     sample = train_ds[0]
     actual_keys = set(sample.keys())
-    keys_ok = actual_keys == expected_keys
-    print(f"  expected keys    : {sorted(expected_keys)}")
+    keys_ok = required_keys <= actual_keys and (actual_keys - required_keys) <= optional_keys
+    print(f"  required keys    : {sorted(required_keys)}")
     print(f"  actual keys      : {sorted(actual_keys)}")
-    print(f"  keys match       : {'YES' if keys_ok else 'NO — missing: ' + str(expected_keys - actual_keys) + ' extra: ' + str(actual_keys - expected_keys)}")
+    print(f"  keys match       : {'YES' if keys_ok else 'NO — missing: ' + str(required_keys - actual_keys) + ' extra: ' + str(actual_keys - required_keys - optional_keys)}")
 
     print(f"  sample tensors:")
     for k, v in sorted(sample.items()):
@@ -167,7 +168,10 @@ def main() -> None:
         assert set(s["labels_by_granularity"].keys()) == set(granularities)
     for i in range(len(val_ds)):
         s = val_ds[i]
-        assert set(s.keys()) == expected_keys, f"val[{i}] keys mismatch"
+        sk = set(s.keys())
+        assert required_keys <= sk and (sk - required_keys) <= optional_keys, (
+            f"val[{i}] keys mismatch"
+        )
     print(f"  all {len(train_ds) + len(val_ds)} samples structurally valid")
 
     # ── 4. Targets ───────────────────────────────────────────────
