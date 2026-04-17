@@ -709,7 +709,28 @@ class MultiSceneTrainer:
                 key.removeprefix("module."): value
                 for key, value in model_state_dict.items()
             }
-        self._model_module().load_state_dict(model_state_dict)
+        try:
+            self._model_module().load_state_dict(model_state_dict)
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "size mismatch" in msg and "stem.conv.weight" in msg:
+                saved = checkpoint.get("config") or {}
+                saved_data = saved.get("data", {}) if isinstance(saved, dict) else {}
+                saved_bb = (
+                    (saved.get("model") or {}).get("backbone", {})
+                    if isinstance(saved, dict)
+                    else {}
+                )
+                raise RuntimeError(
+                    f"{msg}\n"
+                    "Hint: first conv input width mismatch — the checkpoint was trained with a "
+                    "different point feature layout than the current config (e.g. "
+                    f"saved data.use_normals={saved_data.get('use_normals', '?')}, "
+                    f"saved backbone.in_channels={saved_bb.get('in_channels', '?')}). "
+                    "Match data.use_normals / data.append_xyz_to_features / "
+                    "model.backbone.in_channels to the run that produced this checkpoint."
+                ) from exc
+            raise
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 

@@ -192,6 +192,15 @@ def main() -> None:
     parser.add_argument("--wandb-project", type=str, default="chorus-student")
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument(
+        "--wandb-run-id",
+        type=str,
+        default=None,
+        help=(
+            "Continue this W&B run (same as env WANDB_RUN_ID). "
+            "Uses resume from WANDB_RESUME or defaults to 'allow'."
+        ),
+    )
+    parser.add_argument(
         "--wandb-offline",
         action="store_true",
         help="Log to Weights & Biases in offline mode (no network). Sync later with: wandb sync <run_dir>",
@@ -496,6 +505,23 @@ def main() -> None:
             )
             if wandb_offline:
                 init_kw["settings"] = wandb.Settings(mode="offline")
+            wandb_run_id = (
+                (args.wandb_run_id or os.environ.get("WANDB_RUN_ID") or "").strip() or None
+            )
+            wandb_resume = (os.environ.get("WANDB_RESUME") or "").strip() or None
+            if wandb_run_id:
+                init_kw["id"] = wandb_run_id
+                init_kw["resume"] = wandb_resume or "allow"
+                log.info(
+                    "wandb run continuation: id=%s resume=%s",
+                    wandb_run_id,
+                    init_kw["resume"],
+                )
+            elif args.resume:
+                log.warning(
+                    "Checkpoint resume (--resume) but no W&B run id "
+                    "(set WANDB_RUN_ID or --wandb-run-id); wandb will start a new run."
+                )
             wandb.init(**init_kw)
             wandb.define_metric("epoch")
             wandb.define_metric("global_step")
@@ -506,9 +532,11 @@ def main() -> None:
             wandb.define_metric("train_eval/*", step_metric="epoch")
             wandb.define_metric("train_eval_scene/*", step_metric="epoch")
             if wandb_offline:
+                # wandb.run.dir is .../offline-run-.../files; metrics live in .../offline-run-.../*.wandb
+                sync_dir = str(Path(wandb.run.dir).resolve().parent)
                 log.info(
                     "wandb offline — sync to the hub after the run: wandb sync %s",
-                    wandb.run.dir,
+                    sync_dir,
                 )
             else:
                 log.info("wandb run: %s", wandb.run.url)
