@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem-per-cpu=4G
-#SBATCH --gpus=rtx_3090:4
+#SBATCH --gpus=rtx_4090:4,rtx_3090:4,a100:4
 #SBATCH --time=48:00:00
 
 set -euo pipefail
