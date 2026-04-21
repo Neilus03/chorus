@@ -22,3 +22,4 @@ chorus/logs/
 student/logs/
 
 *.txt
+chorus/.venv*
