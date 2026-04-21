@@ -107,14 +107,67 @@ def build_pairwise_cost_matrix(
 @torch.no_grad()
 def hungarian_match(
     cost_matrix: torch.Tensor,
-) -> tuple[np.ndarray, np.ndarray]:
+    *,
+    context: str = "",
+    sanitize_non_finite: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray]:
     """Run scipy Hungarian on a [Q, M] cost matrix.
 
     Returns (pred_indices, gt_indices) — both int arrays of length M
     (assuming Q >= M, every GT gets a match).
     """
+    if cost_matrix.numel() == 0:
+        return np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64)
+
+    if not torch.isfinite(cost_matrix).all():
+        # Cost matrices can occasionally contain NaN/Inf if upstream logits blow
+        # up or targets contain unexpected values. By default we sanitize to
+        # "very bad" costs so training can continue, but we log loudly.
+        non_finite = ~torch.isfinite(cost_matrix)
+        nf_count = int(non_finite.sum().item())
+        total = int(cost_matrix.numel())
+        finite_vals = cost_matrix[~non_finite]
+        finite_min = float(finite_vals.min().item()) if finite_vals.numel() else float("nan")
+        finite_max = float(finite_vals.max().item()) if finite_vals.numel() else float("nan")
+        log.error(
+            "Non-finite entries in Hungarian cost matrix%s: shape=%s non_finite=%d/%d finite_min=%s finite_max=%s",
+            f" ({context})" if context else "",
+            tuple(cost_matrix.shape),
+            nf_count,
+            total,
+            f"{finite_min:.6g}" if np.isfinite(finite_min) else str(finite_min),
+            f"{finite_max:.6g}" if np.isfinite(finite_max) else str(finite_max),
+        )
+
+        if sanitize_non_finite:
+            # Replace NaN/Inf with a large finite value so SciPy can proceed.
+            # Keep relative scale by anchoring to max finite if available.
+            if finite_vals.numel():
+                replacement = float(finite_vals.max().item()) + 1e6
+            else:
+                replacement = 1e6
+            cost_matrix = torch.where(non_finite, cost_matrix.new_full((), replacement), cost_matrix)
+        else:
+            raise ValueError(
+                f"Hungarian cost matrix contains non-finite entries{f' ({context})' if context else ''}."
+            )
+
     cost_np = cost_matrix.detach().cpu().numpy()
-    pred_idx, gt_idx = linear_sum_assignment(cost_np)
+    try:
+        pred_idx, gt_idx = linear_sum_assignment(cost_np)
+    except ValueError as e:
+        # Re-log with a bit more detail so the crash is actionable.
+        cm = cost_matrix
+        log.error(
+            "Hungarian matching failed%s: shape=%s min=%s max=%s finite=%s",
+            f" ({context})" if context else "",
+            tuple(cm.shape),
+            f"{float(cm.min().item()):.6g}" if cm.numel() else "n/a",
+            f"{float(cm.max().item()):.6g}" if cm.numel() else "n/a",
+            bool(torch.isfinite(cm).all().item()) if cm.numel() else True,
+        )
+        raise
+
     return pred_idx.astype(np.int64), gt_idx.astype(np.int64)
 
 
@@ -156,6 +209,8 @@ class MaskSetCriterion(nn.Module):
         self,
         pred: dict[str, torch.Tensor],
         targets: InstanceTargets,
+        *,
+        context: str = "",
     ) -> dict[str, Any]:
         """
         Parameters
@@ -181,12 +236,44 @@ class MaskSetCriterion(nn.Module):
         supervised = supervision_mask.bool()
 
         # ── matching ──
+        if not torch.isfinite(mask_logits).all():
+            nf = int((~torch.isfinite(mask_logits)).sum().item())
+            log.error(
+                "Non-finite values in pred mask_logits%s: shape=%s non_finite=%d/%d",
+                f" ({context})" if context else "",
+                tuple(mask_logits.shape),
+                nf,
+                int(mask_logits.numel()),
+            )
+        if not torch.isfinite(score_logits).all():
+            nf = int((~torch.isfinite(score_logits)).sum().item())
+            log.error(
+                "Non-finite values in pred score_logits%s: shape=%s non_finite=%d/%d",
+                f" ({context})" if context else "",
+                tuple(score_logits.shape),
+                nf,
+                int(score_logits.numel()),
+            )
+        if not torch.isfinite(gt_masks).all():
+            nf = int((~torch.isfinite(gt_masks)).sum().item())
+            log.error(
+                "Non-finite values in GT masks%s: shape=%s non_finite=%d/%d",
+                f" ({context})" if context else "",
+                tuple(gt_masks.shape),
+                nf,
+                int(gt_masks.numel()),
+            )
+
         cost_matrix = build_pairwise_cost_matrix(
             mask_logits, gt_masks, supervision_mask,
             bce_weight=self.cost_bce_weight,
             dice_weight=self.cost_dice_weight,
         )
-        pred_idx, gt_idx = hungarian_match(cost_matrix)
+        pred_idx, gt_idx = hungarian_match(
+            cost_matrix,
+            context=context,
+            sanitize_non_finite=True,
+        )
         pred_idx_t = torch.from_numpy(pred_idx).to(mask_logits.device)
         gt_idx_t = torch.from_numpy(gt_idx).to(mask_logits.device)
 
@@ -277,7 +364,7 @@ class MultiGranCriterion(nn.Module):
 
         for g, targets_g in targets_by_granularity.items():
             head_pred = heads_pred[g]
-            ld = self.criterion(head_pred, targets_g)
+            ld = self.criterion(head_pred, targets_g, context=f"granularity={g}")
 
             w = self.granularity_weights.get(g, 1.0)
             weighted = w * ld["loss_total"]
