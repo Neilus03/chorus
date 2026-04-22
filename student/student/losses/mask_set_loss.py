@@ -423,3 +423,68 @@ class MultiGranCriterion(nn.Module):
                 result["loss_total"] = result["loss_total"] + weighted_aux
 
         return result
+
+
+class SingleGranCriterion(nn.Module):
+    """Criterion for :class:`ContinuousQueryInstanceDecoder` (single-head).
+
+    Wraps :class:`MaskSetCriterion` and handles the flat output dict from the
+    continuous decoder, including auxiliary layer losses.
+
+    Parameters
+    ----------
+    criterion:
+        A shared :class:`MaskSetCriterion` instance.
+    aux_weight:
+        Multiplier on losses from intermediate decoder layers.
+    """
+
+    def __init__(
+        self,
+        criterion: MaskSetCriterion,
+        aux_weight: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.criterion = criterion
+        self.aux_weight = aux_weight
+
+    def forward(
+        self,
+        pred: dict,
+        targets: "InstanceTargets",
+        *,
+        context: str = "",
+    ) -> dict[str, Any]:
+        """
+        Parameters
+        ----------
+        pred:
+            Flat dict from ``ContinuousQueryInstanceDecoder`` with
+            ``mask_logits`` [Q, N], ``score_logits`` [Q], and optionally
+            ``aux_outputs`` — list of intermediate-layer prediction dicts.
+        targets:
+            :class:`InstanceTargets` for the sampled granularity.
+
+        Returns
+        -------
+        Dict with ``loss_total``, individual losses, matching info, and
+        optional ``loss_aux``.
+        """
+        result = self.criterion(pred, targets, context=context)
+
+        if self.aux_weight > 0 and "aux_outputs" in pred:
+            aux_loss_sum = None
+            for aux_idx, aux_pred in enumerate(pred["aux_outputs"]):
+                aux_ctx = f"{context}/aux{aux_idx}" if context else f"aux{aux_idx}"
+                aux_result = self.criterion(aux_pred, targets, context=aux_ctx)
+                if aux_loss_sum is None:
+                    aux_loss_sum = aux_result["loss_total"]
+                else:
+                    aux_loss_sum = aux_loss_sum + aux_result["loss_total"]
+
+            if aux_loss_sum is not None:
+                weighted_aux = self.aux_weight * aux_loss_sum
+                result["loss_aux"] = weighted_aux.detach()
+                result["loss_total"] = result["loss_total"] + weighted_aux
+
+        return result
