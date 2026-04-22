@@ -1,8 +1,8 @@
-# Train 100 / val 10 — LitePT aug, 4-GPU DDP batched scenes, Pointcept-style sphere crops.
-# Launch: torchrun --nproc_per_node=4 scripts/run_multi_scene.py --config configs/scannet_train100_val10_aug_ddp4_batched_pointcept.yaml
+# Finetune: start from pseudo-trained student weights, train on real ScanNet GT for 100 epochs.
+# Launch (DDP 4xGPU): torchrun --standalone --nproc_per_node=4 scripts/run_multi_scene.py --config configs/scannet_full_aug_ddp4_batch_pointcept_ft100_gt.yaml --finetune-from /path/to/best.pt
 
 experiment:
-  name: scannet_full_aug_ddp4_batched_pointcept_eval_every_30
+  name: scannet_full_aug_ddp4_batched_pointcept_ft100_gt
   seed: 42
   output_root: ${CHORUS_OUTPUT_ROOT:-/scratch2/nedela/student_runs}
 
@@ -20,6 +20,9 @@ data:
   subsampling_mode: sphere_crop
   augmentations: true
   dense_instance_ids: false
+  # Switch training supervision from pack pseudo labels to real ScanNet GT instance ids.
+  # GT is replicated to all three heads (g02/g05/g08).
+  label_source: scannet_gt
 
 model:
   backbone:
@@ -50,14 +53,15 @@ loss:
 
 train:
   device: cuda
-  lr: 3.0e-4
+  # Finetune defaults (lower LR, shorter warmup, frequent eval)
+  lr: 1.0e-4
   weight_decay: 1.0e-5
   grad_clip_norm: 1.0
-  max_epochs: 1000
-  eval_every_epochs: 30
+  max_epochs: 100
+  eval_every_epochs: 5
   save_every_epochs: 10
   log_every_steps: 50
-  warmup_epochs: 20
+  warmup_epochs: 5
   num_workers: 2
   batch_scenes_per_step: 2
   balance_train_by_points: true
@@ -71,6 +75,7 @@ train:
   decoder_loss_mode: scene_local
 
 eval:
+  # Used both for training-time evaluation and to decide which GT instances are supervised/kept.
   scannet_benchmark: all
   score_threshold: 0.1
   mask_threshold: 0.5

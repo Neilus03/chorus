@@ -157,6 +157,20 @@ def main() -> None:
         default=None,
         help="Resume from checkpoint path, or use 'last'/'best' in output/checkpoints",
     )
+    parser.add_argument(
+        "--finetune-from",
+        type=str,
+        default=None,
+        help=(
+            "Initialize model weights from a checkpoint but reset optimizer/scheduler "
+            "and restart training from epoch 0."
+        ),
+    )
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Run one validation pass and exit (use with --resume or --finetune-from).",
+    )
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument(
         "--no-train-metrics",
@@ -402,6 +416,8 @@ def main() -> None:
             subsampling_mode=data_cfg.get("subsampling_mode", "sphere_crop"),
             sphere_point_max=data_cfg.get("sphere_point_max", None),
             train_augmentations=train_aug,
+            label_source=data_cfg.get("label_source", "pack"),
+            scannet_eval_benchmark=eval_cfg.get("scannet_benchmark", "all"),
         )
         val_max_pts = data_cfg.get("val_max_points", None)
         val_ds = MultiSceneDataset(
@@ -414,6 +430,8 @@ def main() -> None:
             subsampling_mode=data_cfg.get("val_subsampling_mode", data_cfg.get("subsampling_mode", "sphere_crop")),
             sphere_point_max=data_cfg.get("val_sphere_point_max", data_cfg.get("sphere_point_max", None)),
             train_augmentations=False,
+            label_source=data_cfg.get("label_source", "pack"),
+            scannet_eval_benchmark=eval_cfg.get("scannet_benchmark", "all"),
         )
         log.info(
             "Train batching: scenes/step=%d  shard_balance=%s  drop_last=%s  "
@@ -517,9 +535,9 @@ def main() -> None:
                     wandb_run_id,
                     init_kw["resume"],
                 )
-            elif args.resume:
+            elif args.resume or args.finetune_from:
                 log.warning(
-                    "Checkpoint resume (--resume) but no W&B run id "
+                    "Checkpoint init (--resume/--finetune-from) but no W&B run id "
                     "(set WANDB_RUN_ID or --wandb-run-id); wandb will start a new run."
                 )
             wandb.init(**init_kw)
@@ -613,13 +631,25 @@ def main() -> None:
             is_main_process=is_main_process,
         )
 
-        if args.resume:
+        if args.resume and args.finetune_from:
+            raise ValueError("Use only one of --resume or --finetune-from.")
+
+        if args.finetune_from:
+            trainer.load_weights_only(Path(args.finetune_from))
+            _dist_barrier()
+        elif args.resume:
             if args.resume in {"last", "best"}:
                 ckpt_path = out_dir / "checkpoints" / f"{args.resume}.pt"
             else:
                 ckpt_path = Path(args.resume)
             trainer.load_checkpoint(ckpt_path)
             _dist_barrier()
+
+        if args.eval_only:
+            _dist_barrier()
+            trainer._validate(epoch=trainer.current_epoch)
+            _dist_barrier()
+            return
 
         final_metrics = trainer.train()
 
