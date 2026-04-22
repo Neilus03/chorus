@@ -6,6 +6,8 @@ from student.models.instance_decoder import (
     GranularityHead,
     MultiHeadQueryInstanceDecoder,
 )
+from student.models.continuous_decoder import ContinuousQueryInstanceDecoder
+from student.models.finetune_wrapper import FineTuningWrapper
 from student.models.student_model import StudentInstanceSegModel
 
 __all__ = [
@@ -16,5 +18,7 @@ __all__ = [
     "HybridQueryInitializer",
     "GranularityHead",
     "MultiHeadQueryInstanceDecoder",
+    "ContinuousQueryInstanceDecoder",
+    "FineTuningWrapper",
     "StudentInstanceSegModel",
 ]
