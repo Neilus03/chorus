@@ -114,6 +114,7 @@ class MultiSceneTrainer:
         *,
         device: str = "cuda:0",
         lr: float = 1e-4,
+        backbone_lr_scale: float = 0.1,
         weight_decay: float = 1e-4,
         grad_clip_norm: float = 1.0,
         max_epochs: int = 50,
@@ -158,6 +159,7 @@ class MultiSceneTrainer:
     ) -> None:
         self.device = device
         self.lr = lr
+        self.backbone_lr_scale = backbone_lr_scale
         self.grad_clip_norm = grad_clip_norm
         self.max_epochs = max_epochs
         self.eval_every_epochs = eval_every_epochs
@@ -226,10 +228,22 @@ class MultiSceneTrainer:
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
 
-        # Uniform LR — training from scratch, no pretrained backbone weights
-        self.optimizer = torch.optim.AdamW(
-            _unwrap_model(self.model).parameters(), lr=lr, weight_decay=weight_decay,
-        )
+        base_model = _unwrap_model(self.model)
+        if hasattr(base_model, "parameter_groups"):
+            param_groups = [
+                {"params": pg["params"], "lr": lr * pg["lr_scale"]}
+                for pg in base_model.parameter_groups(backbone_lr_scale)
+            ]
+            self.optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
+        else:
+            # Uniform LR — training from scratch, no pretrained backbone weights
+            self.optimizer = torch.optim.AdamW(
+                base_model.parameters(),
+                lr=lr,
+                weight_decay=weight_decay,
+            )
+
+    
 
         # Linear warmup → MultiStepLR
         if warmup_epochs > 0 and max_epochs > warmup_epochs:
@@ -746,6 +760,42 @@ class MultiSceneTrainer:
             self.global_step,
             self.best_val_metric,
             self.best_epoch,
+        )
+
+    def load_weights_only(self, path: Path | str, *, strict: bool = True) -> None:
+        """Load model weights from a checkpoint but reset training state.
+
+        Intended for finetuning: initialize the model from a prior run while
+        restarting epoch counters and best-metric tracking. Optimizer/scheduler
+        state is intentionally NOT restored.
+        """
+        ckpt_path = Path(path)
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+        checkpoint = torch.load(ckpt_path, map_location=self.device)
+        model_state_dict = checkpoint.get("model_state_dict")
+        if not isinstance(model_state_dict, dict):
+            raise KeyError(
+                f"Checkpoint {ckpt_path} missing 'model_state_dict' (keys={sorted(checkpoint.keys())})"
+            )
+        if any(key.startswith("module.") for key in model_state_dict):
+            model_state_dict = {
+                key.removeprefix("module."): value
+                for key, value in model_state_dict.items()
+            }
+
+        self._model_module().load_state_dict(model_state_dict, strict=strict)
+
+        self.current_epoch = 0
+        self.global_step = 0
+        self.best_val_metric = -1.0
+        self.best_epoch = -1
+
+        log.info(
+            "Loaded weights-only init from %s (strict=%s); reset epoch/global_step/best metrics.",
+            ckpt_path,
+            strict,
         )
 
     # ------------------------------------------------------------------ #
