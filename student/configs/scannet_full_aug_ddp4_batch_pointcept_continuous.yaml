@@ -1,0 +1,77 @@
+# Continuous granularity decoder — LitePT aug, 4-GPU DDP batched scenes, Pointcept-style sphere crops.
+# Launch: torchrun --nproc_per_node=4 scripts/run_multi_scene.py --config configs/scannet_full_aug_ddp4_batch_pointcept_continuous.yaml
+
+experiment:
+  name: scannet_full_continuous_ddp4_batched_pointcept
+  seed: 42
+  output_root: ${CHORUS_OUTPUT_ROOT:-/scratch2/nedela/student_runs}
+
+data:
+  scans_root: ${SCANNET_SCANS_ROOT:-/scratch2/nedela/chorus_poc/scans}
+  train_split: configs/splits/scannet_full_train.txt
+  val_split: configs/splits/scannet_full_val.txt
+  granularities: [0.2, 0.5, 0.8]
+  use_colors: true
+  use_normals: true
+  append_xyz_to_features: true
+  min_instance_points: 10
+  preload: false
+  max_points: 70000
+  subsampling_mode: sphere_crop
+  augmentations: true
+  dense_instance_ids: false
+
+model:
+  decoder_type: continuous
+  backbone:
+    name: litept
+    litept_root: ${LITEPT_ROOT:-/home/nedela/projects/LitePT}
+    litept_variant: litept_s_star
+    in_channels: 9
+    grid_size: 0.02
+    multi_scale: true
+    multi_scale_indices: [0, 1, 2, 3]
+  num_queries: 250
+  # num_queries_by_granularity is not used in continuous mode;
+  # all queries share a single pool conditioned by the sampled scale.
+  decoder_hidden_dim: 256
+  num_decoder_layers: 4
+  num_decoder_heads: 8
+  query_init: hybrid
+  use_positional_guidance: true
+  learned_query_ratio: 0.25
+
+loss:
+  bce_weight: 1.0
+  dice_weight: 1.0
+  score_weight: 0.5
+  aux_weight: 0.2
+
+train:
+  device: cuda
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  grad_clip_norm: 1.0
+  max_epochs: 1000
+  eval_every_epochs: 30
+  save_every_epochs: 10
+  log_every_steps: 50
+  warmup_epochs: 20
+  num_workers: 2
+  batch_scenes_per_step: 2
+  balance_train_by_points: true
+  drop_last_train: false
+  sync_step_metrics: false
+  log_scene_ids: false
+  profile_train_steps: false
+  profile_every_steps: 10
+  max_total_points_per_batch: null
+  batch_assembly_policy: sequential
+  decoder_loss_mode: scene_local
+
+eval:
+  scannet_benchmark: all
+  score_threshold: 0.1
+  mask_threshold: 0.5
+  min_points_per_proposal: 30
+  fragment_merge_eval: false

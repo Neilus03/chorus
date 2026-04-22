@@ -35,7 +35,7 @@ from student.config_utils import (
     set_seed,
 )
 from student.data.multi_scene_dataset import MultiSceneDataset, build_scene_list
-from student.losses import MaskSetCriterion, MultiGranCriterion
+from student.losses import MaskSetCriterion, MultiGranCriterion, SingleGranCriterion
 from student.models.student_model import build_student_model
 from student.engine.multi_scene_trainer import MultiSceneTrainer
 
@@ -458,6 +458,7 @@ def main() -> None:
         bb_cfg = model_cfg["backbone"]
         num_queries, num_queries_by_granularity = resolve_num_queries(model_cfg, bb_cfg)
         log.info("Building model ...")
+        decoder_type = model_cfg.get("decoder_type", "multi_head")
         model = build_student_model(
             litept_root=bb_cfg["litept_root"],
             in_channels=bb_cfg.get("in_channels", 3),
@@ -474,25 +475,34 @@ def main() -> None:
             use_positional_guidance=model_cfg.get("use_positional_guidance", True),
             learned_query_ratio=model_cfg.get("learned_query_ratio", 0.25),
             multi_scale=bb_cfg.get("multi_scale", False),
+            decoder_type=decoder_type,
         )
         total_params = sum(p.numel() for p in model.parameters())
-        log.info("Model: %s params (%d heads)", f"{total_params:,}", len(granularities))
+        num_heads_display = 1 if decoder_type == "continuous" else len(granularities)
+        head_label = "1 head (continuous)" if decoder_type == "continuous" else f"{num_heads_display} heads"
+        log.info("Model: %s params (%s)", f"{total_params:,}", head_label)
         if args.print_model:
             for line in str(model).splitlines():
                 log.info("%s", line)
 
         # ── 6. criterion ──
-        log.info("Building criterion ...")
+        log.info("Building criterion (decoder_type=%s) ...", decoder_type)
         base_criterion = MaskSetCriterion(
             bce_weight=loss_cfg.get("bce_weight", 1.0),
             dice_weight=loss_cfg.get("dice_weight", 1.0),
             score_weight=loss_cfg.get("score_weight", 0.5),
         )
-        criterion = MultiGranCriterion(
-            criterion=base_criterion,
-            granularity_weights=loss_cfg.get("granularity_weights", None),
-            aux_weight=loss_cfg.get("aux_weight", 0.0),
-        )
+        if decoder_type == "continuous":
+            criterion: MultiGranCriterion | SingleGranCriterion = SingleGranCriterion(
+                criterion=base_criterion,
+                aux_weight=loss_cfg.get("aux_weight", 0.0),
+            )
+        else:
+            criterion = MultiGranCriterion(
+                criterion=base_criterion,
+                granularity_weights=loss_cfg.get("granularity_weights", None),
+                aux_weight=loss_cfg.get("aux_weight", 0.0),
+            )
 
         # ── output dir ──
         log.info("Preparing output directory ...")

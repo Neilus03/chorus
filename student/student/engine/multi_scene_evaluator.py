@@ -3,6 +3,8 @@
 Wraps existing :func:`evaluate_student_predictions_multi` and
 :func:`compute_pseudo_metrics_multi` with cross-scene iteration and
 metric aggregation.
+
+Supports both multi-head and continuous decoder models transparently.
 """
 
 from __future__ import annotations
@@ -22,8 +24,38 @@ from student.data.target_builder import build_instance_targets_multi
 from student.engine.evaluator import evaluate_student_predictions_multi
 from student.engine.fragment_merge_eval import evaluate_scene_fragment_merge
 from student.metrics.pseudo_metrics import compute_pseudo_metrics_multi
+from student.models.continuous_decoder import ContinuousQueryInstanceDecoder
 
 log = logging.getLogger(__name__)
+
+
+# ── granularity key → float value ────────────────────────────────────────
+
+_GRAN_KEY_TO_VAL = {
+    "g02": 0.2, "g05": 0.5, "g08": 0.8,
+    "g01": 0.1, "g03": 0.3, "g04": 0.4,
+    "g06": 0.6, "g07": 0.7, "g09": 0.9,
+    "g10": 1.0,
+}
+
+
+def _gran_key_to_float(key: str) -> float:
+    """Convert granularity key like 'g05' → 0.5."""
+    if key in _GRAN_KEY_TO_VAL:
+        return _GRAN_KEY_TO_VAL[key]
+    return float(key.replace("g0", "0.").replace("g", "0."))
+
+
+def _is_continuous_model(model: nn.Module) -> bool:
+    """Check if model uses a ContinuousQueryInstanceDecoder."""
+    # Unwrap DDP / FineTuningWrapper
+    m = model
+    if hasattr(m, "module"):
+        m = m.module
+    if hasattr(m, "model"):
+        m = m.model
+    decoder = getattr(m, "decoder", None)
+    return isinstance(decoder, ContinuousQueryInstanceDecoder)
 
 
 def _clear_backbone_cache(model: nn.Module) -> None:
@@ -133,6 +165,56 @@ def _base_dataset_and_index(
     return dataset, idx
 
 
+# ── continuous decoder: per-granularity forward + assembly ───────────────
+
+
+def _evaluate_continuous_scene(
+    model: nn.Module,
+    points: torch.Tensor,
+    features: torch.Tensor,
+    granularities: tuple[str, ...],
+    criterion: nn.Module,
+    targets_by_gran: dict,
+) -> tuple[dict, dict]:
+    """Run continuous decoder at each granularity, assemble multi-head output.
+
+    Returns (pred_multihead, loss_result_multihead) in the format expected
+    by ``evaluate_student_predictions_multi`` and ``compute_pseudo_metrics_multi``.
+    """
+    heads_pred: dict[str, dict] = {}
+    heads_loss: dict[str, dict] = {}
+    loss_total = torch.tensor(0.0, device=points.device)
+    point_embed = None
+
+    for g in granularities:
+        g_val = _gran_key_to_float(g)
+        flat_pred = model(points, features, target_g=g_val)
+        heads_pred[g] = {
+            "mask_logits": flat_pred["mask_logits"],
+            "score_logits": flat_pred["score_logits"],
+            "query_embed": flat_pred.get("query_embed"),
+        }
+        if point_embed is None:
+            point_embed = flat_pred.get("point_embed")
+
+        # Compute per-granularity loss
+        targets_g = targets_by_gran[g]
+        g_loss = criterion(flat_pred, targets_g, context=f"eval/{g}")
+        heads_loss[g] = g_loss
+        loss_total = loss_total + g_loss["loss_total"]
+
+    pred_multihead = {"heads": heads_pred}
+    if point_embed is not None:
+        pred_multihead["point_embed"] = point_embed
+
+    loss_multihead = {
+        "loss_total": loss_total / len(granularities),
+        "heads": heads_loss,
+    }
+
+    return pred_multihead, loss_multihead
+
+
 def evaluate_multi_scene(
     model: nn.Module,
     dataset: MultiSceneDataset | Subset,
@@ -156,6 +238,10 @@ def evaluate_multi_scene(
     Sets model to eval mode.  Caller is responsible for restoring
     train mode afterward.
 
+    Supports both multi-head and continuous decoder models transparently.
+    For continuous decoders, the model is run once per granularity to produce
+    the same multi-head output structure expected by downstream evaluators.
+
     Parameters
     ----------
     model:
@@ -163,7 +249,8 @@ def evaluate_multi_scene(
     dataset:
         ``MultiSceneDataset`` to evaluate on.
     criterion:
-        ``MultiGranCriterion`` for computing validation loss.
+        ``MultiGranCriterion`` or ``SingleGranCriterion`` for computing
+        validation loss.
     device:
         Target CUDA device string.
     granularities:
@@ -187,6 +274,7 @@ def evaluate_multi_scene(
             module.train()
     # --------------------------
 
+    continuous = _is_continuous_model(model)
     per_scene: dict[str, dict[str, Any]] = {}
     frag_pm = fragment_merge_point_max if fragment_merge_point_max is not None else 50_000
 
@@ -208,8 +296,15 @@ def evaluate_multi_scene(
         _clear_backbone_cache(model)
 
         with torch.no_grad():
-            pred = model(points, features)
-            loss_result = criterion(pred, targets_by_gran)
+            if continuous:
+                # Run model once per granularity, assemble multi-head output
+                pred, loss_result = _evaluate_continuous_scene(
+                    model, points, features, granularities,
+                    criterion, targets_by_gran,
+                )
+            else:
+                pred = model(points, features)
+                loss_result = criterion(pred, targets_by_gran)
 
         loss_val = loss_result["loss_total"].item()
 
@@ -270,3 +365,4 @@ def evaluate_multi_scene(
             granularities=granularities,
         ),
     }
+
