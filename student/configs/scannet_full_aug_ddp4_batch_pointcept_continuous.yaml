@@ -1,8 +1,8 @@
-# Train 100 / val 10 — LitePT aug, 4-GPU DDP batched scenes, Pointcept-style sphere crops.
-# Launch: torchrun --nproc_per_node=4 scripts/run_multi_scene.py --config configs/scannet_train100_val10_aug_ddp4_batched_pointcept.yaml
+# Continuous granularity decoder — LitePT aug, 4-GPU DDP batched scenes, Pointcept-style sphere crops.
+# Launch: torchrun --nproc_per_node=4 scripts/run_multi_scene.py --config configs/scannet_full_aug_ddp4_batch_pointcept_continuous.yaml
 
 experiment:
-  name: scannet_full_aug_ddp4_batched_pointcept_eval_every_30
+  name: scannet_full_continuous_ddp4_batched_pointcept
   seed: 42
   output_root: ${CHORUS_OUTPUT_ROOT:-/scratch2/nedela/student_runs}
 
@@ -22,6 +22,7 @@ data:
   dense_instance_ids: false
 
 model:
+  decoder_type: continuous
   backbone:
     name: litept
     litept_root: ${LITEPT_ROOT:-/home/nedela/projects/LitePT}
@@ -30,11 +31,9 @@ model:
     grid_size: 0.02
     multi_scale: true
     multi_scale_indices: [0, 1, 2, 3]
-  num_queries: 200
-  num_queries_by_granularity:
-    g02: 300
-    g05: 200
-    g08: 100
+  num_queries: 250
+  # num_queries_by_granularity is not used in continuous mode;
+  # all queries share a single pool conditioned by the sampled scale.
   decoder_hidden_dim: 256
   num_decoder_layers: 4
   num_decoder_heads: 8

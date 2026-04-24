@@ -86,6 +86,7 @@ class SingleSceneTrainer:
         mask_threshold: float = 0.5,
         min_points_per_proposal: int = 30,
         eval_benchmark: str = "scannet200",
+        eval_benchmarks: str | list[str] | tuple[str, ...] | None = None,
         full_eval_every: int | None = None,
     ) -> None:
         self.device = device
@@ -99,6 +100,7 @@ class SingleSceneTrainer:
         self.mask_threshold = mask_threshold
         self.min_points_per_proposal = min_points_per_proposal
         self.eval_benchmark = eval_benchmark
+        self.eval_benchmarks = eval_benchmarks
         self.full_eval_every = full_eval_every or save_every
 
         self.model = model.to(device)
@@ -346,7 +348,11 @@ class SingleSceneTrainer:
                         score_threshold=self.score_threshold,
                         mask_threshold=self.mask_threshold,
                         min_points=self.min_points_per_proposal,
-                        eval_benchmark=self.eval_benchmark,
+                        eval_benchmarks=(
+                            self.eval_benchmarks
+                            if self.eval_benchmarks is not None
+                            else self.eval_benchmark
+                        ),
                     )
 
                     if _wandb_active():
@@ -358,12 +364,23 @@ class SingleSceneTrainer:
                                 wb_full[f"eval/pseudo_AP50_{g}"] = pseudo["AP50"]
                                 wb_full[f"eval/pseudo_NMI_{g}"] = pseudo.get("NMI", 0)
                                 wb_full[f"eval/pseudo_ARI_{g}"] = pseudo.get("ARI", 0)
-                            real = eval_g.get("real_gt", {})
-                            if isinstance(real, dict) and "AP25" in real:
-                                wb_full[f"eval/real_AP25_{g}"] = real["AP25"]
-                                wb_full[f"eval/real_AP50_{g}"] = real["AP50"]
-                                wb_full[f"eval/real_NMI_{g}"] = real.get("NMI", 0)
-                                wb_full[f"eval/real_ARI_{g}"] = real.get("ARI", 0)
+                            real_by = eval_g.get("real_gt_by_benchmark", None)
+                            if isinstance(real_by, dict):
+                                for bench, real in real_by.items():
+                                    if isinstance(real, dict) and "AP25" in real:
+                                        b = str(bench)
+                                        wb_full[f"eval/real_AP25_{g}_{b}"] = real["AP25"]
+                                        wb_full[f"eval/real_AP50_{g}_{b}"] = real["AP50"]
+                                        wb_full[f"eval/real_NMI_{g}_{b}"] = real.get("NMI", 0)
+                                        wb_full[f"eval/real_ARI_{g}_{b}"] = real.get("ARI", 0)
+                            else:
+                                real = eval_g.get("real_gt", {})
+                                if isinstance(real, dict) and "AP25" in real:
+                                    b = str(real.get("eval_benchmark", "unknown"))
+                                    wb_full[f"eval/real_AP25_{g}_{b}"] = real["AP25"]
+                                    wb_full[f"eval/real_AP50_{g}_{b}"] = real["AP50"]
+                                    wb_full[f"eval/real_NMI_{g}_{b}"] = real.get("NMI", 0)
+                                    wb_full[f"eval/real_ARI_{g}_{b}"] = real.get("ARI", 0)
                             wb_full[f"eval/num_proposals_{g}"] = eval_g.get("num_proposals", 0)
                         wandb.log(wb_full)
 

@@ -29,6 +29,9 @@ from student.data.single_scene_dataset import build_input_features
 
 log = logging.getLogger(__name__)
 
+_LABEL_SOURCE_PACK = "pack"
+_LABEL_SOURCE_SCANNET_GT = "scannet_gt"
+
 
 def _normals_array_for_scene(
     scene: MultiGranTrainingPackScene,
@@ -150,6 +153,8 @@ class MultiSceneDataset(Dataset):
         subsampling_mode: str = "sphere_crop",
         sphere_point_max: int | None = None,
         train_augmentations: bool = False,
+        label_source: str = _LABEL_SOURCE_PACK,
+        scannet_eval_benchmark: str = "all",
     ) -> None:
         super().__init__()
         self._scene_dirs = list(scene_dirs)
@@ -162,9 +167,17 @@ class MultiSceneDataset(Dataset):
         self._subsampling_mode = subsampling_mode
         self._sphere_point_max = sphere_point_max
         self._train_augmentations = bool(train_augmentations)
+        self._label_source = str(label_source)
+        self._scannet_eval_benchmark = str(scannet_eval_benchmark)
         self._scenes: list[MultiGranTrainingPackScene] = []
         self._scene_point_counts: list[int] = []
         self._features_cache: list[np.ndarray] | None = [] if not train_augmentations else None
+
+        if self._label_source not in (_LABEL_SOURCE_PACK, _LABEL_SOURCE_SCANNET_GT):
+            raise ValueError(
+                f"label_source must be one of "
+                f"{(_LABEL_SOURCE_PACK, _LABEL_SOURCE_SCANNET_GT)}, got {self._label_source!r}"
+            )
 
         if self._subsampling_mode not in ("sphere_crop", "randperm", "none"):
             raise ValueError(
@@ -324,9 +337,30 @@ class MultiSceneDataset(Dataset):
 
         points_t = torch.from_numpy(np.asarray(points_np)).float()
         features_t = torch.from_numpy(features).float()
-        valid_t = torch.from_numpy(scene.valid_points).bool()
+        valid_np = scene.valid_points
+        sup_np = scene.supervision_mask
+        if self._label_source == _LABEL_SOURCE_SCANNET_GT:
+            from chorus.datasets.scannet.gt import load_scannet_gt_instance_ids
+
+            gt_ids = load_scannet_gt_instance_ids(
+                scene.scene_dir,
+                scene.scene_id,
+                eval_benchmark=self._scannet_eval_benchmark,
+            )
+            # Convert ScanNet GT convention (0=ignore/background) to student convention (-1=ignore).
+            gt_labels = np.asarray(gt_ids, dtype=np.int64)
+            gt_labels = np.where(gt_labels == 0, -1, gt_labels)
+
+            labels_by_gran = {
+                g: torch.from_numpy(gt_labels).long()
+                for g in self._granularities
+            }
+            sup_np = gt_labels != -1
+            valid_np = sup_np.copy()
+
+        valid_t = torch.from_numpy(valid_np).bool()
         seen_t = torch.from_numpy(scene.seen_points).bool()
-        sup_t = torch.from_numpy(scene.supervision_mask).bool()
+        sup_t = torch.from_numpy(sup_np).bool()
 
         n = points_t.shape[0]
         vertex_indices: torch.Tensor | None = None

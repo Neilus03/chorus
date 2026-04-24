@@ -4,6 +4,7 @@ Pure composition of backbone + decoder.  Nothing else.
 
     input:  points [N, 3], features [N, C]
     output: nested dict with shared point_embed and per-head predictions
+            (multi-head) or flat dict (continuous)
 """
 
 from __future__ import annotations
@@ -14,27 +15,32 @@ import torch.nn as nn
 from student.data.batched_scene_batch import split_tensor_by_offsets
 from student.models.litept_wrapper import LitePTBackbone, LitePTBackboneOutput
 from student.models.instance_decoder import MultiHeadQueryInstanceDecoder
+from student.models.continuous_decoder import ContinuousQueryInstanceDecoder
 
 
 class StudentInstanceSegModel(nn.Module):
-    """LitePT backbone -> multi-head query instance decoder.
+    """LitePT backbone -> query instance decoder.
+
+    Supports both :class:`MultiHeadQueryInstanceDecoder` (discrete granularities)
+    and :class:`ContinuousQueryInstanceDecoder` (continuous granularity conditioning).
 
     Parameters
     ----------
     backbone:
         Pre-constructed :class:`LitePTBackbone`.
     decoder:
-        Pre-constructed :class:`MultiHeadQueryInstanceDecoder`.
+        Pre-constructed decoder (multi-head or continuous).
     """
 
     def __init__(
         self,
         backbone: LitePTBackbone,
-        decoder: MultiHeadQueryInstanceDecoder,
+        decoder: MultiHeadQueryInstanceDecoder | ContinuousQueryInstanceDecoder,
     ) -> None:
         super().__init__()
         self.backbone = backbone
         self.decoder = decoder
+        self._continuous = isinstance(decoder, ContinuousQueryInstanceDecoder)
 
     @property
     def out_channels(self) -> int:
@@ -60,6 +66,7 @@ class StudentInstanceSegModel(nn.Module):
         points: torch.Tensor,
         features: torch.Tensor,
         *,
+        target_g: torch.Tensor | float | None = None,
         point_offsets: torch.Tensor | None = None,
     ) -> dict | list[dict]:
         """
@@ -67,21 +74,24 @@ class StudentInstanceSegModel(nn.Module):
         ----------
         points   : [N, 3] or [1, N, 3]
         features : [N, C] or [1, N, C]
+        target_g : granularity condition for continuous decoder.
+                   Ignored when using multi-head decoder.
 
         Returns
         -------
-        Nested dict:
-            point_embed : [N, D]
-            heads:
-                g02: {mask_logits, score_logits, query_embed}
-                g05: {mask_logits, score_logits, query_embed}
-                g08: {mask_logits, score_logits, query_embed}
+        Multi-head decoder → nested dict with ``heads`` sub-dict.
+        Continuous decoder → flat dict with ``mask_logits``, ``score_logits``.
         """
         bb: LitePTBackboneOutput = self.backbone(
             points,
             features,
             point_offsets=point_offsets,
         )
+        # Build common decoder kwargs
+        decoder_kw: dict = {}
+        if self._continuous and target_g is not None:
+            decoder_kw["target_g"] = target_g
+
         if bb.point_offsets.numel() <= 1:
             return self.decoder(
                 point_feat=bb.point_feat,
@@ -90,6 +100,7 @@ class StudentInstanceSegModel(nn.Module):
                 scene_xyz=bb.scene_xyz,
                 multi_scale_tokens=bb.multi_scale_tokens or None,
                 multi_scale_xyz=bb.multi_scale_xyz or None,
+                **decoder_kw,
             )
 
         point_feats = split_tensor_by_offsets(bb.point_feat, bb.point_offsets)
@@ -131,6 +142,7 @@ class StudentInstanceSegModel(nn.Module):
                 scene_xyz=scene_xyzs[scene_idx],
                 multi_scale_tokens=multi_scale_tokens,
                 multi_scale_xyz=multi_scale_xyz,
+                **decoder_kw,
             ))
         return outputs
 
@@ -151,6 +163,7 @@ def build_student_model(
     use_positional_guidance: bool = True,
     learned_query_ratio: float = 0.25,
     multi_scale: bool = False,
+    decoder_type: str = "multi_head",
 ) -> StudentInstanceSegModel:
     """Convenience factory from scalar config values.
 
@@ -161,6 +174,7 @@ def build_student_model(
     num_queries_by_granularity:
         Optional per-head override, e.g. ``{"g02": 300, "g05": 150, "g08": 100}``.
         Granularities not listed fall back to *num_queries*.
+        Ignored when ``decoder_type="continuous"``.
     query_init:
         ``"hybrid"`` uses *learned_query_ratio* (default).
         ``"learned"`` forces all queries to be learned embeddings.
@@ -176,6 +190,9 @@ def build_student_model(
         Transformer layer cross-attends to a different backbone decoder scale
         (coarse → fine).  Requires ``litept_variant="litept_s_star"`` for
         meaningful per-scale features.
+    decoder_type:
+        ``"multi_head"`` (default) — discrete per-granularity heads.
+        ``"continuous"`` — single-head with continuous granularity conditioning.
     """
     backbone = LitePTBackbone(
         litept_root=litept_root,
@@ -193,23 +210,42 @@ def build_student_model(
     else:
         effective_ratio = learned_query_ratio
 
-    if num_queries_by_granularity:
-        effective_queries: int | dict[str, int] = {
-            g: num_queries_by_granularity.get(g, num_queries)
-            for g in granularities
-        }
-    else:
-        effective_queries = num_queries
+    if decoder_type == "continuous":
+        decoder: MultiHeadQueryInstanceDecoder | ContinuousQueryInstanceDecoder = (
+            ContinuousQueryInstanceDecoder(
+                in_channels=backbone.out_channels,
+                hidden_dim=hidden_dim,
+                num_queries=num_queries,
+                num_layers=num_decoder_layers,
+                num_heads=num_decoder_heads,
+                learned_ratio=effective_ratio,
+                use_positional_guidance=use_positional_guidance,
+                multi_scale_channels=backbone.multi_scale_channels,
+            )
+        )
+    elif decoder_type == "multi_head":
+        if num_queries_by_granularity:
+            effective_queries: int | dict[str, int] = {
+                g: num_queries_by_granularity.get(g, num_queries)
+                for g in granularities
+            }
+        else:
+            effective_queries = num_queries
 
-    decoder = MultiHeadQueryInstanceDecoder(
-        in_channels=backbone.out_channels,
-        hidden_dim=hidden_dim,
-        num_queries=effective_queries,
-        granularities=granularities,
-        num_layers=num_decoder_layers,
-        num_heads=num_decoder_heads,
-        learned_ratio=effective_ratio,
-        use_positional_guidance=use_positional_guidance,
-        multi_scale_channels=backbone.multi_scale_channels,
-    )
+        decoder = MultiHeadQueryInstanceDecoder(
+            in_channels=backbone.out_channels,
+            hidden_dim=hidden_dim,
+            num_queries=effective_queries,
+            granularities=granularities,
+            num_layers=num_decoder_layers,
+            num_heads=num_decoder_heads,
+            learned_ratio=effective_ratio,
+            use_positional_guidance=use_positional_guidance,
+            multi_scale_channels=backbone.multi_scale_channels,
+        )
+    else:
+        raise ValueError(
+            f"Unknown decoder_type={decoder_type!r}; expected 'multi_head' or 'continuous'"
+        )
+
     return StudentInstanceSegModel(backbone=backbone, decoder=decoder)

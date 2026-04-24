@@ -150,6 +150,23 @@ def _compute_clustering_metrics(
     return {"NMI": float(nmi), "ARI": float(ari)}
 
 
+def _normalize_eval_benchmarks(eval_benchmarks: str | list[str] | tuple[str, ...]) -> list[str]:
+    """Normalize eval benchmark input into a non-empty list of strings.
+
+    Accepts:
+      - "scannet200"
+      - "scannet,scannet200" (comma-separated)
+      - ["scannet20", "scannet200"]
+    """
+    if isinstance(eval_benchmarks, str):
+        parts = [p.strip() for p in eval_benchmarks.split(",")]
+        out = [p for p in parts if p]
+        return out or ["scannet200"]
+    out = [str(x).strip() for x in eval_benchmarks]
+    out = [x for x in out if x]
+    return out or ["scannet200"]
+
+
 # ── pseudo-GT evaluation ─────────────────────────────────────────────────
 
 
@@ -178,7 +195,7 @@ def evaluate_student_predictions(
     score_threshold: float = 0.3,
     mask_threshold: float = 0.5,
     min_points: int = 30,
-    eval_benchmark: str = "scannet200",
+    eval_benchmarks: str | list[str] | tuple[str, ...] = "scannet200",
     vertex_indices: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Full evaluation of student predictions.
@@ -229,67 +246,83 @@ def evaluate_student_predictions(
         pseudo_ap["total_gt_instances"],
     )
 
-    # ── 2. evaluate against real ScanNet GT ──
+    # ── 2. evaluate against real ScanNet GT (optionally multiple benchmarks) ──
+    benchmarks = _normalize_eval_benchmarks(eval_benchmarks)
+    result["eval_benchmarks"] = benchmarks
+
+    real_by_benchmark: dict[str, Any] = {}
+    primary_benchmark = benchmarks[0]
     try:
         _ensure_chorus_importable()
         from chorus.datasets.scannet.gt import load_scannet_gt_instance_ids
 
-        real_gt = load_scannet_gt_instance_ids(
-            scene_dir, scene_id, eval_benchmark=eval_benchmark,
-        )
-
-        real_gt_error: str | None = None
-        if vertex_indices is not None:
-            vi = vertex_indices.detach().cpu().numpy().astype(np.int64, copy=False)
-            if vi.shape[0] != N:
-                log.warning(
-                    "  vertex_indices length %d != model point count %d, skipping real GT eval",
-                    vi.shape[0], N,
+        for bench in benchmarks:
+            try:
+                real_gt = load_scannet_gt_instance_ids(
+                    scene_dir, scene_id, eval_benchmark=bench,
                 )
-                real_gt_error = "vertex_indices length mismatch"
-            elif vi.size > 0 and (
-                int(vi.min()) < 0 or int(vi.max()) >= real_gt.shape[0]
-            ):
-                log.warning(
-                    "  vertex_indices out of range [0, %d), skipping real GT eval",
-                    real_gt.shape[0],
+
+                real_gt_error: str | None = None
+                real_gt_local = real_gt
+                if vertex_indices is not None:
+                    vi = vertex_indices.detach().cpu().numpy().astype(np.int64, copy=False)
+                    if vi.shape[0] != N:
+                        log.warning(
+                            "  vertex_indices length %d != model point count %d, skipping real GT eval",
+                            vi.shape[0], N,
+                        )
+                        real_gt_error = "vertex_indices length mismatch"
+                    elif vi.size > 0 and (
+                        int(vi.min()) < 0 or int(vi.max()) >= real_gt_local.shape[0]
+                    ):
+                        log.warning(
+                            "  vertex_indices out of range [0, %d), skipping real GT eval",
+                            real_gt_local.shape[0],
+                        )
+                        real_gt_error = "vertex_indices out of range"
+                    else:
+                        real_gt_local = real_gt_local[vi]
+
+                if real_gt_error is None and real_gt_local.shape[0] != N:
+                    log.warning(
+                        "  GT vertex count %d != model point count %d, skipping real GT eval",
+                        real_gt_local.shape[0], N,
+                    )
+                    real_gt_error = "vertex count mismatch"
+
+                if real_gt_error is not None:
+                    real_by_benchmark[bench] = {"error": real_gt_error, "eval_benchmark": bench}
+                    continue
+
+                real_ap = _evaluate_ap_against_gt(real_gt_local, proposals)
+                real_clustering = _compute_clustering_metrics(real_gt_local, pred_labels)
+                real_by_benchmark[bench] = {
+                    **real_ap,
+                    **real_clustering,
+                    "eval_benchmark": bench,
+                }
+                log.info(
+                    "  [real GT %s] AP25=%.3f  AP50=%.3f  NMI=%.4f  ARI=%.4f  (%d GT instances)",
+                    bench,
+                    real_ap["AP25"], real_ap["AP50"],
+                    real_clustering["NMI"], real_clustering["ARI"],
+                    real_ap["total_gt_instances"],
                 )
-                real_gt_error = "vertex_indices out of range"
-            else:
-                real_gt = real_gt[vi]
+            except FileNotFoundError as e:
+                log.warning("  Real GT not available (%s): %s", bench, e)
+                real_by_benchmark[bench] = {"error": str(e), "eval_benchmark": bench}
+            except Exception as e:
+                log.warning("  Real GT eval failed (%s): %s", bench, e)
+                real_by_benchmark[bench] = {"error": str(e), "eval_benchmark": bench}
 
-        if real_gt_error is None and real_gt.shape[0] != N:
-            log.warning(
-                "  GT vertex count %d != model point count %d, skipping real GT eval",
-                real_gt.shape[0], N,
-            )
-            real_gt_error = "vertex count mismatch"
-
-        if real_gt_error is not None:
-            result["real_gt"] = {"error": real_gt_error}
-        else:
-            real_ap = _evaluate_ap_against_gt(real_gt, proposals)
-            real_clustering = _compute_clustering_metrics(real_gt, pred_labels)
-
-            result["real_gt"] = {
-                **real_ap,
-                **real_clustering,
-                "eval_benchmark": eval_benchmark,
-            }
-            log.info(
-                "  [real GT %s] AP25=%.3f  AP50=%.3f  NMI=%.4f  ARI=%.4f  (%d GT instances)",
-                eval_benchmark,
-                real_ap["AP25"], real_ap["AP50"],
-                real_clustering["NMI"], real_clustering["ARI"],
-                real_ap["total_gt_instances"],
-            )
-
-    except FileNotFoundError as e:
-        log.warning("  Real GT not available: %s", e)
-        result["real_gt"] = {"error": str(e)}
     except Exception as e:
-        log.warning("  Real GT eval failed: %s", e)
-        result["real_gt"] = {"error": str(e)}
+        # If import/setup fails, record a single shared error.
+        log.warning("  Real GT eval setup failed: %s", e)
+        real_by_benchmark[primary_benchmark] = {"error": str(e), "eval_benchmark": primary_benchmark}
+
+    # Backward compatibility: keep `real_gt` as the primary benchmark result.
+    result["real_gt_by_benchmark"] = real_by_benchmark
+    result["real_gt"] = real_by_benchmark.get(primary_benchmark, {"error": "missing primary real GT result"})
 
     return result
 
@@ -303,7 +336,7 @@ def evaluate_student_predictions_multi(
     score_threshold: float = 0.3,
     mask_threshold: float = 0.5,
     min_points: int = 30,
-    eval_benchmark: str = "scannet200",
+    eval_benchmarks: str | list[str] | tuple[str, ...] = "scannet200",
     vertex_indices: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Full evaluation for each granularity head.
@@ -321,7 +354,7 @@ def evaluate_student_predictions_multi(
             score_threshold=score_threshold,
             mask_threshold=mask_threshold,
             min_points=min_points,
-            eval_benchmark=eval_benchmark,
+            eval_benchmarks=eval_benchmarks,
             vertex_indices=vertex_indices,
         )
     return result
