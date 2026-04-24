@@ -11,6 +11,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import logging
 import os
@@ -348,7 +349,11 @@ def main() -> None:
             local_rank=local_rank,
         )
         if distributed:
-            dist.init_process_group(backend=ddp_backend or "nccl", init_method="env://")
+            dist.init_process_group(
+                backend=ddp_backend or "nccl",
+                init_method="env://",
+                timeout=datetime.timedelta(minutes=30),
+            )
             pg_initialized = True
 
         # ── 2. seed ──

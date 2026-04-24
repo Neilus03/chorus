@@ -344,10 +344,44 @@ class MultiSceneTrainer:
         self,
         dataset: MultiSceneDataset | Subset,
     ) -> MultiSceneDataset | Subset:
+        """Shard the eval dataset across ranks with point-count balancing.
+
+        Instead of a naive stride ``range(rank, N, world_size)`` which can
+        assign all large scenes to a single rank, we greedily assign each
+        scene to the lightest-loaded rank (longest-processing-time-first
+        heuristic).  This keeps evaluation time similar across ranks and
+        avoids NCCL collective timeouts that occur when one rank finishes
+        far earlier than another.
+        """
         if not self.distributed:
             return dataset
-        shard_indices = list(range(self.rank, len(dataset), self.world_size))
-        return Subset(dataset, shard_indices)
+        n = len(dataset)
+        if n == 0:
+            return Subset(dataset, [])
+
+        # Retrieve per-scene point counts (proxy for eval time).
+        base_ds = dataset.dataset if isinstance(dataset, Subset) else dataset
+        if isinstance(base_ds, MultiSceneDataset) and hasattr(base_ds, "scene_point_counts"):
+            all_counts = base_ds.scene_point_counts
+            if isinstance(dataset, Subset):
+                counts = [all_counts[i] for i in dataset.indices]
+            else:
+                counts = list(all_counts)
+        else:
+            # Fallback: uniform weight (reverts to round-robin).
+            counts = [1] * n
+
+        # Greedy LPT (longest processing time first) assignment.
+        indexed = sorted(enumerate(counts), key=lambda x: -x[1])
+        rank_loads = [0] * self.world_size
+        rank_indices: list[list[int]] = [[] for _ in range(self.world_size)]
+        for idx, count in indexed:
+            lightest = min(range(self.world_size), key=lambda r: rank_loads[r])
+            rank_indices[lightest].append(idx)
+            rank_loads[lightest] += count
+
+        my_indices = sorted(rank_indices[self.rank])
+        return Subset(dataset, my_indices)
 
     def _gather_eval_per_scene(
         self,
