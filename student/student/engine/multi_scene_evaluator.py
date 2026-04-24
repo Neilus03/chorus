@@ -85,12 +85,14 @@ def aggregate_multi_scene_results(
     all_losses: list[float] = []
     pseudo_ap25_all: list[float] = []
     pseudo_ap50_all: list[float] = []
-    real_ap25_all: list[float] = []
-    real_ap50_all: list[float] = []
     pseudo_nmi_all: list[float] = []
     pseudo_ari_all: list[float] = []
-    real_nmi_all: list[float] = []
-    real_ari_all: list[float] = []
+    # Real GT metrics can be stored either as a legacy single dict (`real_gt`)
+    # or as a dict of benchmark→metrics (`real_gt_by_benchmark`).
+    real_ap25_by_bench: dict[str, list[float]] = {}
+    real_ap50_by_bench: dict[str, list[float]] = {}
+    real_nmi_by_bench: dict[str, list[float]] = {}
+    real_ari_by_bench: dict[str, list[float]] = {}
     matched_iou_by_gran: dict[str, list[float]] = {g: [] for g in granularities}
 
     for scene_data in per_scene.values():
@@ -122,24 +124,49 @@ def aggregate_multi_scene_results(
                 _append_real(pseudo_nmi_all, pseudo.get("NMI"))
                 _append_real(pseudo_ari_all, pseudo.get("ARI"))
 
+            real_by = g_eval.get("real_gt_by_benchmark", None)
+            if isinstance(real_by, dict):
+                for bench, real in real_by.items():
+                    if not isinstance(real, dict):
+                        continue
+                    if "AP25" in real and "AP50" in real:
+                        real_ap25_by_bench.setdefault(str(bench), [])
+                        real_ap50_by_bench.setdefault(str(bench), [])
+                        real_nmi_by_bench.setdefault(str(bench), [])
+                        real_ari_by_bench.setdefault(str(bench), [])
+                        _append_real(real_ap25_by_bench[str(bench)], real.get("AP25"))
+                        _append_real(real_ap50_by_bench[str(bench)], real.get("AP50"))
+                        _append_real(real_nmi_by_bench[str(bench)], real.get("NMI"))
+                        _append_real(real_ari_by_bench[str(bench)], real.get("ARI"))
+                continue
+
+            # Legacy fallback: single real_gt dict
             real = g_eval.get("real_gt", {})
             if isinstance(real, dict) and "AP25" in real and "AP50" in real:
-                _append_real(real_ap25_all, real.get("AP25"))
-                _append_real(real_ap50_all, real.get("AP50"))
-                _append_real(real_nmi_all, real.get("NMI"))
-                _append_real(real_ari_all, real.get("ARI"))
+                bench = str(real.get("eval_benchmark", "unknown"))
+                real_ap25_by_bench.setdefault(bench, [])
+                real_ap50_by_bench.setdefault(bench, [])
+                real_nmi_by_bench.setdefault(bench, [])
+                real_ari_by_bench.setdefault(bench, [])
+                _append_real(real_ap25_by_bench[bench], real.get("AP25"))
+                _append_real(real_ap50_by_bench[bench], real.get("AP50"))
+                _append_real(real_nmi_by_bench[bench], real.get("NMI"))
+                _append_real(real_ari_by_bench[bench], real.get("ARI"))
 
     aggregate: dict[str, Any] = {
         "loss_mean": _safe_mean(all_losses),
         "pseudo_AP25_mean": _safe_mean(pseudo_ap25_all),
         "pseudo_AP50_mean": _safe_mean(pseudo_ap50_all),
-        "real_AP25_mean": _safe_mean(real_ap25_all),
-        "real_AP50_mean": _safe_mean(real_ap50_all),
         "pseudo_NMI_mean": _safe_mean(pseudo_nmi_all),
         "pseudo_ARI_mean": _safe_mean(pseudo_ari_all),
-        "real_NMI_mean": _safe_mean(real_nmi_all),
-        "real_ARI_mean": _safe_mean(real_ari_all),
     }
+
+    # Per-benchmark real GT aggregates (no primary)
+    for bench in sorted(real_ap25_by_bench):
+        aggregate[f"real_AP25_mean_{bench}"] = _safe_mean(real_ap25_by_bench[bench])
+        aggregate[f"real_AP50_mean_{bench}"] = _safe_mean(real_ap50_by_bench.get(bench, []))
+        aggregate[f"real_NMI_mean_{bench}"] = _safe_mean(real_nmi_by_bench.get(bench, []))
+        aggregate[f"real_ARI_mean_{bench}"] = _safe_mean(real_ari_by_bench.get(bench, []))
 
     all_iou_values: list[float] = []
     for g in granularities:
@@ -226,6 +253,7 @@ def evaluate_multi_scene(
     mask_threshold: float = 0.5,
     min_points: int = 30,
     eval_benchmark: str = "scannet200",
+    eval_benchmarks: str | list[str] | tuple[str, ...] | None = None,
     min_instance_points: int = 10,
     dense_instance_ids: bool = False,
     fragment_merge_eval: bool = False,
@@ -258,7 +286,9 @@ def evaluate_multi_scene(
     score_threshold / mask_threshold / min_points:
         Proposal extraction thresholds.
     eval_benchmark:
-        ScanNet GT evaluation benchmark name.
+        Backward-compatible ScanNet GT benchmark name (single).
+    eval_benchmarks:
+        If set, evaluate real GT against all listed benchmarks (e.g. ["scannet20","scannet200"]).
     min_instance_points:
         Minimum instance size for target building.
 
@@ -342,7 +372,7 @@ def evaluate_multi_scene(
                     score_threshold=score_threshold,
                     mask_threshold=mask_threshold,
                     min_points=min_points,
-                    eval_benchmark=eval_benchmark,
+                    eval_benchmarks=(eval_benchmarks if eval_benchmarks is not None else eval_benchmark),
                     vertex_indices=vi,
                 )
 

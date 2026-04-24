@@ -183,6 +183,7 @@ class MultiSceneTrainer:
         mask_threshold: float = 0.5,
         min_points_per_proposal: int = 30,
         eval_benchmark: str = "scannet200",
+        eval_benchmarks: str | list[str] | tuple[str, ...] | None = None,
         min_instance_points: int = 10,
         warmup_epochs: int = 5,
         granularities: tuple[str, ...] = ("g02", "g05", "g08"),
@@ -227,6 +228,7 @@ class MultiSceneTrainer:
         self.mask_threshold = mask_threshold
         self.min_points_per_proposal = min_points_per_proposal
         self.eval_benchmark = eval_benchmark
+        self.eval_benchmarks = eval_benchmarks
         self.min_instance_points = min_instance_points
         self.granularities = granularities
         self.config = config
@@ -487,6 +489,7 @@ class MultiSceneTrainer:
             mask_threshold=self.mask_threshold,
             min_points=self.min_points_per_proposal,
             eval_benchmark=self.eval_benchmark,
+            eval_benchmarks=self.eval_benchmarks,
             min_instance_points=self.min_instance_points,
             dense_instance_ids=self.dense_instance_ids,
             fragment_merge_eval=self.fragment_merge_eval,
@@ -1288,12 +1291,18 @@ class MultiSceneTrainer:
             return {}
 
         agg = val_result["aggregate"]
+        real_ap50_bits = [
+            f"{k.removeprefix('real_AP50_mean_')}={agg[k]:.3f}"
+            for k in sorted(agg.keys())
+            if k.startswith("real_AP50_mean_") and isinstance(agg.get(k), (int, float))
+        ]
+        real_ap50_str = ", ".join(real_ap50_bits) if real_ap50_bits else "n/a"
         log.info(
-            "  [val epoch %d] loss=%.4f  pseudo_AP50=%.3f  real_AP50=%.3f  mIoU=%.3f",
+            "  [val epoch %d] loss=%.4f  pseudo_AP50=%.3f  real_AP50=(%s)  mIoU=%.3f",
             epoch,
             agg["loss_mean"],
             agg["pseudo_AP50_mean"],
-            agg["real_AP50_mean"],
+            real_ap50_str,
             agg["matched_mean_iou_mean"],
         )
 
@@ -1345,18 +1354,23 @@ class MultiSceneTrainer:
             return {}
 
         agg = train_result["aggregate"]
+        real_ap50_bits = [
+            f"{k.removeprefix('real_AP50_mean_')}={agg[k]:.3f}"
+            for k in sorted(agg.keys())
+            if k.startswith("real_AP50_mean_") and isinstance(agg.get(k), (int, float))
+        ]
+        real_ap50_str = ", ".join(real_ap50_bits) if real_ap50_bits else "n/a"
         log.info(
             "  [train-eval epoch %d] loss=%.4f  "
             "pseudo(AP25=%.3f, AP50=%.3f, NMI=%.4f, ARI=%.4f)  "
-            "real(AP25=%.3f, AP50=%.3f)  mIoU=%.3f",
+            "real(AP50=(%s))  mIoU=%.3f",
             epoch,
             agg["loss_mean"],
             agg["pseudo_AP25_mean"],
             agg["pseudo_AP50_mean"],
             agg["pseudo_NMI_mean"],
             agg["pseudo_ARI_mean"],
-            agg["real_AP25_mean"],
-            agg["real_AP50_mean"],
+            real_ap50_str,
             agg["matched_mean_iou_mean"],
         )
 

@@ -254,6 +254,7 @@ def main() -> None:
         mask_threshold=eval_cfg.get("mask_threshold", 0.5),
         min_points_per_proposal=eval_cfg.get("min_points_per_proposal", 30),
         eval_benchmark=eval_cfg.get("scannet_benchmark", "scannet200"),
+        eval_benchmarks=eval_cfg.get("scannet_benchmarks", None),
     )
 
     final_metrics = trainer.train()
