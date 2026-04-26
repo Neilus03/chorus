@@ -55,9 +55,10 @@ train:
   device: cuda
   # Finetune defaults (lower LR, shorter warmup, frequent eval)
   lr: 1.0e-4
+  backbone_lr_scale: 0.1
   weight_decay: 1.0e-5
   grad_clip_norm: 1.0
-  max_epochs: 100
+  max_epochs: 200
   eval_every_epochs: 5
   save_every_epochs: 10
   log_every_steps: 50
