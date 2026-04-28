@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=student_scannet_ft_gt_ddp4
-#SBATCH --output=logs/scannet_ft_gt_ddp4_%j.out
-#SBATCH --error=logs/scannet_ft_gt_ddp4_%j.err
+#SBATCH --output=student/logs/scannet_ft_gt_ddp4_%j.out
+#SBATCH --error=student/logs/scannet_ft_gt_ddp4_%j.err
 #SBATCH --partition=gpuhe.120h
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem-per-cpu=4G
-#SBATCH --gpus=rtx_3090:2,rtx_4090:2
+#SBATCH --gpus=rtx_3090:4
 #SBATCH --time=48:00:00
 
 set -euo pipefail
@@ -64,7 +64,7 @@ fi
 
 echo "Running multi-scene finetune (ScanNet GT)"
 echo "  CONFIG=${CONFIG_ARG}"
-NPROC_PER_NODE="${SLURM_GPUS_ON_NODE:-2}"
+NPROC_PER_NODE="${SLURM_GPUS_ON_NODE:-4}"
 echo "  NPROC_PER_NODE=${NPROC_PER_NODE}"
 echo "  EXTRA_ARGS=$*"
 
