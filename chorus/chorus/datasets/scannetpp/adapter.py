@@ -56,7 +56,7 @@ class ScanNetPPSceneAdapter(SceneAdapter):
         color_dir = self.scene_root / "color"
         depth_dir = self.scene_root / "depth"
         pose_dir = self.scene_root / "pose"
-        intrinsics_path = self.scene_root / "intrinsic" / "intrinsic_color.txt"
+        intrinsics_dir = self.scene_root / "intrinsic"
 
         if not color_dir.is_dir():
             raise FileNotFoundError(
@@ -70,9 +70,9 @@ class ScanNetPPSceneAdapter(SceneAdapter):
             raise FileNotFoundError(
                 f"Missing pose directory at {pose_dir}. Call adapter.prepare() first."
             )
-        if not intrinsics_path.exists():
+        if not intrinsics_dir.is_dir():
             raise FileNotFoundError(
-                f"Missing intrinsics file at {intrinsics_path}. Call adapter.prepare() first."
+                f"Missing intrinsics directory at {intrinsics_dir}. Call adapter.prepare() first."
             )
 
         color_files = {
@@ -88,7 +88,7 @@ class ScanNetPPSceneAdapter(SceneAdapter):
                 rgb_path=color_files[frame_id],
                 depth_path=depth_dir / f"{frame_id}.png",
                 pose_path=pose_dir / f"{frame_id}.txt",
-                intrinsics_path=intrinsics_path,
+                intrinsics_path=intrinsics_dir / f"{frame_id}.txt",
             )
             for frame_id in frame_ids
         ]
@@ -110,7 +110,16 @@ class ScanNetPPSceneAdapter(SceneAdapter):
         pose = np.loadtxt(frame.pose_path)
         if np.isnan(pose).any() or np.isinf(pose).any():
             raise ValueError(f"Invalid pose matrix in {frame.pose_path}")
-        return pose
+        
+        # Convert from ARKit (X-right, Y-up, Z-back) to OpenCV (X-right, Y-down, Z-forward)
+        conversion_matrix = np.array([
+            [1,  0,  0, 0],
+            [0, -1,  0, 0],
+            [0,  0, -1, 0],
+            [0,  0,  0, 1]
+        ], dtype=np.float32)
+        
+        return pose @ conversion_matrix
 
     def load_intrinsics(self, frame: FrameRecord) -> np.ndarray:
         return np.loadtxt(frame.intrinsics_path)[:3, :3]

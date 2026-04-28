@@ -14,6 +14,7 @@ from chorus.eval.scannet_oracle import (
     build_oracle_best_labels,
     build_proposals_from_cluster_outputs,
     compute_additional_oracle_metrics,
+    flatten_oracle_ap_bucket_metrics,
 )
 
 
@@ -121,6 +122,22 @@ def test_compute_additional_oracle_metrics_tracks_winner_granularity_share() -> 
 
     assert extras["topk_proposal_coverage"]["iou_0.25"]["R_at_least_1"] == pytest.approx(1.0)
     assert extras["topk_proposal_coverage"]["iou_0.50"]["R_at_least_1"] == pytest.approx(1.0)
+
+
+def test_flatten_oracle_ap_bucket_metrics_maps_size_buckets() -> None:
+    oracle_results = {
+        "Small (<10 pts)": {"AP25": 0.1, "AP50": 0.2, "Count": 3},
+        "Medium (10-20 pts)": {"AP25": 0.3, "AP50": 0.4, "Count": 2},
+        "Large (>20 pts)": {"AP25": 0.5, "AP50": 0.6, "Count": 1},
+    }
+    flat = flatten_oracle_ap_bucket_metrics(oracle_results)
+    assert flat["oracle_ap25_small"] == pytest.approx(0.1)
+    assert flat["oracle_ap50_small"] == pytest.approx(0.2)
+    assert flat["oracle_ap25_medium"] == pytest.approx(0.3)
+    assert flat["oracle_ap50_large"] == pytest.approx(0.6)
+    assert flatten_oracle_ap_bucket_metrics(None) == {}
+    assert flatten_oracle_ap_bucket_metrics({}) == {}
+
 
 if __name__ == "__main__":
     pytest.main([__file__])

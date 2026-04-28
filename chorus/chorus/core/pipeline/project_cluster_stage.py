@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import os
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -9,6 +13,7 @@ import numpy as np
 from chorus.common.types import ClusterOutput, TeacherOutput
 from chorus.common.progress import log_progress, phase_timer
 from chorus.core.clustering.hdbscan_cluster import cluster_features
+from chorus.core.clustering.hdbscan_subsample import cluster_features_with_subsample_cap
 from chorus.core.embedding.svd import compute_svd_features
 from chorus.core.lifting.project import project_points_to_image
 from chorus.core.lifting.visibility import compute_visible_points
@@ -79,16 +84,28 @@ def _maybe_save_hdbscan_features(
     }
 
 
-def run_project_cluster_stage(
+@dataclass
+class ProjectClusterSvdStage:
+    features_seen: np.ndarray
+    seen_mask: np.ndarray
+    num_points: int
+    used_frames: int
+    skipped_frames: int
+    num_seen_points: int
+    unseen_points: int
+    voting_stats: dict[str, Any]
+    svd_stats: dict[str, Any]
+
+
+def compute_project_cluster_svd_stage(
     adapter: SceneAdapter,
     teacher_output: TeacherOutput,
     frame_skip: int,
-    svd_components: int = 32,
-    min_cluster_size: int = 100,
-    min_samples: int = 5,
-    cluster_selection_epsilon: float = 0.1,
-    save_outputs: bool = True,
-) -> ClusterOutput:
+    svd_components: int,
+    min_cluster_size: int,
+    min_samples: int,
+    cluster_selection_epsilon: float,
+) -> tuple[ProjectClusterSvdStage, dict[str, str]]:
     points_3d = adapter.load_geometry_points()
     num_points = points_3d.shape[0]
     visibility_cfg = adapter.get_visibility_config()
@@ -192,12 +209,70 @@ def run_project_cluster_stage(
         cluster_selection_epsilon=cluster_selection_epsilon,
     )
 
-    labels_seen, clustering_stats = cluster_features(
-        features_seen,
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-        cluster_selection_epsilon=cluster_selection_epsilon,
+    stage = ProjectClusterSvdStage(
+        features_seen=features_seen,
+        seen_mask=seen_mask,
+        num_points=num_points,
+        used_frames=used_frames,
+        skipped_frames=skipped_frames,
+        num_seen_points=num_seen_points,
+        unseen_points=unseen_points,
+        voting_stats=voting_stats,
+        svd_stats=svd_stats,
     )
+    return stage, feature_artifacts
+
+
+def _dispatch_hdbscan(
+    features_seen: np.ndarray,
+    min_cluster_size: int,
+    min_samples: int,
+    cluster_selection_epsilon: float,
+    hdbscan_max_samples: int | None,
+    hdbscan_subsample_seed: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    n = int(features_seen.shape[0])
+    t_cluster = time.perf_counter()
+    if hdbscan_max_samples is not None and n > int(hdbscan_max_samples):
+        labels_seen, clustering_stats = cluster_features_with_subsample_cap(
+            features_seen,
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            cluster_selection_epsilon=cluster_selection_epsilon,
+            max_samples=int(hdbscan_max_samples),
+            rng=np.random.default_rng(int(hdbscan_subsample_seed)),
+        )
+    else:
+        labels_seen, clustering_stats = cluster_features(
+            features_seen,
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            cluster_selection_epsilon=cluster_selection_epsilon,
+        )
+    clustering_stats = dict(clustering_stats)
+    clustering_stats["hdbscan_cluster_wall_seconds"] = float(time.perf_counter() - t_cluster)
+    return labels_seen, clustering_stats
+
+
+def finalize_project_cluster_output(
+    adapter: SceneAdapter,
+    teacher_output: TeacherOutput,
+    svd_stage: ProjectClusterSvdStage,
+    feature_artifacts: dict[str, str],
+    labels_seen: np.ndarray,
+    clustering_stats: dict[str, Any],
+    save_outputs: bool,
+    stats_overlay: dict[str, Any] | None = None,
+) -> ClusterOutput:
+    num_points = svd_stage.num_points
+    seen_mask = svd_stage.seen_mask
+    features_seen = svd_stage.features_seen
+    used_frames = svd_stage.used_frames
+    skipped_frames = svd_stage.skipped_frames
+    num_seen_points = svd_stage.num_seen_points
+    unseen_points = svd_stage.unseen_points
+    voting_stats = svd_stage.voting_stats
+    svd_stats = svd_stage.svd_stats
 
     full_labels = np.full(num_points, -1, dtype=np.int32)
     full_labels[seen_mask] = labels_seen
@@ -234,6 +309,8 @@ def run_project_cluster_stage(
         **feature_artifacts,
         **clustering_stats,
     }
+    if stats_overlay:
+        stats.update(stats_overlay)
 
     cluster_output = ClusterOutput(
         granularity=teacher_output.granularity,
@@ -296,3 +373,239 @@ def run_project_cluster_stage(
         labels_path=labels_path,
         stats=stats,
     )
+
+
+def run_project_cluster_stage(
+    adapter: SceneAdapter,
+    teacher_output: TeacherOutput,
+    frame_skip: int,
+    svd_components: int = 32,
+    min_cluster_size: int = 100,
+    min_samples: int = 5,
+    cluster_selection_epsilon: float = 0.1,
+    save_outputs: bool = True,
+    hdbscan_max_samples: int | None = None,
+    hdbscan_subsample_seed: int = 0,
+) -> ClusterOutput:
+    svd_stage, feature_artifacts = compute_project_cluster_svd_stage(
+        adapter=adapter,
+        teacher_output=teacher_output,
+        frame_skip=frame_skip,
+        svd_components=svd_components,
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        cluster_selection_epsilon=cluster_selection_epsilon,
+    )
+    labels_seen, clustering_stats = _dispatch_hdbscan(
+        svd_stage.features_seen,
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        cluster_selection_epsilon=cluster_selection_epsilon,
+        hdbscan_max_samples=hdbscan_max_samples,
+        hdbscan_subsample_seed=hdbscan_subsample_seed,
+    )
+    return finalize_project_cluster_output(
+        adapter=adapter,
+        teacher_output=teacher_output,
+        svd_stage=svd_stage,
+        feature_artifacts=feature_artifacts,
+        labels_seen=labels_seen,
+        clustering_stats=clustering_stats,
+        save_outputs=save_outputs,
+        stats_overlay=None,
+    )
+
+
+def _hdbscan_cap_from_seen_fraction(
+    num_seen: int,
+    fraction: float,
+    min_cluster_size: int,
+) -> int:
+    """Max HDBSCAN rows = round(fraction * seen), floored at min_cluster_size, capped at num_seen."""
+    if num_seen <= 0:
+        return 0
+    frac = float(fraction)
+    if not (0.0 < frac <= 1.0):
+        raise ValueError(f"subsample fraction must be in (0, 1], got {fraction}")
+    m = int(round(frac * num_seen))
+    m = max(int(min_cluster_size), m)
+    return min(m, int(num_seen))
+
+
+def run_project_cluster_hdbscan_subsample_ablation(
+    adapter: SceneAdapter,
+    teacher_output: TeacherOutput,
+    frame_skip: int,
+    svd_components: int,
+    min_cluster_size: int,
+    min_samples: int,
+    cluster_selection_epsilon: float,
+    subsample_fractions: Sequence[float] | None,
+    subsample_seed: int,
+    eval_benchmark: str | None,
+) -> dict[str, Any]:
+    """One SVD lift, full HDBSCAN once, then per-fraction capped subsample + 1-NN vs full (no artifact writes)."""
+    from sklearn.metrics import adjusted_rand_score
+
+    from chorus.eval.scannet_oracle import (
+        evaluate_and_save_scannet_oracle,
+        flatten_oracle_ap_bucket_metrics,
+    )
+
+    fractions = tuple(subsample_fractions) if subsample_fractions is not None else (0.9, 0.75, 0.5, 0.25)
+
+    svd_stage, feature_artifacts = compute_project_cluster_svd_stage(
+        adapter=adapter,
+        teacher_output=teacher_output,
+        frame_skip=frame_skip,
+        svd_components=svd_components,
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        cluster_selection_epsilon=cluster_selection_epsilon,
+    )
+
+    n_seen = int(svd_stage.num_seen_points)
+    labels_full, stats_full = _dispatch_hdbscan(
+        svd_stage.features_seen,
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        cluster_selection_epsilon=cluster_selection_epsilon,
+        hdbscan_max_samples=None,
+        hdbscan_subsample_seed=0,
+    )
+    cluster_full = finalize_project_cluster_output(
+        adapter=adapter,
+        teacher_output=teacher_output,
+        svd_stage=svd_stage,
+        feature_artifacts=feature_artifacts,
+        labels_seen=labels_full,
+        clustering_stats=stats_full,
+        save_outputs=False,
+        stats_overlay={"hdbscan_ablation_branch": "full"},
+    )
+
+    oracle_full = evaluate_and_save_scannet_oracle(
+        adapter=adapter,
+        cluster_outputs=[cluster_full],
+        eval_benchmark=eval_benchmark,
+        save_artifacts=False,
+    )
+    cm_full = oracle_full.get("clustering_metrics") or {}
+    ap_full = flatten_oracle_ap_bucket_metrics(oracle_full.get("oracle_results"))
+    wall_full = float(stats_full.get("hdbscan_cluster_wall_seconds", 0.0))
+
+    full_block: dict[str, Any] = {
+        "timing_seconds": {
+            "full_hdbscan_cluster_wall": wall_full,
+            "full_hdbscan_fit_predict": float(stats_full.get("hdbscan_fit_predict_seconds", 0.0)),
+        },
+        "oracle_clustering_metrics": dict(cm_full),
+        "oracle_ap": dict(ap_full),
+        "intrinsic_metrics": cluster_full.stats.get("intrinsic_metrics"),
+    }
+
+    by_fraction: dict[str, Any] = {}
+    for frac in fractions:
+        cap = _hdbscan_cap_from_seen_fraction(n_seen, frac, min_cluster_size)
+        frac_key = f"{frac:g}"
+        equiv_full = cap >= n_seen
+
+        if equiv_full:
+            by_fraction[frac_key] = {
+                "subsample_fraction": float(frac),
+                "hdbscan_max_samples_effective": int(cap),
+                "subsample_equivalent_to_full": True,
+                "pseudolabel_ari_vs_full": 1.0,
+                "timing_seconds": {
+                    "subsample_hdbscan_cluster_wall": 0.0,
+                    "speedup_full_over_sub": None,
+                    "subsample_hdbscan_fit_predict": 0.0,
+                    "subsample_propagate_nn": 0.0,
+                },
+                "oracle_clustering_metrics_sub": dict(cm_full),
+                "oracle_nmi_delta_sub_minus_full": 0.0
+                if cm_full.get("NMI") is not None
+                else None,
+                "oracle_ari_delta_sub_minus_full": 0.0
+                if cm_full.get("ARI") is not None
+                else None,
+                "oracle_ap": {
+                    "sub": dict(ap_full),
+                    "delta_sub_minus_full": {},
+                },
+                "intrinsic_sub": cluster_full.stats.get("intrinsic_metrics"),
+            }
+            continue
+
+        labels_sub, stats_sub = _dispatch_hdbscan(
+            svd_stage.features_seen,
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            cluster_selection_epsilon=cluster_selection_epsilon,
+            hdbscan_max_samples=int(cap),
+            hdbscan_subsample_seed=subsample_seed,
+        )
+        cluster_sub = finalize_project_cluster_output(
+            adapter=adapter,
+            teacher_output=teacher_output,
+            svd_stage=svd_stage,
+            feature_artifacts=feature_artifacts,
+            labels_seen=labels_sub,
+            clustering_stats=stats_sub,
+            save_outputs=False,
+            stats_overlay={"hdbscan_ablation_branch": "subsample"},
+        )
+
+        pseudolabel_ari = float(adjusted_rand_score(labels_full, labels_sub))
+
+        oracle_sub = evaluate_and_save_scannet_oracle(
+            adapter=adapter,
+            cluster_outputs=[cluster_sub],
+            eval_benchmark=eval_benchmark,
+            save_artifacts=False,
+        )
+        cm_s = oracle_sub.get("clustering_metrics") or {}
+        ap_s = flatten_oracle_ap_bucket_metrics(oracle_sub.get("oracle_results"))
+        ap_delta: dict[str, float] = {}
+        for k in sorted(set(ap_full) | set(ap_s)):
+            vf, vs = ap_full.get(k), ap_s.get(k)
+            if vf is not None and vs is not None:
+                ap_delta[k] = float(vs) - float(vf)
+
+        wall_sub = float(stats_sub.get("hdbscan_cluster_wall_seconds", 0.0))
+        speedup = (wall_full / wall_sub) if wall_sub > 1e-9 else None
+
+        by_fraction[frac_key] = {
+            "subsample_fraction": float(frac),
+            "hdbscan_max_samples_effective": int(cap),
+            "subsample_equivalent_to_full": False,
+            "pseudolabel_ari_vs_full": pseudolabel_ari,
+            "timing_seconds": {
+                "subsample_hdbscan_cluster_wall": wall_sub,
+                "speedup_full_over_sub": speedup,
+                "subsample_hdbscan_fit_predict": float(stats_sub.get("hdbscan_fit_predict_seconds", 0.0)),
+                "subsample_propagate_nn": float(stats_sub.get("hdbscan_propagate_nn_seconds", 0.0)),
+            },
+            "oracle_clustering_metrics_sub": dict(cm_s),
+            "oracle_nmi_delta_sub_minus_full": float(cm_s.get("NMI", 0.0)) - float(cm_full.get("NMI", 0.0))
+            if cm_full.get("NMI") is not None and cm_s.get("NMI") is not None
+            else None,
+            "oracle_ari_delta_sub_minus_full": float(cm_s.get("ARI", 0.0)) - float(cm_full.get("ARI", 0.0))
+            if cm_full.get("ARI") is not None and cm_s.get("ARI") is not None
+            else None,
+            "oracle_ap": {
+                "sub": dict(ap_s),
+                "delta_sub_minus_full": dict(ap_delta),
+            },
+            "intrinsic_sub": cluster_sub.stats.get("intrinsic_metrics"),
+        }
+
+    return {
+        "scene_id": adapter.scene_id,
+        "granularity": float(teacher_output.granularity),
+        "num_seen_points": n_seen,
+        "subsample_fractions": [float(f) for f in fractions],
+        "subsample_seed": int(subsample_seed),
+        "full": full_block,
+        "by_fraction": by_fraction,
+    }
