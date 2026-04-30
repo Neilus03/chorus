@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -240,6 +241,28 @@ def evaluate_oracle_ap(
     return results
 
 
+def flatten_oracle_ap_bucket_metrics(oracle_results: dict[str, Any] | None) -> dict[str, float | None]:
+    """Stable keys aligned with ScanNet++ reporting: oracle_ap25_small, oracle_ap50_large, etc."""
+    if not oracle_results:
+        return {}
+    flat: dict[str, float | None] = {}
+    for bucket_name, bucket_metrics in oracle_results.items():
+        if not isinstance(bucket_metrics, dict):
+            continue
+        lower = str(bucket_name).strip().lower()
+        if lower.startswith("small"):
+            bucket = "small"
+        elif lower.startswith("medium"):
+            bucket = "medium"
+        elif lower.startswith("large"):
+            bucket = "large"
+        else:
+            continue
+        flat[f"oracle_ap25_{bucket}"] = bucket_metrics.get("AP25")
+        flat[f"oracle_ap50_{bucket}"] = bucket_metrics.get("AP50")
+    return flat
+
+
 def build_oracle_best_labels(
     gt_ids: np.ndarray,
     proposals: list[np.ndarray],
@@ -327,6 +350,7 @@ def evaluate_and_save_scannet_oracle(
     cluster_outputs: list[ClusterOutput],
     eval_benchmark: str | None = SCANNET_EVAL_BENCHMARK_20,
     min_iou_for_ply: float = 0.1,
+    save_artifacts: bool = True,
 ) -> dict:
     if adapter.dataset_name == "scannet":
         resolved_benchmark = normalize_scannet_eval_benchmark(eval_benchmark)
@@ -386,27 +410,32 @@ def evaluate_and_save_scannet_oracle(
     results_to_save["_extras"] = additional_metrics
     results_to_save["_clustering"] = clustering_metrics
 
-    with metrics_path.open("w", encoding="utf-8") as f:
-        json.dump(results_to_save, f, indent=2)
+    if save_artifacts:
+        with metrics_path.open("w", encoding="utf-8") as f:
+            json.dump(results_to_save, f, indent=2)
 
-    np.save(labels_path, oracle_best_labels)
+        np.save(labels_path, oracle_best_labels)
 
-    geometry_record = adapter.get_geometry_record()
-    save_oracle_best_ply(
-        geometry_path=geometry_record.geometry_path,
-        out_path=ply_path,
-        oracle_labels=oracle_best_labels,
-    )
+        geometry_record = adapter.get_geometry_record()
+        save_oracle_best_ply(
+            geometry_path=geometry_record.geometry_path,
+            out_path=ply_path,
+            oracle_labels=oracle_best_labels,
+        )
 
-    print(f"Saved oracle metrics: {metrics_path}")
-    print(f"Saved oracle pooled labels: {labels_path}")
-    print(f"Saved oracle pooled ply: {ply_path}")
-    if resolved_benchmark is not None:
-        print(f"Oracle benchmark: {resolved_benchmark}")
-    print(
-        "Clustering consistency metrics (GT vs oracle labels on foreground points): "
-        f"NMI={clustering_metrics['NMI']:.4f}, ARI={clustering_metrics['ARI']:.4f}"
-    )
+        print(f"Saved oracle metrics: {metrics_path}")
+        print(f"Saved oracle pooled labels: {labels_path}")
+        print(f"Saved oracle pooled ply: {ply_path}")
+        if resolved_benchmark is not None:
+            print(f"Oracle benchmark: {resolved_benchmark}")
+        print(
+            "Clustering consistency metrics (GT vs oracle labels on foreground points): "
+            f"NMI={clustering_metrics['NMI']:.4f}, ARI={clustering_metrics['ARI']:.4f}"
+        )
+    else:
+        metrics_path = None
+        labels_path = None
+        ply_path = None
 
     return {
         "eval_benchmark": resolved_benchmark,
