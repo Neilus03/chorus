@@ -163,6 +163,7 @@ def build_student_model(
     use_positional_guidance: bool = True,
     learned_query_ratio: float = 0.25,
     multi_scale: bool = False,
+    multi_scale_indices: list[int] | None = None,
     decoder_type: str = "multi_head",
 ) -> StudentInstanceSegModel:
     """Convenience factory from scalar config values.
@@ -201,6 +202,7 @@ def build_student_model(
         litept_variant=litept_variant,
         litept_kwargs=litept_kwargs,
         multi_scale=multi_scale,
+        multi_scale_indices=multi_scale_indices,
     )
 
     if query_init == "learned":
