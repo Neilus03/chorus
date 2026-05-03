@@ -119,6 +119,7 @@ class LitePTBackbone(nn.Module):
         litept_variant: str = "litept_s_star",
         litept_kwargs: dict[str, Any] | None = None,
         multi_scale: bool = False,
+        multi_scale_indices: list[int] | None = None,
     ) -> None:
         super().__init__()
         self.litept_root = Path(litept_root).resolve()
@@ -157,15 +158,34 @@ class LitePTBackbone(nn.Module):
         self._multi_scale = bool(multi_scale)
         self._captured: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self._multi_scale_channels: list[int] = []
+        self._multi_scale_indices: list[int] | None = None
 
         if self._multi_scale and hasattr(self.model, "dec"):
             dec_channels_cfg = list(ctor.get("dec_channels", (72, 72, 144, 252)))
             # dec_channels_cfg is indexed s=0 (finest) .. s=3 (coarsest).
             # self.model.dec runs in forward order dec3→dec0 (coarsest→finest),
-            # so reversed gives coarse→fine channel widths.
-            self._multi_scale_channels = list(reversed(dec_channels_cfg))
+            # so reversed gives coarse→fine channel widths. Hook indices i are in
+            # that same coarse→fine order (i ascending).
+            all_channels_coarse_to_fine = list(reversed(dec_channels_cfg))
             num_dec_stages = len(self.model.dec)
-            for i in range(num_dec_stages):
+
+            if multi_scale_indices is None:
+                selected = list(range(num_dec_stages))
+            else:
+                selected = sorted({int(i) for i in multi_scale_indices})
+                for i in selected:
+                    if i < 0 or i >= num_dec_stages:
+                        raise ValueError(
+                            f"multi_scale_indices contains out-of-range index {i}; "
+                            f"expected [0, {num_dec_stages - 1}]"
+                        )
+
+            self._multi_scale_indices = selected
+            self._multi_scale_channels = [
+                all_channels_coarse_to_fine[i] for i in selected
+            ]
+
+            for i in selected:
                 self.model.dec[i].register_forward_hook(self._make_hook(i))
 
     def _make_hook(self, scale_idx: int):
