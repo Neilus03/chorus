@@ -437,16 +437,21 @@ class SingleGranCriterion(nn.Module):
         A shared :class:`MaskSetCriterion` instance.
     aux_weight:
         Multiplier on losses from intermediate decoder layers.
+    granularity_weights:
+        Optional per-granularity multipliers applied to ``loss_total`` when
+        *granularity_key* is passed to ``forward`` (training / eval at fixed g).
     """
 
     def __init__(
         self,
         criterion: MaskSetCriterion,
         aux_weight: float = 0.0,
+        granularity_weights: dict[str, float] | None = None,
     ) -> None:
         super().__init__()
         self.criterion = criterion
         self.aux_weight = aux_weight
+        self.granularity_weights = granularity_weights or {}
 
     def forward(
         self,
@@ -454,6 +459,7 @@ class SingleGranCriterion(nn.Module):
         targets: "InstanceTargets",
         *,
         context: str = "",
+        granularity_key: str | None = None,
     ) -> dict[str, Any]:
         """
         Parameters
@@ -464,11 +470,17 @@ class SingleGranCriterion(nn.Module):
             ``aux_outputs`` — list of intermediate-layer prediction dicts.
         targets:
             :class:`InstanceTargets` for the sampled granularity.
+        granularity_key:
+            If set (e.g. ``"g05"``), scales ``loss_total`` by
+            ``granularity_weights[granularity_key]`` (default 1.0).
 
         Returns
         -------
         Dict with ``loss_total``, individual losses, matching info, and
-        optional ``loss_aux``.
+        optional ``loss_aux``.  When granularity weighting is applied,
+        ``loss_total_unweighted`` is the combined loss before scaling (for
+        logging / per-head plots); ``loss_total`` is the scaled tensor used for
+        backprop.
         """
         result = self.criterion(pred, targets, context=context)
 
@@ -486,5 +498,13 @@ class SingleGranCriterion(nn.Module):
                 weighted_aux = self.aux_weight * aux_loss_sum
                 result["loss_aux"] = weighted_aux.detach()
                 result["loss_total"] = result["loss_total"] + weighted_aux
+
+        unweighted_total = result["loss_total"]
+        w = 1.0
+        if granularity_key is not None:
+            w = float(self.granularity_weights.get(granularity_key, 1.0))
+            result["loss_total_unweighted"] = unweighted_total.detach()
+
+        result["loss_total"] = unweighted_total * w
 
         return result

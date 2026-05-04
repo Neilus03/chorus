@@ -45,6 +45,7 @@ from student.engine.multi_scene_evaluator import (
 )
 from student.losses.mask_set_loss import MultiGranCriterion, SingleGranCriterion
 from student.models.continuous_decoder import ContinuousQueryInstanceDecoder
+from student.models.finetune_wrapper import FineTuningWrapper
 
 log = logging.getLogger(__name__)
 
@@ -111,6 +112,13 @@ def _dist_ready() -> bool:
 def _unwrap_model(model: nn.Module) -> nn.Module:
     if isinstance(model, DistributedDataParallel):
         return model.module
+    return model
+
+
+def _unwrap_prompt_model(model: nn.Module) -> nn.Module:
+    model = _unwrap_model(model)
+    if isinstance(model, FineTuningWrapper):
+        return model.model
     return model
 
 
@@ -211,6 +219,8 @@ class MultiSceneTrainer:
         fragment_merge_num: int = 4,
         fragment_merge_point_max: int | None = None,
         fragment_merge_seed: int = 0,
+        prompt_finetune: bool = False,
+        prompt_target_granularity: str | None = None,
     ) -> None:
         self.device = device
         self.lr = lr
@@ -259,10 +269,31 @@ class MultiSceneTrainer:
         self.fragment_merge_num = int(fragment_merge_num)
         self.fragment_merge_point_max = fragment_merge_point_max
         self.fragment_merge_seed = int(fragment_merge_seed)
+        self.prompt_finetune = bool(prompt_finetune)
+        self.prompt_target_granularity = (
+            str(prompt_target_granularity)
+            if prompt_target_granularity is not None
+            else (granularities[0] if granularities else None)
+        )
 
         # Detect continuous decoder mode
-        base_decoder = getattr(model, "decoder", None)
+        base_decoder = getattr(_unwrap_prompt_model(model), "decoder", None)
         self._continuous = isinstance(base_decoder, ContinuousQueryInstanceDecoder)
+        if self.prompt_finetune:
+            if not isinstance(model, FineTuningWrapper):
+                raise TypeError("prompt_finetune=True requires model to be FineTuningWrapper")
+            if not self._continuous:
+                raise TypeError("prompt_finetune=True requires a continuous decoder model")
+            if self.prompt_target_granularity not in self.granularities:
+                raise ValueError(
+                    "prompt_target_granularity must be one of "
+                    f"{self.granularities}, got {self.prompt_target_granularity!r}"
+                )
+            if len(self.granularities) != 1:
+                raise ValueError(
+                    "Prompt fine-tuning expects exactly one target granularity key; "
+                    f"got {self.granularities}"
+                )
 
         # Build granularity key→value mapping for DDP-safe sampling
         self._gran_keys = tuple(granularities)
@@ -397,6 +428,9 @@ class MultiSceneTrainer:
     def _model_module(self) -> nn.Module:
         return _unwrap_model(self.model)
 
+    def _base_model_module(self) -> nn.Module:
+        return _unwrap_prompt_model(self.model)
+
     def _sync_device(self) -> None:
         if str(self.device).startswith("cuda"):
             torch.cuda.synchronize(self.device)
@@ -530,6 +564,8 @@ class MultiSceneTrainer:
             fragment_merge_num=self.fragment_merge_num,
             fragment_merge_point_max=self.fragment_merge_point_max,
             fragment_merge_seed=self.fragment_merge_seed,
+            prompt_finetune=self.prompt_finetune,
+            prompt_target_granularity=self.prompt_target_granularity,
         )
 
         self._model_module().eval()
@@ -585,7 +621,7 @@ class MultiSceneTrainer:
 
     def _clear_backbone_cache(self) -> None:
         """Invalidate LitePT voxelization cache before processing a new scene."""
-        backbone = getattr(self._model_module(), "backbone", None)
+        backbone = getattr(self._base_model_module(), "backbone", None)
         if backbone is not None and hasattr(backbone, "_cached_voxelization"):
             backbone._cached_voxelization = None
 
@@ -730,8 +766,13 @@ class MultiSceneTrainer:
         for scene_pred, scene_targets in zip(preds_list, targets_by_scene):
             targets_g = scene_targets[sampled_g_key]
             ctx = f"continuous/g={sampled_g_key}"
-            scene_loss = self.criterion(scene_pred, targets_g, context=ctx)
+            scene_loss = self.criterion(
+                scene_pred, targets_g, context=ctx, granularity_key=sampled_g_key,
+            )
             scene_results.append(scene_loss)
+
+        def _head_loss_total(r: dict[str, Any]) -> torch.Tensor:
+            return r.get("loss_total_unweighted", r["loss_total"])
 
         if len(scene_results) == 1:
             result = scene_results[0]
@@ -740,7 +781,7 @@ class MultiSceneTrainer:
             ]
             # Wrap in a heads-like structure for logging compatibility
             result["heads"] = {sampled_g_key: {
-                "loss_total": result["loss_total"].detach(),
+                "loss_total": _head_loss_total(result),
                 "loss_mask_bce": result["loss_mask_bce"],
                 "loss_mask_dice": result["loss_mask_dice"],
                 "loss_score": result["loss_score"],
@@ -757,7 +798,7 @@ class MultiSceneTrainer:
             "heads": {
                 sampled_g_key: {
                     "loss_total": torch.stack([
-                        r["loss_total"].detach() for r in scene_results
+                        _head_loss_total(r) for r in scene_results
                     ]).mean(),
                     "loss_mask_bce": torch.stack([
                         r["loss_mask_bce"] for r in scene_results
@@ -996,7 +1037,18 @@ class MultiSceneTrainer:
                 for key, value in model_state_dict.items()
             }
 
-        self._model_module().load_state_dict(model_state_dict, strict=strict)
+        target_model = self._model_module()
+        loading_base_into_prompt = (
+            isinstance(target_model, FineTuningWrapper)
+            and not any(
+                key.startswith("model.") or key == "g_ft_logit"
+                for key in model_state_dict
+            )
+        )
+        if loading_base_into_prompt:
+            target_model.model.load_state_dict(model_state_dict, strict=strict)
+        else:
+            target_model.load_state_dict(model_state_dict, strict=strict)
 
         self.current_epoch = 0
         self.global_step = 0
@@ -1057,7 +1109,9 @@ class MultiSceneTrainer:
             # ── continuous decoder: DDP-safe granularity sampling ──
             sampled_g_key: str | None = None
             sampled_g_val: float | None = None
-            if self._continuous:
+            if self.prompt_finetune:
+                sampled_g_key = self.prompt_target_granularity
+            elif self._continuous:
                 sampled_g_key, sampled_g_val = sample_granularity_ddp(
                     torch.device(self.device),
                     distributed=self.distributed,
@@ -1082,7 +1136,7 @@ class MultiSceneTrainer:
             forward_kwargs: dict[str, Any] = {
                 "point_offsets": point_offsets,
             }
-            if self._continuous and sampled_g_val is not None:
+            if self._continuous and not self.prompt_finetune and sampled_g_val is not None:
                 forward_kwargs["target_g"] = sampled_g_val
 
             pred = self.model(
@@ -1138,6 +1192,10 @@ class MultiSceneTrainer:
                     "num_points_total": float(num_points_total),
                     "num_points_max_scene": float(num_points_max_scene),
                 }
+                if self.prompt_finetune:
+                    prompt_model = self._model_module()
+                    if isinstance(prompt_model, FineTuningWrapper):
+                        step_metrics["learned_granularity"] = prompt_model.learned_granularity
                 # Collect per-head metrics from loss_result["heads"]
                 active_grans = (
                     [sampled_g_key] if sampled_g_key is not None
@@ -1205,6 +1263,8 @@ class MultiSceneTrainer:
                     }
                     if self.distributed and self.log_scene_ids:
                         row["scene_ids_by_rank"] = scene_ids_by_rank
+                    if "learned_granularity" in step_metrics:
+                        row["learned_granularity"] = step_metrics["learned_granularity"]
                     for g in active_grans:
                         if f"loss_{g}" in step_metrics:
                             row[f"loss_{g}"] = step_metrics[f"loss_{g}"]
@@ -1235,6 +1295,8 @@ class MultiSceneTrainer:
                                 wb[f"train_scene/loss_mask_bce_{g}"] = step_metrics[f"loss_mask_bce_{g}"]
                                 wb[f"train_scene/loss_mask_dice_{g}"] = step_metrics[f"loss_mask_dice_{g}"]
                                 wb[f"train_scene/loss_score_{g}"] = step_metrics[f"loss_score_{g}"]
+                        if "learned_granularity" in step_metrics:
+                            wb["train_scene/learned_granularity"] = step_metrics["learned_granularity"]
                         if "loss_aux" in step_metrics:
                             wb["train_scene/loss_aux"] = step_metrics["loss_aux"]
                         wandb.log(wb)
@@ -1289,14 +1351,23 @@ class MultiSceneTrainer:
             "loss_max": loss_max,
             "lr": self.optimizer.param_groups[0]["lr"],
         }
+        prompt_model = self._model_module()
+        if isinstance(prompt_model, FineTuningWrapper):
+            epoch_metrics["learned_granularity"] = prompt_model.learned_granularity
         if self.is_main_process:
+            prompt_suffix = (
+                f"  g_ft={epoch_metrics['learned_granularity']:.4f}"
+                if "learned_granularity" in epoch_metrics
+                else ""
+            )
             log.info(
-                "Epoch %d/%d  loss_mean=%.4f  loss_range=[%.4f, %.4f]  lr=%.2e",
+                "Epoch %d/%d  loss_mean=%.4f  loss_range=[%.4f, %.4f]  lr=%.2e%s",
                 epoch, self.max_epochs,
                 epoch_metrics["loss_mean"],
                 epoch_metrics["loss_min"],
                 epoch_metrics["loss_max"],
                 epoch_metrics["lr"],
+                prompt_suffix,
             )
             self._log_row({"epoch_summary": True, **epoch_metrics})
 
@@ -1308,6 +1379,11 @@ class MultiSceneTrainer:
                     "train/loss_min": epoch_metrics["loss_min"],
                     "train/loss_max": epoch_metrics["loss_max"],
                     "train/lr": epoch_metrics["lr"],
+                    **(
+                        {"train/learned_granularity": epoch_metrics["learned_granularity"]}
+                        if "learned_granularity" in epoch_metrics
+                        else {}
+                    ),
                 })
 
         return epoch_metrics
@@ -1331,26 +1407,39 @@ class MultiSceneTrainer:
             if k.startswith("real_AP50_mean_") and isinstance(agg.get(k), (int, float))
         ]
         real_ap50_str = ", ".join(real_ap50_bits) if real_ap50_bits else "n/a"
+        prompt_model = self._model_module()
+        learned_g = (
+            prompt_model.learned_granularity
+            if isinstance(prompt_model, FineTuningWrapper)
+            else None
+        )
+        prompt_suffix = f"  g_ft={learned_g:.4f}" if learned_g is not None else ""
         log.info(
-            "  [val epoch %d] loss=%.4f  pseudo_AP50=%.3f  real_AP50=(%s)  mIoU=%.3f",
+            "  [val epoch %d] loss=%.4f  pseudo_AP50=%.3f  real_AP50=(%s)  mIoU=%.3f%s",
             epoch,
             agg["loss_mean"],
             agg["pseudo_AP50_mean"],
             real_ap50_str,
             agg["matched_mean_iou_mean"],
+            prompt_suffix,
         )
 
-        self._log_row({
+        row = {
             "epoch": epoch,
             "validation": True,
             **{f"val_{k}": v for k, v in agg.items() if isinstance(v, (int, float))},
-        })
+        }
+        if learned_g is not None:
+            row["learned_granularity"] = learned_g
+        self._log_row(row)
 
         if _wandb_active():
             wb: dict[str, Any] = {
                 "epoch": epoch,
                 "global_step": self.global_step,
             }
+            if learned_g is not None:
+                wb["val/learned_granularity"] = learned_g
             for k, v in agg.items():
                 if isinstance(v, (int, float)):
                     wb[f"val/{k}"] = v
@@ -1394,10 +1483,17 @@ class MultiSceneTrainer:
             if k.startswith("real_AP50_mean_") and isinstance(agg.get(k), (int, float))
         ]
         real_ap50_str = ", ".join(real_ap50_bits) if real_ap50_bits else "n/a"
+        prompt_model = self._model_module()
+        learned_g = (
+            prompt_model.learned_granularity
+            if isinstance(prompt_model, FineTuningWrapper)
+            else None
+        )
+        prompt_suffix = f"  g_ft={learned_g:.4f}" if learned_g is not None else ""
         log.info(
             "  [train-eval epoch %d] loss=%.4f  "
             "pseudo(AP25=%.3f, AP50=%.3f, NMI=%.4f, ARI=%.4f)  "
-            "real(AP50=(%s))  mIoU=%.3f",
+            "real(AP50=(%s))  mIoU=%.3f%s",
             epoch,
             agg["loss_mean"],
             agg["pseudo_AP25_mean"],
@@ -1406,19 +1502,25 @@ class MultiSceneTrainer:
             agg["pseudo_ARI_mean"],
             real_ap50_str,
             agg["matched_mean_iou_mean"],
+            prompt_suffix,
         )
 
-        self._log_row({
+        row = {
             "epoch": epoch,
             "train_eval": True,
             **{f"train_eval_{k}": v for k, v in agg.items() if isinstance(v, (int, float))},
-        })
+        }
+        if learned_g is not None:
+            row["learned_granularity"] = learned_g
+        self._log_row(row)
 
         if _wandb_active():
             wb: dict[str, Any] = {
                 "epoch": epoch,
                 "global_step": self.global_step,
             }
+            if learned_g is not None:
+                wb["train_eval/learned_granularity"] = learned_g
             for k, v in agg.items():
                 if isinstance(v, (int, float)):
                     wb[f"train_eval/{k}"] = v
@@ -1447,12 +1549,17 @@ class MultiSceneTrainer:
         if self.is_main_process:
             log.info(
                 "Starting training: %d epochs, %d train scenes, %d val scenes, "
-                "%d granularities (%s)",
+                "%d granularities (%s)%s",
                 self.max_epochs,
                 len(self.train_dataset),
                 len(self.val_dataset),
                 len(self.granularities),
                 ", ".join(self.granularities),
+                (
+                    f"  prompt_finetune target={self.prompt_target_granularity}"
+                    if self.prompt_finetune
+                    else ""
+                ),
             )
 
         t_start = time.time()

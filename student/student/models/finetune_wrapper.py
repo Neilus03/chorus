@@ -50,6 +50,20 @@ class FineTuningWrapper(nn.Module):
         """Current granularity value (for logging/inspection)."""
         return torch.sigmoid(self.g_ft_logit).item()
 
+    @property
+    def backbone(self) -> nn.Module:
+        """Expose the wrapped backbone for trainer utilities."""
+        return self.model.backbone
+
+    @property
+    def decoder(self) -> nn.Module:
+        """Expose the wrapped decoder for mode detection."""
+        return self.model.decoder
+
+    @property
+    def num_queries(self) -> int:
+        return self.model.num_queries
+
     def parameter_groups(self, backbone_lr_scale: float | None = None) -> list[dict]:
         """Return param groups with separate LR scaling.
 
@@ -76,11 +90,14 @@ class FineTuningWrapper(nn.Module):
         features: torch.Tensor,
         *,
         point_offsets: torch.Tensor | None = None,
+        target_g: torch.Tensor | float | None = None,
     ) -> dict | list[dict]:
         """Forward pass using the learned granularity prompt.
 
         The granularity is passed as a tensor (not float) to preserve
         the gradient path through ``g_ft_logit``.
+        ``target_g`` is accepted for interface compatibility but ignored:
+        prompt fine-tuning must use the learned prompt consistently.
         """
         g = torch.sigmoid(self.g_ft_logit)  # always in (0, 1), smooth gradients
         return self.model(points, features, target_g=g, point_offsets=point_offsets)
