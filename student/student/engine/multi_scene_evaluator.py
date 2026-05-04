@@ -226,7 +226,9 @@ def _evaluate_continuous_scene(
 
         # Compute per-granularity loss
         targets_g = targets_by_gran[g]
-        g_loss = criterion(flat_pred, targets_g, context=f"eval/{g}")
+        g_loss = criterion(
+            flat_pred, targets_g, context=f"eval/{g}", granularity_key=g,
+        )
         heads_loss[g] = g_loss
         loss_total = loss_total + g_loss["loss_total"]
 
@@ -239,6 +241,41 @@ def _evaluate_continuous_scene(
         "heads": heads_loss,
     }
 
+    return pred_multihead, loss_multihead
+
+
+def _evaluate_prompt_scene(
+    model: nn.Module,
+    points: torch.Tensor,
+    features: torch.Tensor,
+    prompt_key: str,
+    criterion: nn.Module,
+    targets_by_gran: dict,
+) -> tuple[dict, dict]:
+    """Run a prompt-tuned continuous model once using its learned ``g_ft``."""
+    flat_pred = model(points, features)
+    heads_pred = {
+        prompt_key: {
+            "mask_logits": flat_pred["mask_logits"],
+            "score_logits": flat_pred["score_logits"],
+            "query_embed": flat_pred.get("query_embed"),
+        },
+    }
+    pred_multihead: dict[str, Any] = {"heads": heads_pred}
+    if "point_embed" in flat_pred:
+        pred_multihead["point_embed"] = flat_pred["point_embed"]
+
+    targets_g = targets_by_gran[prompt_key]
+    g_loss = criterion(
+        flat_pred,
+        targets_g,
+        context=f"eval/prompt/{prompt_key}",
+        granularity_key=prompt_key,
+    )
+    loss_multihead = {
+        "loss_total": g_loss["loss_total"],
+        "heads": {prompt_key: g_loss},
+    }
     return pred_multihead, loss_multihead
 
 
@@ -260,6 +297,8 @@ def evaluate_multi_scene(
     fragment_merge_num: int = 4,
     fragment_merge_point_max: int | None = None,
     fragment_merge_seed: int = 0,
+    prompt_finetune: bool = False,
+    prompt_target_granularity: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate model on all scenes in a dataset.
 
@@ -305,6 +344,11 @@ def evaluate_multi_scene(
     # --------------------------
 
     continuous = _is_continuous_model(model)
+    prompt_key = prompt_target_granularity or (granularities[0] if granularities else None)
+    if prompt_finetune and prompt_key not in granularities:
+        raise ValueError(
+            f"prompt_target_granularity={prompt_key!r} must be one of {granularities}"
+        )
     per_scene: dict[str, dict[str, Any]] = {}
     frag_pm = fragment_merge_point_max if fragment_merge_point_max is not None else 50_000
 
@@ -326,7 +370,14 @@ def evaluate_multi_scene(
         _clear_backbone_cache(model)
 
         with torch.no_grad():
-            if continuous:
+            if prompt_finetune:
+                if prompt_key is None:
+                    raise ValueError("Prompt fine-tuning requires at least one granularity key")
+                pred, loss_result = _evaluate_prompt_scene(
+                    model, points, features, prompt_key,
+                    criterion, targets_by_gran,
+                )
+            elif continuous:
                 # Run model once per granularity, assemble multi-head output
                 pred, loss_result = _evaluate_continuous_scene(
                     model, points, features, granularities,
@@ -347,7 +398,7 @@ def evaluate_multi_scene(
 
         eval_result: dict[str, Any] = {}
         try:
-            if fragment_merge_eval:
+            if fragment_merge_eval and not prompt_finetune:
                 base_ds, real_idx = _base_dataset_and_index(dataset, idx)
                 eval_result = evaluate_scene_fragment_merge(
                     model,

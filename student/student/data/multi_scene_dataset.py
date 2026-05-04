@@ -138,6 +138,11 @@ class MultiSceneDataset(Dataset):
         If True, apply LitePT ScanNet-style geometric and (when colors are used)
         chromatic jitter on **training** samples only.  Ignores precomputed
         feature cache so augmentations vary each epoch.
+    scannet_gt_supervise_all_points:
+        When ``label_source="scannet_gt"``, keep every point in the mask-loss
+        supervision domain.  ScanNet GT points with id 0 remain ``-1`` labels,
+        so they are not target instances, but they become negatives for every
+        foreground instance mask.  Pack/pseudo-label pretraining is unaffected.
     """
 
     def __init__(
@@ -155,6 +160,7 @@ class MultiSceneDataset(Dataset):
         train_augmentations: bool = False,
         label_source: str = _LABEL_SOURCE_PACK,
         scannet_eval_benchmark: str = "all",
+        scannet_gt_supervise_all_points: bool = False,
     ) -> None:
         super().__init__()
         self._scene_dirs = list(scene_dirs)
@@ -169,6 +175,7 @@ class MultiSceneDataset(Dataset):
         self._train_augmentations = bool(train_augmentations)
         self._label_source = str(label_source)
         self._scannet_eval_benchmark = str(scannet_eval_benchmark)
+        self._scannet_gt_supervise_all_points = bool(scannet_gt_supervise_all_points)
         self._scenes: list[MultiGranTrainingPackScene] = []
         self._scene_point_counts: list[int] = []
         self._features_cache: list[np.ndarray] | None = [] if not train_augmentations else None
@@ -355,7 +362,10 @@ class MultiSceneDataset(Dataset):
                 g: torch.from_numpy(gt_labels).long()
                 for g in self._granularities
             }
-            sup_np = gt_labels != -1
+            if self._scannet_gt_supervise_all_points:
+                sup_np = np.ones_like(gt_labels, dtype=bool)
+            else:
+                sup_np = gt_labels != -1
             valid_np = sup_np.copy()
 
         valid_t = torch.from_numpy(valid_np).bool()

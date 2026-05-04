@@ -36,7 +36,12 @@ from student.config_utils import (
     set_seed,
 )
 from student.data.multi_scene_dataset import MultiSceneDataset, build_scene_list
-from student.losses import MaskSetCriterion, MultiGranCriterion
+from student.losses import (
+    MaskSetCriterion,
+    MultiGranCriterion,
+    SingleGranCriterion,
+)
+from student.models.finetune_wrapper import FineTuningWrapper
 from student.models.student_model import build_student_model
 from student.engine.multi_scene_trainer import MultiSceneTrainer
 
@@ -171,6 +176,14 @@ def main() -> None:
         "--eval-only",
         action="store_true",
         help="Run one validation pass and exit (use with --resume or --finetune-from).",
+    )
+    parser.add_argument(
+        "--eval-before-train",
+        action="store_true",
+        help=(
+            "Run one validation pass after checkpoint initialization and before "
+            "the first training epoch."
+        ),
     )
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument(
@@ -423,6 +436,9 @@ def main() -> None:
             train_augmentations=train_aug,
             label_source=data_cfg.get("label_source", "pack"),
             scannet_eval_benchmark=eval_cfg.get("scannet_benchmark", "all"),
+            scannet_gt_supervise_all_points=bool(
+                data_cfg.get("scannet_gt_supervise_all_points", False)
+            ),
         )
         val_max_pts = data_cfg.get("val_max_points", None)
         val_ds = MultiSceneDataset(
@@ -437,6 +453,9 @@ def main() -> None:
             train_augmentations=False,
             label_source=data_cfg.get("label_source", "pack"),
             scannet_eval_benchmark=eval_cfg.get("scannet_benchmark", "all"),
+            scannet_gt_supervise_all_points=bool(
+                data_cfg.get("scannet_gt_supervise_all_points", False)
+            ),
         )
         log.info(
             "Train batching: scenes/step=%d  shard_balance=%s  drop_last=%s  "
@@ -462,7 +481,24 @@ def main() -> None:
 
         bb_cfg = model_cfg["backbone"]
         num_queries, num_queries_by_granularity = resolve_num_queries(model_cfg, bb_cfg)
-        log.info("Building model ...")
+        decoder_type = str(model_cfg.get("decoder_type", "multi_head"))
+        prompt_ft_cfg = train_cfg.get("prompt_finetune", {})
+        if isinstance(prompt_ft_cfg, bool):
+            prompt_ft_enabled = prompt_ft_cfg
+            prompt_ft_cfg = {"enabled": prompt_ft_enabled}
+        elif isinstance(prompt_ft_cfg, dict):
+            prompt_ft_enabled = bool(prompt_ft_cfg.get("enabled", False))
+        else:
+            raise TypeError("train.prompt_finetune must be a bool or mapping")
+        if prompt_ft_enabled:
+            if decoder_type != "continuous":
+                raise ValueError("train.prompt_finetune.enabled requires model.decoder_type=continuous")
+            if len(granularities) != 1:
+                raise ValueError(
+                    "Prompt fine-tuning uses one real-GT target scale; set "
+                    f"data.granularities to a single value, got {granularities}"
+                )
+        log.info("Building model (decoder_type=%s) ...", decoder_type)
         model = build_student_model(
             litept_root=bb_cfg["litept_root"],
             in_channels=bb_cfg.get("in_channels", 3),
@@ -479,7 +515,30 @@ def main() -> None:
             use_positional_guidance=model_cfg.get("use_positional_guidance", True),
             learned_query_ratio=model_cfg.get("learned_query_ratio", 0.25),
             multi_scale=bb_cfg.get("multi_scale", False),
+            multi_scale_indices=bb_cfg.get("multi_scale_indices", None),
+            decoder_type=decoder_type,
         )
+        if prompt_ft_enabled:
+            init_g = float(prompt_ft_cfg.get("init_g", 0.5))
+            if not (0.0 < init_g < 1.0):
+                raise ValueError(f"prompt_finetune.init_g must be in (0, 1), got {init_g}")
+            prompt_backbone_lr_scale = float(
+                prompt_ft_cfg.get(
+                    "backbone_lr_scale",
+                    train_cfg.get("backbone_lr_scale", 0.01),
+                )
+            )
+            model = FineTuningWrapper(
+                model,
+                init_g=init_g,
+                backbone_lr_scale=prompt_backbone_lr_scale,
+            )
+            log.info(
+                "Prompt fine-tuning enabled: target=%s init_g=%.3f backbone_lr_scale=%.4g",
+                granularities[0],
+                init_g,
+                prompt_backbone_lr_scale,
+            )
         total_params = sum(p.numel() for p in model.parameters())
         log.info("Model: %s params (%d heads)", f"{total_params:,}", len(granularities))
         if args.print_model:
@@ -493,11 +552,20 @@ def main() -> None:
             dice_weight=loss_cfg.get("dice_weight", 1.0),
             score_weight=loss_cfg.get("score_weight", 0.5),
         )
-        criterion = MultiGranCriterion(
-            criterion=base_criterion,
-            granularity_weights=loss_cfg.get("granularity_weights", None),
-            aux_weight=loss_cfg.get("aux_weight", 0.0),
-        )
+        gran_weights = loss_cfg.get("granularity_weights", None)
+        aux_weight = float(loss_cfg.get("aux_weight", 0.0))
+        if decoder_type == "continuous":
+            criterion = SingleGranCriterion(
+                base_criterion,
+                aux_weight=aux_weight,
+                granularity_weights=gran_weights,
+            )
+        else:
+            criterion = MultiGranCriterion(
+                criterion=base_criterion,
+                granularity_weights=gran_weights,
+                aux_weight=aux_weight,
+            )
 
         # ── output dir ──
         log.info("Preparing output directory ...")
@@ -614,6 +682,8 @@ def main() -> None:
             fragment_merge_num=int(eval_cfg.get("fragment_merge_num", 4)),
             fragment_merge_point_max=eval_cfg.get("fragment_merge_point_max", None),
             fragment_merge_seed=int(eval_cfg.get("fragment_merge_seed", seed)),
+            prompt_finetune=prompt_ft_enabled,
+            prompt_target_granularity=granularities[0] if prompt_ft_enabled else None,
             num_workers=int(train_cfg.get("num_workers", 0)),
             log_every_steps=int(train_cfg.get("log_every_steps", 1)),
             batch_scenes_per_step=int(train_cfg.get("batch_scenes_per_step", 1)),
@@ -657,6 +727,13 @@ def main() -> None:
             trainer._validate(epoch=trainer.current_epoch)
             _dist_barrier()
             return
+
+        if args.eval_before_train:
+            if is_main_process:
+                log.info("Pre-training validation before first optimizer step ...")
+            _dist_barrier()
+            trainer._validate(epoch=trainer.current_epoch)
+            _dist_barrier()
 
         final_metrics = trainer.train()
 

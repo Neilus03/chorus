@@ -172,6 +172,7 @@ def main() -> None:
         use_positional_guidance=model_cfg.get("use_positional_guidance", True),
         learned_query_ratio=model_cfg.get("learned_query_ratio", 0.25),
         multi_scale=bb_cfg.get("multi_scale", False),
+        multi_scale_indices=bb_cfg.get("multi_scale_indices", None),
     ).to(device)
     print(f"  built in {time.time() - t0:.2f}s")
 
