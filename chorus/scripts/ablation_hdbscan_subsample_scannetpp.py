@@ -24,6 +24,7 @@ from chorus.datasets.scannetpp.download import (
     read_split_scene_ids,
     resolve_scannetpp_dataset_root,
 )
+from chorus.datasets.scannetpp.prepare import has_raw_scene_assets
 
 
 def _map_scratch2_to_euler(path: Path) -> Path:
@@ -48,20 +49,39 @@ def _parse_subsample_fractions(raw: str) -> list[float]:
     return out
 
 
+_ORACLE_AP25_KEYS = ("oracle_ap25_small", "oracle_ap25_medium", "oracle_ap25_large")
+_ORACLE_AP50_KEYS = ("oracle_ap50_small", "oracle_ap50_medium", "oracle_ap50_large")
+_ORACLE_MAP_KEYS = ("oracle_map_25_95_small", "oracle_map_25_95_medium", "oracle_map_25_95_large")
+
+
+def _macro_three(values: dict[str, float | None], keys: tuple[str, ...]) -> float | None:
+    xs = [float(values[k]) for k in keys if values.get(k) is not None]
+    return float(statistics.mean(xs)) if len(xs) == 3 else None
+
+
 def _read_scannetpp_scene_ids(
     *,
     dataset_root: Path,
     scene_list_file: Path | None,
     split: str | None,
     max_scenes: int | None,
+    scene_source: str,
 ) -> list[str]:
-    """Same selection rules as orchestrators.streaming.read_scannetpp_scene_ids (lightweight import)."""
+    """Resolve scene IDs from an explicit list, dataset split files, or `data/` (optionally filtered)."""
     if scene_list_file is not None:
         scene_ids = [
             line.strip()
             for line in scene_list_file.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+    elif scene_source == "data_dir_ready":
+        data_root = dataset_root / "data"
+        if not data_root.exists():
+            scene_ids = []
+        else:
+            candidates = sorted(p.name for p in data_root.iterdir() if p.is_dir())
+            scene_ids = [sid for sid in candidates if has_raw_scene_assets(data_root / sid, require_annotations=False)]
+            print(f"scene_source=data_dir_ready: {len(scene_ids)} scene(s) under {data_root} with complete raw assets.")
     elif split is not None:
         scene_ids = read_split_scene_ids(split=split, dataset_root=dataset_root)
     else:
@@ -103,6 +123,15 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--split", type=str, default=os.environ.get("CHORUS_SCANNETPP_SPLIT", "nvs_sem_val"))
     p.add_argument("--scene-list-file", type=Path, default=None)
+    p.add_argument(
+        "--scene-source",
+        type=str,
+        choices=("split", "data_dir_ready"),
+        default="split",
+        help="split: scene IDs from CHORUS split metadata (--split). "
+        "data_dir_ready: dirs under dataset_root/data with all required raw iphone/mesh assets (no split filter). "
+        "Ignored when --scene-list-file is set.",
+    )
     p.add_argument("--max-scenes", type=int, default=3)
     p.add_argument("--granularities", type=str, default="0.2,0.5,0.8")
     p.add_argument("--frame-skip", type=int, default=10)
@@ -150,8 +179,9 @@ def main() -> None:
     scene_ids = _read_scannetpp_scene_ids(
         dataset_root=dataset_root,
         scene_list_file=args.scene_list_file,
-        split=args.split if args.scene_list_file is None else None,
+        split=args.split if args.scene_list_file is None and args.scene_source == "split" else None,
         max_scenes=args.max_scenes,
+        scene_source=str(args.scene_source),
     )
 
     report_dir = args.report_dir or (dataset_root / "_chorus_reports")
@@ -170,7 +200,11 @@ def main() -> None:
     if len(scene_ids) == 0:
         report = {
             "created_at": datetime.now().isoformat(),
-            "config": {"dataset_root": str(dataset_root), "split": args.split},
+            "config": {
+                "dataset_root": str(dataset_root),
+                "split": args.split,
+                "scene_source": args.scene_source,
+            },
             "summary": {"num_scenes_requested": 0, "note": "no scenes selected"},
             "scenes": [],
         }
@@ -245,7 +279,29 @@ def main() -> None:
             )
             print(f"FAILED {scene_id}: {exc}")
 
+        # Save partial progress in case of OOM or crash
+        partial_path = str(out_path).replace(".json", f"_partial.json")
+        save_json(_json_safe({"scenes": rows}), partial_path)
+
     ok_rows = [r for r in rows if r.get("status") == "ok"]
+
+    def _frac_scratch() -> dict[str, Any]:
+        return {
+            "pseudolabel_ari_vs_full": [],
+            "oracle_nmi_delta_sub_minus_full": [],
+            "oracle_ari_delta_sub_minus_full": [],
+            "speedup_full_over_sub": [],
+            "subsample_hdbscan_cluster_wall_s": [],
+            "ap_delta_keys": defaultdict(list),
+            "map_delta_keys": defaultdict(list),
+            "det_sub_keys": defaultdict(list),
+            "macro_ap25_delta_vs_full": [],
+            "macro_ap50_delta_vs_full": [],
+            "macro_map_delta_vs_full": [],
+            "macro_ap25_sub": [],
+            "macro_ap50_sub": [],
+            "macro_map_sub": [],
+        }
 
     mean_by_granularity: dict[str, Any] = {}
     for r in ok_rows:
@@ -255,16 +311,11 @@ def main() -> None:
                     "oracle_nmi_full": [],
                     "oracle_ari_full": [],
                     "full_hdbscan_cluster_wall_s": [],
-                    "by_fraction": defaultdict(
-                        lambda: {
-                            "pseudolabel_ari_vs_full": [],
-                            "oracle_nmi_delta_sub_minus_full": [],
-                            "oracle_ari_delta_sub_minus_full": [],
-                            "speedup_full_over_sub": [],
-                            "subsample_hdbscan_cluster_wall_s": [],
-                            "ap_delta_keys": defaultdict(list),
-                        }
-                    ),
+                    "det_flat_full_keys": defaultdict(list),
+                    "macro_ap25_full": [],
+                    "macro_ap50_full": [],
+                    "macro_map_full": [],
+                    "by_fraction": defaultdict(_frac_scratch),
                 }
             bucket = mean_by_granularity[gkey]
             full = ab.get("full") or {}
@@ -276,6 +327,23 @@ def main() -> None:
             tsf = (full.get("timing_seconds") or {}).get("full_hdbscan_cluster_wall")
             if tsf is not None:
                 bucket["full_hdbscan_cluster_wall_s"].append(float(tsf))
+
+            ap_full_d = dict(full.get("oracle_ap") or {})
+            map_full_d = dict(full.get("oracle_map_25_95") or {})
+            merged_full_det = {**ap_full_d, **map_full_d}
+            for det_k, det_v in merged_full_det.items():
+                if det_v is not None and isinstance(det_v, (int, float)):
+                    bucket["det_flat_full_keys"][str(det_k)].append(float(det_v))
+
+            mf_ap25 = _macro_three(ap_full_d, _ORACLE_AP25_KEYS)
+            if mf_ap25 is not None:
+                bucket["macro_ap25_full"].append(mf_ap25)
+            mf_ap50 = _macro_three(ap_full_d, _ORACLE_AP50_KEYS)
+            if mf_ap50 is not None:
+                bucket["macro_ap50_full"].append(mf_ap50)
+            mf_map = _macro_three(map_full_d, _ORACLE_MAP_KEYS)
+            if mf_map is not None:
+                bucket["macro_map_full"].append(mf_map)
 
             for fk, fr in (ab.get("by_fraction") or {}).items():
                 bfr = bucket["by_fraction"][fk]
@@ -295,6 +363,33 @@ def main() -> None:
                 for ap_k, ap_v in dap.items():
                     if ap_v is not None and isinstance(ap_v, (int, float)):
                         bfr["ap_delta_keys"][str(ap_k)].append(float(ap_v))
+                dmap = (fr.get("oracle_map_25_95") or {}).get("delta_sub_minus_full") or {}
+                for mk, mv in dmap.items():
+                    if mv is not None and isinstance(mv, (int, float)):
+                        bfr["map_delta_keys"][str(mk)].append(float(mv))
+
+                ap_sub = dict((fr.get("oracle_ap") or {}).get("sub") or {})
+                map_sub = dict((fr.get("oracle_map_25_95") or {}).get("sub") or {})
+                merged_sub = {**ap_sub, **map_sub}
+                for det_k, det_v in merged_sub.items():
+                    if det_v is not None and isinstance(det_v, (int, float)):
+                        bfr["det_sub_keys"][str(det_k)].append(float(det_v))
+
+                ms_ap25 = _macro_three(ap_sub, _ORACLE_AP25_KEYS)
+                if ms_ap25 is not None:
+                    bfr["macro_ap25_sub"].append(float(ms_ap25))
+                if mf_ap25 is not None and ms_ap25 is not None:
+                    bfr["macro_ap25_delta_vs_full"].append(float(ms_ap25 - mf_ap25))
+                ms_ap50 = _macro_three(ap_sub, _ORACLE_AP50_KEYS)
+                if ms_ap50 is not None:
+                    bfr["macro_ap50_sub"].append(float(ms_ap50))
+                if mf_ap50 is not None and ms_ap50 is not None:
+                    bfr["macro_ap50_delta_vs_full"].append(float(ms_ap50 - mf_ap50))
+                ms_map = _macro_three(map_sub, _ORACLE_MAP_KEYS)
+                if ms_map is not None:
+                    bfr["macro_map_sub"].append(float(ms_map))
+                if mf_map is not None and ms_map is not None:
+                    bfr["macro_map_delta_vs_full"].append(float(ms_map - mf_map))
 
     def _finalize_fraction_block(raw: dict[str, Any]) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -308,6 +403,22 @@ def main() -> None:
                 "mean_oracle_ap_delta_sub_minus_full": {
                     k: _safe_mean(v) for k, v in fr["ap_delta_keys"].items()
                 },
+                "mean_oracle_map_25_95_delta_sub_minus_full": {
+                    k: _safe_mean(v) for k, v in fr["map_delta_keys"].items()
+                },
+                "mean_oracle_detection_sub_across_scenes": {
+                    k: _safe_mean(v) for k, v in fr["det_sub_keys"].items()
+                },
+                "mean_oracle_macro_detection_sub_across_scenes": {
+                    "ap25_buckets_mean_across_instances": _safe_mean(fr["macro_ap25_sub"]),
+                    "ap50_buckets_mean_across_instances": _safe_mean(fr["macro_ap50_sub"]),
+                    "map25_95_buckets_mean_across_instances": _safe_mean(fr["macro_map_sub"]),
+                },
+                "mean_oracle_macro_delta_sub_minus_full": {
+                    "ap25_buckets_mean_across_instances": _safe_mean(fr["macro_ap25_delta_vs_full"]),
+                    "ap50_buckets_mean_across_instances": _safe_mean(fr["macro_ap50_delta_vs_full"]),
+                    "map25_95_buckets_mean_across_instances": _safe_mean(fr["macro_map_delta_vs_full"]),
+                },
             }
         return out
 
@@ -317,6 +428,14 @@ def main() -> None:
             "mean_oracle_nmi_full": _safe_mean(bucket["oracle_nmi_full"]),
             "mean_oracle_ari_full": _safe_mean(bucket["oracle_ari_full"]),
             "mean_full_hdbscan_cluster_wall_s": _safe_mean(bucket["full_hdbscan_cluster_wall_s"]),
+            "mean_oracle_detection_full_across_scenes": {
+                k: _safe_mean(v) for k, v in bucket["det_flat_full_keys"].items()
+            },
+            "mean_oracle_macro_detection_full_across_scenes": {
+                "ap25_mean_of_three_buckets": _safe_mean(bucket["macro_ap25_full"]),
+                "ap50_mean_of_three_buckets": _safe_mean(bucket["macro_ap50_full"]),
+                "map25_95_mean_of_three_buckets": _safe_mean(bucket["macro_map_full"]),
+            },
             "by_fraction": _finalize_fraction_block(bucket["by_fraction"]),
         }
 
@@ -337,6 +456,7 @@ def main() -> None:
         "config": {
             "dataset_root": str(dataset_root),
             "split": args.split,
+            "scene_source": args.scene_source,
             "frame_skip": args.frame_skip,
             "svd_components": args.svd_components,
             "min_cluster_size": args.min_cluster_size,

@@ -15,6 +15,7 @@ from chorus.eval.scannet_oracle import (
     build_proposals_from_cluster_outputs,
     compute_additional_oracle_metrics,
     flatten_oracle_ap_bucket_metrics,
+    flatten_oracle_map_bucket_metrics,
 )
 
 
@@ -137,6 +138,22 @@ def test_flatten_oracle_ap_bucket_metrics_maps_size_buckets() -> None:
     assert flat["oracle_ap50_large"] == pytest.approx(0.6)
     assert flatten_oracle_ap_bucket_metrics(None) == {}
     assert flatten_oracle_ap_bucket_metrics({}) == {}
+
+
+def test_flatten_oracle_map_bucket_metrics() -> None:
+    additional = {
+        "oracle_mAP_25_95_by_bucket": {
+            "Small (<10 pts)": 0.11,
+            "Medium (10-20 pts)": 0.22,
+            "Large (>20 pts)": 0.33,
+        }
+    }
+    flat = flatten_oracle_map_bucket_metrics(additional)
+    assert flat["oracle_map_25_95_small"] == pytest.approx(0.11)
+    assert flat["oracle_map_25_95_medium"] == pytest.approx(0.22)
+    assert flat["oracle_map_25_95_large"] == pytest.approx(0.33)
+    assert flatten_oracle_map_bucket_metrics(None) == {}
+    assert flatten_oracle_map_bucket_metrics({}) == {}
 
 
 if __name__ == "__main__":
