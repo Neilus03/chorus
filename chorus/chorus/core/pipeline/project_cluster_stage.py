@@ -450,6 +450,7 @@ def run_project_cluster_hdbscan_subsample_ablation(
     from chorus.eval.scannet_oracle import (
         evaluate_and_save_scannet_oracle,
         flatten_oracle_ap_bucket_metrics,
+        flatten_oracle_map_bucket_metrics,
     )
 
     fractions = tuple(subsample_fractions) if subsample_fractions is not None else (0.9, 0.75, 0.5, 0.25)
@@ -492,6 +493,7 @@ def run_project_cluster_hdbscan_subsample_ablation(
     )
     cm_full = oracle_full.get("clustering_metrics") or {}
     ap_full = flatten_oracle_ap_bucket_metrics(oracle_full.get("oracle_results"))
+    map_full = flatten_oracle_map_bucket_metrics(oracle_full.get("additional_metrics"))
     wall_full = float(stats_full.get("hdbscan_cluster_wall_seconds", 0.0))
 
     full_block: dict[str, Any] = {
@@ -501,6 +503,7 @@ def run_project_cluster_hdbscan_subsample_ablation(
         },
         "oracle_clustering_metrics": dict(cm_full),
         "oracle_ap": dict(ap_full),
+        "oracle_map_25_95": dict(map_full),
         "intrinsic_metrics": cluster_full.stats.get("intrinsic_metrics"),
     }
 
@@ -531,6 +534,10 @@ def run_project_cluster_hdbscan_subsample_ablation(
                 else None,
                 "oracle_ap": {
                     "sub": dict(ap_full),
+                    "delta_sub_minus_full": {},
+                },
+                "oracle_map_25_95": {
+                    "sub": dict(map_full),
                     "delta_sub_minus_full": {},
                 },
                 "intrinsic_sub": cluster_full.stats.get("intrinsic_metrics"),
@@ -566,11 +573,17 @@ def run_project_cluster_hdbscan_subsample_ablation(
         )
         cm_s = oracle_sub.get("clustering_metrics") or {}
         ap_s = flatten_oracle_ap_bucket_metrics(oracle_sub.get("oracle_results"))
+        map_s = flatten_oracle_map_bucket_metrics(oracle_sub.get("additional_metrics"))
         ap_delta: dict[str, float] = {}
         for k in sorted(set(ap_full) | set(ap_s)):
             vf, vs = ap_full.get(k), ap_s.get(k)
             if vf is not None and vs is not None:
                 ap_delta[k] = float(vs) - float(vf)
+        map_delta: dict[str, float] = {}
+        for k in sorted(set(map_full) | set(map_s)):
+            vf, vs = map_full.get(k), map_s.get(k)
+            if vf is not None and vs is not None:
+                map_delta[k] = float(vs) - float(vf)
 
         wall_sub = float(stats_sub.get("hdbscan_cluster_wall_seconds", 0.0))
         speedup = (wall_full / wall_sub) if wall_sub > 1e-9 else None
@@ -596,6 +609,10 @@ def run_project_cluster_hdbscan_subsample_ablation(
             "oracle_ap": {
                 "sub": dict(ap_s),
                 "delta_sub_minus_full": dict(ap_delta),
+            },
+            "oracle_map_25_95": {
+                "sub": dict(map_s),
+                "delta_sub_minus_full": dict(map_delta),
             },
             "intrinsic_sub": cluster_sub.stats.get("intrinsic_metrics"),
         }

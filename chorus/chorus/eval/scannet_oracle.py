@@ -241,6 +241,17 @@ def evaluate_oracle_ap(
     return results
 
 
+def _oracle_size_bucket_slug(bucket_name: object) -> str | None:
+    lower = str(bucket_name).strip().lower()
+    if lower.startswith("small"):
+        return "small"
+    if lower.startswith("medium"):
+        return "medium"
+    if lower.startswith("large"):
+        return "large"
+    return None
+
+
 def flatten_oracle_ap_bucket_metrics(oracle_results: dict[str, Any] | None) -> dict[str, float | None]:
     """Stable keys aligned with ScanNet++ reporting: oracle_ap25_small, oracle_ap50_large, etc."""
     if not oracle_results:
@@ -249,17 +260,28 @@ def flatten_oracle_ap_bucket_metrics(oracle_results: dict[str, Any] | None) -> d
     for bucket_name, bucket_metrics in oracle_results.items():
         if not isinstance(bucket_metrics, dict):
             continue
-        lower = str(bucket_name).strip().lower()
-        if lower.startswith("small"):
-            bucket = "small"
-        elif lower.startswith("medium"):
-            bucket = "medium"
-        elif lower.startswith("large"):
-            bucket = "large"
-        else:
+        bucket = _oracle_size_bucket_slug(bucket_name)
+        if bucket is None:
             continue
         flat[f"oracle_ap25_{bucket}"] = bucket_metrics.get("AP25")
         flat[f"oracle_ap50_{bucket}"] = bucket_metrics.get("AP50")
+    return flat
+
+
+def flatten_oracle_map_bucket_metrics(additional_metrics: dict[str, Any] | None) -> dict[str, float | None]:
+    """mAP@[0.25:0.95] per size bucket: oracle_map_25_95_small, etc."""
+    if not additional_metrics:
+        return {}
+    map_by_bucket = additional_metrics.get("oracle_mAP_25_95_by_bucket") or {}
+    flat: dict[str, float | None] = {}
+    for bucket_name, val in map_by_bucket.items():
+        bucket = _oracle_size_bucket_slug(bucket_name)
+        if bucket is None or val is None:
+            continue
+        try:
+            flat[f"oracle_map_25_95_{bucket}"] = float(val)
+        except (TypeError, ValueError):
+            continue
     return flat
 
 
