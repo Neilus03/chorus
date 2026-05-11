@@ -195,8 +195,9 @@ class GranularityHead(nn.Module):
     maps final D-dim refined queries into task-specific outputs.
     """
 
-    def __init__(self, hidden_dim: int) -> None:
+    def __init__(self, hidden_dim: int, num_classes: int | None = None) -> None:
         super().__init__()
+        self.num_classes = int(num_classes) if num_classes is not None else None
         self.mask_embed = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
@@ -209,7 +210,20 @@ class GranularityHead(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
+        self.class_head: nn.Module | None = None
+        if self.num_classes is not None:
+            self.class_head = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.num_classes + 1),
+            )
         self.logit_scale = nn.Parameter(torch.log(torch.tensor(10.0)))
+
+    def class_logits(self, query_embed: torch.Tensor) -> torch.Tensor | None:
+        if self.class_head is None:
+            return None
+        return self.class_head(query_embed)
 
 
 # ── Main Decoder ─────────────────────────────────────────────────────────
@@ -256,6 +270,7 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
         learned_ratio: float = 0.25,
         use_positional_guidance: bool = True,
         multi_scale_channels: list[int] | None = None,
+        num_instance_classes: int | None = None,
     ) -> None:
         super().__init__()
         self.in_channels = int(in_channels)
@@ -321,7 +336,8 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
 
         # --- per-head output projections ---
         self.heads = nn.ModuleDict({
-            g: GranularityHead(hidden_dim) for g in granularities
+            g: GranularityHead(hidden_dim, num_classes=num_instance_classes)
+            for g in granularities
         })
 
     # ------------------------------------------------------------------ #
@@ -442,21 +458,29 @@ class MultiHeadQueryInstanceDecoder(nn.Module):
                     q_aux = q_b.squeeze(0)
                     me_aux = F.normalize(head.mask_embed(q_aux), dim=-1)
                     logit_s = head.logit_scale.exp()
-                    aux_by_layer[layer_idx]["heads"][g] = {
+                    aux_head = {
                         "mask_logits": logit_s * (me_aux @ dense_mask_feat.T),
                         "score_logits": head.score_head(q_aux).squeeze(-1),
                     }
+                    class_logits = head.class_logits(q_aux)
+                    if class_logits is not None:
+                        aux_head["class_logits"] = class_logits
+                    aux_by_layer[layer_idx]["heads"][g] = aux_head
 
             # final layer prediction
             refined_q = q_b.squeeze(0)       # [Q, D]
             mask_embed = F.normalize(head.mask_embed(refined_q), dim=-1)
             logit_s = head.logit_scale.exp()
 
-            out["heads"][g] = {
+            out_head = {
                 "mask_logits": logit_s * (mask_embed @ dense_mask_feat.T),  # [Q, N]
                 "score_logits": head.score_head(refined_q).squeeze(-1),     # [Q]
                 "query_embed": refined_q,
             }
+            class_logits = head.class_logits(refined_q)
+            if class_logits is not None:
+                out_head["class_logits"] = class_logits
+            out["heads"][g] = out_head
 
         if aux_by_layer:
             out["aux_outputs"] = aux_by_layer

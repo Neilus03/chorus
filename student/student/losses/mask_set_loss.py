@@ -67,8 +67,11 @@ def build_pairwise_cost_matrix(
     gt_masks: torch.Tensor,
     supervision_mask: torch.Tensor,
     *,
+    class_logits: torch.Tensor | None = None,
+    class_ids: torch.Tensor | None = None,
     bce_weight: float = 1.0,
     dice_weight: float = 1.0,
+    class_weight: float = 0.0,
 ) -> torch.Tensor:
     """Build [Q, M] cost matrix for Hungarian matching.
 
@@ -97,6 +100,16 @@ def build_pairwise_cost_matrix(
             card = probs.sum(dim=1) + gt_m.sum()
             dice = 1.0 - (2.0 * inter + 1.0) / (card + 1.0)
             cost[:, m] += dice_weight * dice
+
+    if (
+        class_weight > 0
+        and class_logits is not None
+        and class_ids is not None
+        and M > 0
+    ):
+        probs = class_logits.softmax(dim=-1)
+        class_ids = class_ids.to(device=mask_logits.device, dtype=torch.long)
+        cost += class_weight * (-probs[:, class_ids])
 
     return cost
 
@@ -197,6 +210,9 @@ class MaskSetCriterion(nn.Module):
         score_weight: float = 0.5,
         cost_bce_weight: float = 1.0,
         cost_dice_weight: float = 1.0,
+        class_weight: float = 0.0,
+        no_object_weight: float = 0.1,
+        cost_class_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.bce_weight = bce_weight
@@ -204,6 +220,9 @@ class MaskSetCriterion(nn.Module):
         self.score_weight = score_weight
         self.cost_bce_weight = cost_bce_weight
         self.cost_dice_weight = cost_dice_weight
+        self.class_weight = class_weight
+        self.no_object_weight = no_object_weight
+        self.cost_class_weight = cost_class_weight
 
     def forward(
         self,
@@ -228,8 +247,14 @@ class MaskSetCriterion(nn.Module):
         """
         mask_logits = pred["mask_logits"]          # [Q, N]
         score_logits = pred["score_logits"]        # [Q]
+        class_logits = pred.get("class_logits")    # [Q, C+1], optional
         gt_masks = targets.gt_masks.to(mask_logits.device)
         supervision_mask = targets.supervision_mask.to(mask_logits.device)
+        class_ids = (
+            targets.class_ids.to(mask_logits.device)
+            if targets.class_ids is not None
+            else None
+        )
 
         Q = mask_logits.shape[0]
         M = gt_masks.shape[0]
@@ -268,6 +293,9 @@ class MaskSetCriterion(nn.Module):
             mask_logits, gt_masks, supervision_mask,
             bce_weight=self.cost_bce_weight,
             dice_weight=self.cost_dice_weight,
+            class_logits=class_logits,
+            class_ids=class_ids,
+            class_weight=self.cost_class_weight,
         )
         pred_idx, gt_idx = hungarian_match(
             cost_matrix,
@@ -304,11 +332,40 @@ class MaskSetCriterion(nn.Module):
             score_logits, score_targets, reduction="mean",
         )
 
+        # ── class/no-object loss (Mask3D-style, optional) ──
+        if class_logits is not None and class_ids is not None:
+            num_classes_with_no_object = int(class_logits.shape[-1])
+            no_object_id = num_classes_with_no_object - 1
+            class_targets = torch.full(
+                (Q,),
+                no_object_id,
+                dtype=torch.long,
+                device=class_logits.device,
+            )
+            if len(pred_idx) > 0:
+                class_targets[pred_idx_t] = class_ids[gt_idx_t]
+
+            ce_weights = torch.ones(
+                num_classes_with_no_object,
+                dtype=class_logits.dtype,
+                device=class_logits.device,
+            )
+            ce_weights[no_object_id] = float(self.no_object_weight)
+            loss_class = F.cross_entropy(
+                class_logits,
+                class_targets,
+                weight=ce_weights,
+                reduction="mean",
+            )
+        else:
+            loss_class = mask_logits.sum() * 0.0
+
         # ── total ──
         loss_total = (
             self.bce_weight * loss_mask_bce
             + self.dice_weight * loss_mask_dice
             + self.score_weight * loss_score
+            + self.class_weight * loss_class
         )
 
         return {
@@ -316,6 +373,7 @@ class MaskSetCriterion(nn.Module):
             "loss_mask_bce": loss_mask_bce.detach(),
             "loss_mask_dice": loss_mask_dice.detach(),
             "loss_score": loss_score.detach(),
+            "loss_class": loss_class.detach(),
             "num_matches": len(pred_idx),
             "matched_pred_indices": pred_idx,
             "matched_gt_indices": gt_idx,

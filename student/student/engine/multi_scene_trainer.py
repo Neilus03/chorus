@@ -186,8 +186,10 @@ class MultiSceneTrainer:
         train_eval_scene_ids: list[str] | None = None,
         train_eval_selection: str = "first",
         save_every_epochs: int = 10,
+        best_val_metric_name: str = "pseudo_AP50_mean",
         output_dir: Path | str,
         score_threshold: float = 0.3,
+        class_score_threshold: float | None = None,
         mask_threshold: float = 0.5,
         min_points_per_proposal: int = 30,
         eval_benchmark: str = "scannet200",
@@ -233,8 +235,10 @@ class MultiSceneTrainer:
         self.train_eval_scene_ids = train_eval_scene_ids
         self.train_eval_selection = train_eval_selection
         self.save_every_epochs = save_every_epochs
+        self.best_val_metric_name = str(best_val_metric_name)
         self.output_dir = Path(output_dir)
         self.score_threshold = score_threshold
+        self.class_score_threshold = class_score_threshold
         self.mask_threshold = mask_threshold
         self.min_points_per_proposal = min_points_per_proposal
         self.eval_benchmark = eval_benchmark
@@ -554,6 +558,7 @@ class MultiSceneTrainer:
             device=self.device,
             granularities=self.granularities,
             score_threshold=self.score_threshold,
+            class_score_threshold=self.class_score_threshold,
             mask_threshold=self.mask_threshold,
             min_points=self.min_points_per_proposal,
             eval_benchmark=self.eval_benchmark,
@@ -653,6 +658,10 @@ class MultiSceneTrainer:
                     min_instance_points=self.min_instance_points,
                     ignore_label=-1,
                     dense_instance_ids=self.dense_instance_ids,
+                    instance_class_map=(
+                        batch.instance_classes_by_granularity
+                        .get(granularity_key, [None] * batch.num_scenes)[scene_idx]
+                    ),
                 )
                 targets_by_scene.append({granularity_key: targets})
         else:
@@ -662,11 +671,19 @@ class MultiSceneTrainer:
                     g: batch.labels_by_granularity[g][scene_idx]
                     for g in self.granularities
                 }
+                instance_class_maps = {
+                    g: (
+                        batch.instance_classes_by_granularity
+                        .get(g, [None] * batch.num_scenes)[scene_idx]
+                    )
+                    for g in self.granularities
+                }
                 targets_by_scene.append(build_instance_targets_multi(
                     labels_by_granularity,
                     batch.supervision_masks[scene_idx],
                     min_instance_points=self.min_instance_points,
                     dense_instance_ids=self.dense_instance_ids,
+                    instance_class_maps=instance_class_maps,
                 ))
         return targets_by_scene
 
@@ -697,6 +714,10 @@ class MultiSceneTrainer:
                 ]).mean(),
                 "loss_score": torch.stack([
                     x["heads"][g]["loss_score"] for x in scene_results
+                ]).mean(),
+                "loss_class": torch.stack([
+                    x["heads"][g].get("loss_class", x["heads"][g]["loss_score"] * 0.0)
+                    for x in scene_results
                 ]).mean(),
             }
 
@@ -785,6 +806,7 @@ class MultiSceneTrainer:
                 "loss_mask_bce": result["loss_mask_bce"],
                 "loss_mask_dice": result["loss_mask_dice"],
                 "loss_score": result["loss_score"],
+                "loss_class": result.get("loss_class", result["loss_score"] * 0.0),
             }}
             return result
 
@@ -808,6 +830,10 @@ class MultiSceneTrainer:
                     ]).mean(),
                     "loss_score": torch.stack([
                         r["loss_score"] for r in scene_results
+                    ]).mean(),
+                    "loss_class": torch.stack([
+                        r.get("loss_class", r["loss_score"] * 0.0)
+                        for r in scene_results
                     ]).mean(),
                 },
             },
@@ -955,6 +981,7 @@ class MultiSceneTrainer:
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "scheduler_state_dict": self.scheduler.state_dict(),
                 "best_val_metric": self.best_val_metric,
+                "best_val_metric_name": self.best_val_metric_name,
                 "best_epoch": self.best_epoch,
                 "config": self.config,
             },
@@ -1002,14 +1029,29 @@ class MultiSceneTrainer:
 
         self.current_epoch = int(checkpoint.get("epoch", 0))
         self.global_step = int(checkpoint.get("global_step", 0))
-        self.best_val_metric = float(checkpoint.get("best_val_metric", -1.0))
-        self.best_epoch = int(checkpoint.get("best_epoch", -1))
+        saved_best_metric_name = str(
+            checkpoint.get("best_val_metric_name", "pseudo_AP50_mean")
+        )
+        if saved_best_metric_name == self.best_val_metric_name:
+            self.best_val_metric = float(checkpoint.get("best_val_metric", -1.0))
+            self.best_epoch = int(checkpoint.get("best_epoch", -1))
+        else:
+            self.best_val_metric = -1.0
+            self.best_epoch = -1
+            self.best_val_metrics = {}
+            log.warning(
+                "Checkpoint best metric was %s, current best metric is %s; "
+                "resetting best-metric tracking on resume.",
+                saved_best_metric_name,
+                self.best_val_metric_name,
+            )
 
         log.info(
-            "Resumed from %s (epoch=%d, global_step=%d, best_val=%.4f @ epoch %d)",
+            "Resumed from %s (epoch=%d, global_step=%d, best_val[%s]=%.4f @ epoch %d)",
             ckpt_path,
             self.current_epoch,
             self.global_step,
+            self.best_val_metric_name,
             self.best_val_metric,
             self.best_epoch,
         )
@@ -1046,9 +1088,21 @@ class MultiSceneTrainer:
             )
         )
         if loading_base_into_prompt:
-            target_model.model.load_state_dict(model_state_dict, strict=strict)
+            load_result = target_model.model.load_state_dict(model_state_dict, strict=strict)
         else:
-            target_model.load_state_dict(model_state_dict, strict=strict)
+            load_result = target_model.load_state_dict(model_state_dict, strict=strict)
+        if not strict:
+            missing = list(getattr(load_result, "missing_keys", []))
+            unexpected = list(getattr(load_result, "unexpected_keys", []))
+            log.info(
+                "Weights-only non-strict load: missing=%d unexpected=%d",
+                len(missing),
+                len(unexpected),
+            )
+            if missing:
+                log.info("  missing keys: %s", ", ".join(missing[:20]))
+            if unexpected:
+                log.info("  unexpected keys: %s", ", ".join(unexpected[:20]))
 
         self.current_epoch = 0
         self.global_step = 0
@@ -1208,6 +1262,8 @@ class MultiSceneTrainer:
                         step_metrics[f"loss_mask_bce_{g}"] = ld_g["loss_mask_bce"].item()
                         step_metrics[f"loss_mask_dice_{g}"] = ld_g["loss_mask_dice"].item()
                         step_metrics[f"loss_score_{g}"] = ld_g["loss_score"].item()
+                        if "loss_class" in ld_g:
+                            step_metrics[f"loss_class_{g}"] = ld_g["loss_class"].item()
                 if "loss_aux" in loss_result:
                     step_metrics["loss_aux"] = loss_result["loss_aux"].item()
 
@@ -1271,6 +1327,8 @@ class MultiSceneTrainer:
                             row[f"loss_mask_bce_{g}"] = step_metrics[f"loss_mask_bce_{g}"]
                             row[f"loss_mask_dice_{g}"] = step_metrics[f"loss_mask_dice_{g}"]
                             row[f"loss_score_{g}"] = step_metrics[f"loss_score_{g}"]
+                            if f"loss_class_{g}" in step_metrics:
+                                row[f"loss_class_{g}"] = step_metrics[f"loss_class_{g}"]
                     if "loss_aux" in step_metrics:
                         row["loss_aux"] = step_metrics["loss_aux"]
                     self._log_row(row)
@@ -1295,6 +1353,8 @@ class MultiSceneTrainer:
                                 wb[f"train_scene/loss_mask_bce_{g}"] = step_metrics[f"loss_mask_bce_{g}"]
                                 wb[f"train_scene/loss_mask_dice_{g}"] = step_metrics[f"loss_mask_dice_{g}"]
                                 wb[f"train_scene/loss_score_{g}"] = step_metrics[f"loss_score_{g}"]
+                                if f"loss_class_{g}" in step_metrics:
+                                    wb[f"train_scene/loss_class_{g}"] = step_metrics[f"loss_class_{g}"]
                         if "learned_granularity" in step_metrics:
                             wb["train_scene/learned_granularity"] = step_metrics["learned_granularity"]
                         if "loss_aux" in step_metrics:
@@ -1406,7 +1466,31 @@ class MultiSceneTrainer:
             for k in sorted(agg.keys())
             if k.startswith("real_AP50_mean_") and isinstance(agg.get(k), (int, float))
         ]
+        real_class_ap50_bits = [
+            f"{k.removeprefix('real_class_AP50_mean_')}={agg[k]:.3f}"
+            for k in sorted(agg.keys())
+            if k.startswith("real_class_AP50_mean_") and isinstance(agg.get(k), (int, float))
+        ]
+        real_class_ap25_bits = [
+            f"{k.removeprefix('real_class_AP25_mean_')}={agg[k]:.3f}"
+            for k in sorted(agg.keys())
+            if k.startswith("real_class_AP25_mean_") and isinstance(agg.get(k), (int, float))
+        ]
+        real_sem_miou_bits = [
+            f"{k.removeprefix('real_sem_mIoU_mean_')}={agg[k]:.3f}"
+            for k in sorted(agg.keys())
+            if k.startswith("real_sem_mIoU_mean_") and isinstance(agg.get(k), (int, float))
+        ]
         real_ap50_str = ", ".join(real_ap50_bits) if real_ap50_bits else "n/a"
+        real_class_ap25_str = (
+            ", ".join(real_class_ap25_bits) if real_class_ap25_bits else "n/a"
+        )
+        real_class_ap50_str = (
+            ", ".join(real_class_ap50_bits) if real_class_ap50_bits else "n/a"
+        )
+        real_sem_miou_str = (
+            ", ".join(real_sem_miou_bits) if real_sem_miou_bits else "n/a"
+        )
         prompt_model = self._model_module()
         learned_g = (
             prompt_model.learned_granularity
@@ -1415,11 +1499,16 @@ class MultiSceneTrainer:
         )
         prompt_suffix = f"  g_ft={learned_g:.4f}" if learned_g is not None else ""
         log.info(
-            "  [val epoch %d] loss=%.4f  pseudo_AP50=%.3f  real_AP50=(%s)  mIoU=%.3f%s",
+            "  [val epoch %d] loss=%.4f  pseudo_AP50=%.3f  real_AP50=(%s)  "
+            "real_class_AP25=(%s)  real_class_AP50=(%s)  "
+            "real_sem_mIoU=(%s)  matched_mIoU=%.3f%s",
             epoch,
             agg["loss_mean"],
             agg["pseudo_AP50_mean"],
             real_ap50_str,
+            real_class_ap25_str,
+            real_class_ap50_str,
+            real_sem_miou_str,
             agg["matched_mean_iou_mean"],
             prompt_suffix,
         )
@@ -1458,6 +1547,11 @@ class MultiSceneTrainer:
                     if isinstance(real, dict) and "AP25" in real:
                         wb[f"val_scene/{scene_id}/real_AP25_{g}"] = real["AP25"]
                         wb[f"val_scene/{scene_id}/real_AP50_{g}"] = real["AP50"]
+                        class_aware = real.get("class_aware", {})
+                        if isinstance(class_aware, dict):
+                            wb[f"val_scene/{scene_id}/real_class_AP25_{g}"] = class_aware.get("AP25", 0)
+                            wb[f"val_scene/{scene_id}/real_class_AP50_{g}"] = class_aware.get("AP50", 0)
+                            wb[f"val_scene/{scene_id}/real_sem_mIoU_{g}"] = class_aware.get("semantic_mIoU", 0)
 
             wandb.log(wb)
 
@@ -1482,7 +1576,31 @@ class MultiSceneTrainer:
             for k in sorted(agg.keys())
             if k.startswith("real_AP50_mean_") and isinstance(agg.get(k), (int, float))
         ]
+        real_class_ap50_bits = [
+            f"{k.removeprefix('real_class_AP50_mean_')}={agg[k]:.3f}"
+            for k in sorted(agg.keys())
+            if k.startswith("real_class_AP50_mean_") and isinstance(agg.get(k), (int, float))
+        ]
+        real_class_ap25_bits = [
+            f"{k.removeprefix('real_class_AP25_mean_')}={agg[k]:.3f}"
+            for k in sorted(agg.keys())
+            if k.startswith("real_class_AP25_mean_") and isinstance(agg.get(k), (int, float))
+        ]
+        real_sem_miou_bits = [
+            f"{k.removeprefix('real_sem_mIoU_mean_')}={agg[k]:.3f}"
+            for k in sorted(agg.keys())
+            if k.startswith("real_sem_mIoU_mean_") and isinstance(agg.get(k), (int, float))
+        ]
         real_ap50_str = ", ".join(real_ap50_bits) if real_ap50_bits else "n/a"
+        real_class_ap25_str = (
+            ", ".join(real_class_ap25_bits) if real_class_ap25_bits else "n/a"
+        )
+        real_class_ap50_str = (
+            ", ".join(real_class_ap50_bits) if real_class_ap50_bits else "n/a"
+        )
+        real_sem_miou_str = (
+            ", ".join(real_sem_miou_bits) if real_sem_miou_bits else "n/a"
+        )
         prompt_model = self._model_module()
         learned_g = (
             prompt_model.learned_granularity
@@ -1493,7 +1611,8 @@ class MultiSceneTrainer:
         log.info(
             "  [train-eval epoch %d] loss=%.4f  "
             "pseudo(AP25=%.3f, AP50=%.3f, NMI=%.4f, ARI=%.4f)  "
-            "real(AP50=(%s))  mIoU=%.3f%s",
+            "real(AP50=(%s), class_AP25=(%s), class_AP50=(%s), sem_mIoU=(%s))  "
+            "matched_mIoU=%.3f%s",
             epoch,
             agg["loss_mean"],
             agg["pseudo_AP25_mean"],
@@ -1501,6 +1620,9 @@ class MultiSceneTrainer:
             agg["pseudo_NMI_mean"],
             agg["pseudo_ARI_mean"],
             real_ap50_str,
+            real_class_ap25_str,
+            real_class_ap50_str,
+            real_sem_miou_str,
             agg["matched_mean_iou_mean"],
             prompt_suffix,
         )
@@ -1539,6 +1661,11 @@ class MultiSceneTrainer:
                     if isinstance(real, dict) and "AP25" in real:
                         wb[f"train_eval_scene/{scene_id}/real_AP25_{g}"] = real["AP25"]
                         wb[f"train_eval_scene/{scene_id}/real_AP50_{g}"] = real["AP50"]
+                        class_aware = real.get("class_aware", {})
+                        if isinstance(class_aware, dict):
+                            wb[f"train_eval_scene/{scene_id}/real_class_AP25_{g}"] = class_aware.get("AP25", 0)
+                            wb[f"train_eval_scene/{scene_id}/real_class_AP50_{g}"] = class_aware.get("AP50", 0)
+                            wb[f"train_eval_scene/{scene_id}/real_sem_mIoU_{g}"] = class_aware.get("semantic_mIoU", 0)
 
             wandb.log(wb)
 
@@ -1588,15 +1715,22 @@ class MultiSceneTrainer:
                 if self.is_main_process:
                     last_val_metrics = val_metrics
 
-                    ap50 = val_metrics["aggregate"].get("pseudo_AP50_mean", 0.0)
-                    if ap50 > self.best_val_metric:
-                        self.best_val_metric = ap50
+                    best_score = val_metrics["aggregate"].get(
+                        self.best_val_metric_name,
+                        float("-inf"),
+                    )
+                    if not isinstance(best_score, (int, float)):
+                        best_score = float("-inf")
+                    if best_score > self.best_val_metric:
+                        self.best_val_metric = float(best_score)
                         self.best_epoch = epoch
                         self.best_val_metrics = val_metrics
                         self._save_checkpoint("best")
                         log.info(
-                            "  New best val pseudo AP50: %.4f at epoch %d",
-                            ap50, epoch,
+                            "  New best val %s: %.4f at epoch %d",
+                            self.best_val_metric_name,
+                            best_score,
+                            epoch,
                         )
                 self._dist_barrier()
 
@@ -1632,6 +1766,7 @@ class MultiSceneTrainer:
             "best_val_metrics": self.best_val_metrics,
             "best_epoch": self.best_epoch,
             "best_val_metric": self.best_val_metric,
+            "best_val_metric_name": self.best_val_metric_name,
             "total_training_time_s": total_time,
             "per_epoch_time_s": epoch_times,
         }

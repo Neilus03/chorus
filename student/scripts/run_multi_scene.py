@@ -517,6 +517,11 @@ def main() -> None:
             multi_scale=bb_cfg.get("multi_scale", False),
             multi_scale_indices=bb_cfg.get("multi_scale_indices", None),
             decoder_type=decoder_type,
+            num_instance_classes=(
+                int(model_cfg["num_instance_classes"])
+                if bool(model_cfg.get("class_aware_instance", False))
+                else None
+            ),
         )
         if prompt_ft_enabled:
             init_g = float(prompt_ft_cfg.get("init_g", 0.5))
@@ -528,15 +533,18 @@ def main() -> None:
                     train_cfg.get("backbone_lr_scale", 0.01),
                 )
             )
+            prompt_mode = str(prompt_ft_cfg.get("mode", "learned"))
             model = FineTuningWrapper(
                 model,
                 init_g=init_g,
                 backbone_lr_scale=prompt_backbone_lr_scale,
+                mode=prompt_mode,
             )
             log.info(
-                "Prompt fine-tuning enabled: target=%s init_g=%.3f backbone_lr_scale=%.4g",
+                "Prompt fine-tuning enabled: target=%s init_g=%.3f mode=%s backbone_lr_scale=%.4g",
                 granularities[0],
                 init_g,
+                prompt_mode,
                 prompt_backbone_lr_scale,
             )
         total_params = sum(p.numel() for p in model.parameters())
@@ -551,6 +559,9 @@ def main() -> None:
             bce_weight=loss_cfg.get("bce_weight", 1.0),
             dice_weight=loss_cfg.get("dice_weight", 1.0),
             score_weight=loss_cfg.get("score_weight", 0.5),
+            class_weight=loss_cfg.get("class_weight", 0.0),
+            no_object_weight=loss_cfg.get("no_object_weight", 0.1),
+            cost_class_weight=loss_cfg.get("cost_class_weight", 0.0),
         )
         gran_weights = loss_cfg.get("granularity_weights", None)
         aux_weight = float(loss_cfg.get("aux_weight", 0.0))
@@ -667,8 +678,10 @@ def main() -> None:
             ),
             train_eval_selection=args.eval_train_selection,
             save_every_epochs=train_cfg.get("save_every_epochs", 10),
+            best_val_metric_name=train_cfg.get("best_val_metric", "pseudo_AP50_mean"),
             output_dir=out_dir,
             score_threshold=eval_cfg.get("score_threshold", 0.3),
+            class_score_threshold=eval_cfg.get("class_score_threshold", None),
             mask_threshold=eval_cfg.get("mask_threshold", 0.5),
             min_points_per_proposal=eval_cfg.get("min_points_per_proposal", 30),
             eval_benchmark=eval_cfg.get("scannet_benchmark", "scannet200"),
@@ -712,7 +725,10 @@ def main() -> None:
             raise ValueError("Use only one of --resume or --finetune-from.")
 
         if args.finetune_from:
-            trainer.load_weights_only(Path(args.finetune_from))
+            trainer.load_weights_only(
+                Path(args.finetune_from),
+                strict=not bool(model_cfg.get("class_aware_instance", False)),
+            )
             _dist_barrier()
         elif args.resume:
             if args.resume in {"last", "best"}:
@@ -748,6 +764,9 @@ def main() -> None:
                 "final_val_metrics": final_metrics.get("final_val_metrics", {}),
                 "best_val_metrics": final_metrics.get("best_val_metrics", {}),
                 "best_epoch": final_metrics.get("best_epoch", -1),
+                "best_val_metric_name": final_metrics.get(
+                    "best_val_metric_name", train_cfg.get("best_val_metric", "pseudo_AP50_mean")
+                ),
                 "total_training_time_s": final_metrics.get("total_training_time_s", 0),
                 "per_epoch_time_s": final_metrics.get("per_epoch_time_s", []),
             }
@@ -764,6 +783,9 @@ def main() -> None:
                         wb_final[f"final/{k}"] = v
                 wb_final["final/best_epoch"] = final_metrics.get("best_epoch", -1)
                 wb_final["final/best_val_metric"] = final_metrics.get("best_val_metric", 0)
+                wb_final["final/best_val_metric_name"] = final_metrics.get(
+                    "best_val_metric_name", train_cfg.get("best_val_metric", "pseudo_AP50_mean")
+                )
                 wandb.summary.update(wb_final)
                 wandb.finish()
 

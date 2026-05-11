@@ -67,6 +67,7 @@ class ContinuousQueryInstanceDecoder(nn.Module):
         learned_ratio: float = 0.25,
         use_positional_guidance: bool = True,
         multi_scale_channels: list[int] | None = None,
+        num_instance_classes: int | None = None,
     ) -> None:
         super().__init__()
         self.in_channels = int(in_channels)
@@ -132,7 +133,7 @@ class ContinuousQueryInstanceDecoder(nn.Module):
         ])
 
         # ── single output head (replaces per-granularity ModuleDict) ──
-        self.head = GranularityHead(hidden_dim)
+        self.head = GranularityHead(hidden_dim, num_classes=num_instance_classes)
 
     # ------------------------------------------------------------------ #
 
@@ -267,10 +268,14 @@ class ContinuousQueryInstanceDecoder(nn.Module):
                 q_aux = q_b.squeeze(0)
                 me_aux = F.normalize(self.head.mask_embed(q_aux), dim=-1)
                 logit_s = self.head.logit_scale.exp()
-                aux_outputs.append({
+                aux_pred = {
                     "mask_logits": logit_s * (me_aux @ dense_mask_feat.T),
                     "score_logits": self.head.score_head(q_aux).squeeze(-1),
-                })
+                }
+                class_logits = self.head.class_logits(q_aux)
+                if class_logits is not None:
+                    aux_pred["class_logits"] = class_logits
+                aux_outputs.append(aux_pred)
 
         # ── final prediction ──
 
@@ -284,6 +289,9 @@ class ContinuousQueryInstanceDecoder(nn.Module):
             "score_logits": self.head.score_head(refined_q).squeeze(-1),  # [Q]
             "query_embed": refined_q,
         }
+        class_logits = self.head.class_logits(refined_q)
+        if class_logits is not None:
+            out["class_logits"] = class_logits
         if aux_outputs:
             out["aux_outputs"] = aux_outputs
 

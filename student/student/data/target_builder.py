@@ -29,6 +29,7 @@ class InstanceTargets:
     supervision_mask: torch.Tensor    # (N,)   bool — kept here for convenience
     num_instances: int
     instance_sizes: np.ndarray        # (M,)   int — points per instance
+    class_ids: torch.Tensor | None = None  # (M,) long — optional contiguous class id
 
 
 def build_instance_targets(
@@ -38,6 +39,7 @@ def build_instance_targets(
     min_instance_points: int = 1,
     ignore_label: int = -1,
     dense_instance_ids: bool = False,
+    instance_class_map: dict[int, int] | None = None,
 ) -> InstanceTargets:
     """Build per-instance binary masks from per-point pseudo-labels.
 
@@ -56,6 +58,9 @@ def build_instance_targets(
         If True, store contiguous instance ids ``0 .. M-1`` (one per kept
         instance) instead of raw pseudo-label values.  Metrics that add 1 to
         ``instance_ids`` then yield per-point labels ``1 .. M``.
+    instance_class_map:
+        Optional mapping from raw instance id in ``labels`` to contiguous class
+        id. Used by real-GT finetuning; pseudo-label pretraining leaves it None.
 
     Returns
     -------
@@ -73,6 +78,7 @@ def build_instance_targets(
     keep_ids: list[int] = []
     rows: list[torch.Tensor] = []
     sizes: list[int] = []
+    class_ids: list[int] = []
 
     for inst_id in unique_ids:
         mask_row = valid & (labels == inst_id)
@@ -81,6 +87,15 @@ def build_instance_targets(
             keep_ids.append(int(inst_id))
             rows.append(mask_row)
             sizes.append(n)
+            if instance_class_map is not None:
+                raw_id = int(inst_id)
+                if raw_id not in instance_class_map:
+                    raise KeyError(
+                        f"Missing class id for instance {raw_id}; "
+                        "real-GT class-aware finetuning requires every kept "
+                        "instance to have a class label."
+                    )
+                class_ids.append(int(instance_class_map[raw_id]))
 
     if rows:
         gt_masks = torch.stack(rows, dim=0)
@@ -91,12 +106,17 @@ def build_instance_targets(
         instance_ids = np.zeros(0, dtype=np.int64)
         instance_sizes = np.zeros(0, dtype=np.int64)
 
+    class_ids_t: torch.Tensor | None = None
+    if instance_class_map is not None:
+        class_ids_t = torch.tensor(class_ids, dtype=torch.long, device=labels.device)
+
     return InstanceTargets(
         instance_ids=instance_ids,
         gt_masks=gt_masks,
         supervision_mask=supervision_mask,
         num_instances=len(keep_ids),
         instance_sizes=instance_sizes,
+        class_ids=class_ids_t,
     )
 
 
@@ -107,6 +127,7 @@ def build_instance_targets_multi(
     min_instance_points: int = 1,
     ignore_label: int = -1,
     dense_instance_ids: bool = False,
+    instance_class_maps: dict[str, dict[int, int] | None] | None = None,
 ) -> dict[str, InstanceTargets]:
     """Build per-instance targets for each granularity.
 
@@ -123,6 +144,11 @@ def build_instance_targets_multi(
             min_instance_points=min_instance_points,
             ignore_label=ignore_label,
             dense_instance_ids=dense_instance_ids,
+            instance_class_map=(
+                instance_class_maps.get(g)
+                if instance_class_maps is not None
+                else None
+            ),
         )
         for g, labels in labels_by_granularity.items()
     }

@@ -165,6 +165,7 @@ def build_student_model(
     multi_scale: bool = False,
     multi_scale_indices: list[int] | None = None,
     decoder_type: str = "multi_head",
+    num_instance_classes: int | None = None,
 ) -> StudentInstanceSegModel:
     """Convenience factory from scalar config values.
 
@@ -223,6 +224,7 @@ def build_student_model(
                 learned_ratio=effective_ratio,
                 use_positional_guidance=use_positional_guidance,
                 multi_scale_channels=backbone.multi_scale_channels,
+                num_instance_classes=num_instance_classes,
             )
         )
     elif decoder_type == "multi_head":
@@ -244,6 +246,7 @@ def build_student_model(
             learned_ratio=effective_ratio,
             use_positional_guidance=use_positional_guidance,
             multi_scale_channels=backbone.multi_scale_channels,
+            num_instance_classes=num_instance_classes,
         )
     else:
         raise ValueError(

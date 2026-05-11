@@ -341,25 +341,32 @@ class MultiSceneDataset(Dataset):
             g: torch.from_numpy(scene.labels_by_granularity[g]).long()
             for g in self._granularities
         }
+        instance_classes_by_gran: dict[str, dict[int, int] | None] = {
+            g: None for g in self._granularities
+        }
 
         points_t = torch.from_numpy(np.asarray(points_np)).float()
         features_t = torch.from_numpy(features).float()
         valid_np = scene.valid_points
         sup_np = scene.supervision_mask
         if self._label_source == _LABEL_SOURCE_SCANNET_GT:
-            from chorus.datasets.scannet.gt import load_scannet_gt_instance_ids
+            from chorus.datasets.scannet.gt import load_scannet_gt_instances
 
-            gt_ids = load_scannet_gt_instance_ids(
+            gt_instances = load_scannet_gt_instances(
                 scene.scene_dir,
                 scene.scene_id,
                 eval_benchmark=self._scannet_eval_benchmark,
             )
             # Convert ScanNet GT convention (0=ignore/background) to student convention (-1=ignore).
-            gt_labels = np.asarray(gt_ids, dtype=np.int64)
+            gt_labels = np.asarray(gt_instances.instance_ids, dtype=np.int64)
             gt_labels = np.where(gt_labels == 0, -1, gt_labels)
 
             labels_by_gran = {
                 g: torch.from_numpy(gt_labels).long()
+                for g in self._granularities
+            }
+            instance_classes_by_gran = {
+                g: dict(gt_instances.instance_class_ids)
                 for g in self._granularities
             }
             if self._scannet_gt_supervise_all_points:
@@ -390,6 +397,7 @@ class MultiSceneDataset(Dataset):
             "points": points_t,
             "features": features_t,
             "labels_by_granularity": labels_by_gran,
+            "instance_classes_by_granularity": instance_classes_by_gran,
             "valid_points": valid_t,
             "seen_points": seen_t,
             "supervision_mask": sup_t,

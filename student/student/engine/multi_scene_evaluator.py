@@ -93,6 +93,9 @@ def aggregate_multi_scene_results(
     real_ap50_by_bench: dict[str, list[float]] = {}
     real_nmi_by_bench: dict[str, list[float]] = {}
     real_ari_by_bench: dict[str, list[float]] = {}
+    real_class_ap25_by_bench: dict[str, list[float]] = {}
+    real_class_ap50_by_bench: dict[str, list[float]] = {}
+    real_sem_miou_by_bench: dict[str, list[float]] = {}
     matched_iou_by_gran: dict[str, list[float]] = {g: [] for g in granularities}
 
     for scene_data in per_scene.values():
@@ -138,6 +141,17 @@ def aggregate_multi_scene_results(
                         _append_real(real_ap50_by_bench[str(bench)], real.get("AP50"))
                         _append_real(real_nmi_by_bench[str(bench)], real.get("NMI"))
                         _append_real(real_ari_by_bench[str(bench)], real.get("ARI"))
+                        class_aware = real.get("class_aware", {})
+                        if isinstance(class_aware, dict):
+                            real_class_ap25_by_bench.setdefault(str(bench), [])
+                            real_class_ap50_by_bench.setdefault(str(bench), [])
+                            real_sem_miou_by_bench.setdefault(str(bench), [])
+                            _append_real(real_class_ap25_by_bench[str(bench)], class_aware.get("AP25"))
+                            _append_real(real_class_ap50_by_bench[str(bench)], class_aware.get("AP50"))
+                            _append_real(
+                                real_sem_miou_by_bench[str(bench)],
+                                class_aware.get("semantic_mIoU"),
+                            )
                 continue
 
             # Legacy fallback: single real_gt dict
@@ -167,6 +181,15 @@ def aggregate_multi_scene_results(
         aggregate[f"real_AP50_mean_{bench}"] = _safe_mean(real_ap50_by_bench.get(bench, []))
         aggregate[f"real_NMI_mean_{bench}"] = _safe_mean(real_nmi_by_bench.get(bench, []))
         aggregate[f"real_ARI_mean_{bench}"] = _safe_mean(real_ari_by_bench.get(bench, []))
+        aggregate[f"real_class_AP25_mean_{bench}"] = _safe_mean(
+            real_class_ap25_by_bench.get(bench, [])
+        )
+        aggregate[f"real_class_AP50_mean_{bench}"] = _safe_mean(
+            real_class_ap50_by_bench.get(bench, [])
+        )
+        aggregate[f"real_sem_mIoU_mean_{bench}"] = _safe_mean(
+            real_sem_miou_by_bench.get(bench, [])
+        )
 
     all_iou_values: list[float] = []
     for g in granularities:
@@ -221,6 +244,8 @@ def _evaluate_continuous_scene(
             "score_logits": flat_pred["score_logits"],
             "query_embed": flat_pred.get("query_embed"),
         }
+        if "class_logits" in flat_pred:
+            heads_pred[g]["class_logits"] = flat_pred["class_logits"]
         if point_embed is None:
             point_embed = flat_pred.get("point_embed")
 
@@ -261,6 +286,8 @@ def _evaluate_prompt_scene(
             "query_embed": flat_pred.get("query_embed"),
         },
     }
+    if "class_logits" in flat_pred:
+        heads_pred[prompt_key]["class_logits"] = flat_pred["class_logits"]
     pred_multihead: dict[str, Any] = {"heads": heads_pred}
     if "point_embed" in flat_pred:
         pred_multihead["point_embed"] = flat_pred["point_embed"]
@@ -287,6 +314,7 @@ def evaluate_multi_scene(
     device: str,
     granularities: tuple[str, ...],
     score_threshold: float = 0.3,
+    class_score_threshold: float | None = None,
     mask_threshold: float = 0.5,
     min_points: int = 30,
     eval_benchmark: str = "scannet200",
@@ -365,6 +393,7 @@ def evaluate_multi_scene(
             sample["supervision_mask"],
             min_instance_points=min_instance_points,
             dense_instance_ids=dense_instance_ids,
+            instance_class_maps=sample.get("instance_classes_by_granularity"),
         )
 
         _clear_backbone_cache(model)
@@ -407,6 +436,7 @@ def evaluate_multi_scene(
                     device=device,
                     granularities=granularities,
                     score_threshold=score_threshold,
+                    class_score_threshold=class_score_threshold,
                     mask_threshold=mask_threshold,
                     min_points=min_points,
                     eval_benchmark=eval_benchmark,
@@ -446,4 +476,3 @@ def evaluate_multi_scene(
             granularities=granularities,
         ),
     }
-

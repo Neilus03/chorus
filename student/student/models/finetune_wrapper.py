@@ -35,15 +35,22 @@ class FineTuningWrapper(nn.Module):
         pretrained_model: nn.Module,
         init_g: float = 0.5,
         backbone_lr_scale: float = 0.01,
+        mode: str = "learned",
     ) -> None:
         super().__init__()
         self.model = pretrained_model
         self._backbone_lr_scale = backbone_lr_scale
+        self.mode = str(mode)
+        if self.mode not in {"learned", "fixed"}:
+            raise ValueError(f"Unknown prompt finetune mode {self.mode!r}")
 
         # Sigmoid reparameterization: sigmoid(logit) = init_g
         # For init_g=0.5 → logit=0.0; for init_g=0.3 → logit≈-0.847
         init_logit = torch.log(torch.tensor(init_g / (1.0 - init_g)))
-        self.g_ft_logit = nn.Parameter(init_logit.clone())
+        if self.mode == "learned":
+            self.g_ft_logit = nn.Parameter(init_logit.clone())
+        else:
+            self.register_buffer("g_ft_logit", init_logit.clone())
 
     @property
     def learned_granularity(self) -> float:
@@ -78,11 +85,13 @@ class FineTuningWrapper(nn.Module):
         backbone_params = list(self.model.backbone.parameters())
         decoder_params = list(self.model.decoder.parameters())
 
-        return [
+        groups = [
             {"params": backbone_params, "lr_scale": backbone_lr_scale},
             {"params": decoder_params, "lr_scale": 1.0},
-            {"params": [self.g_ft_logit], "lr_scale": 1.0},
         ]
+        if isinstance(self.g_ft_logit, nn.Parameter):
+            groups.append({"params": [self.g_ft_logit], "lr_scale": 1.0})
+        return groups
 
     def forward(
         self,

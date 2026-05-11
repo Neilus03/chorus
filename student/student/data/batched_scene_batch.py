@@ -47,6 +47,7 @@ class BatchedMultiSceneSample:
     features: torch.Tensor
     point_offsets: torch.Tensor
     labels_by_granularity: dict[str, list[torch.Tensor]]
+    instance_classes_by_granularity: dict[str, list[dict[int, int] | None]]
     valid_points: list[torch.Tensor]
     seen_points: list[torch.Tensor]
     supervision_masks: list[torch.Tensor]
@@ -99,6 +100,13 @@ def collate_multi_scene_samples(
         g: [sample["labels_by_granularity"][g] for sample in batch]
         for g in granularities
     }
+    instance_classes_by_granularity: dict[str, list[dict[int, int] | None]] = {
+        g: [
+            sample.get("instance_classes_by_granularity", {}).get(g)
+            for sample in batch
+        ]
+        for g in granularities
+    }
 
     vertex_indices: list[torch.Tensor | None] = [
         sample["vertex_indices"] if "vertex_indices" in sample else None
@@ -112,6 +120,7 @@ def collate_multi_scene_samples(
         features=features,
         point_offsets=point_offsets,
         labels_by_granularity=labels_by_granularity,
+        instance_classes_by_granularity=instance_classes_by_granularity,
         valid_points=[sample["valid_points"] for sample in batch],
         seen_points=[sample["seen_points"] for sample in batch],
         supervision_masks=[sample["supervision_mask"] for sample in batch],
