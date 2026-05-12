@@ -322,11 +322,16 @@ def _candidate_scannet_metadata_roots() -> list[Path]:
     if env_root:
         candidates.append(Path(os.path.expanduser(os.path.expandvars(env_root))).resolve())
 
+    # --- Search the current working directory ---
+    candidates.append(Path.cwd().resolve())
+
     this_file = Path(__file__).resolve()
     candidates.append((this_file.parent / "meta_data").resolve())
 
     for parent in this_file.parents:
         candidates.append((parent / "LitePT" / "datasets" / "preprocessing" / "scannet" / "meta_data").resolve())
+        # --- Also check parent directories directly ---
+        candidates.append(parent.resolve())
 
     unique_candidates: list[Path] = []
     seen: set[Path] = set()
@@ -342,12 +347,13 @@ def _candidate_scannet_metadata_roots() -> list[Path]:
 def resolve_scannet_metadata_root() -> Path:
     for candidate in _candidate_scannet_metadata_roots():
         labels_path = candidate / "scannetv2-labels.combined.tsv"
-        if labels_path.exists():
+        # --- Check for read permission (os.R_OK), not just existence ---
+        if labels_path.exists() and os.access(labels_path, os.R_OK):
             return candidate
 
     searched = "\n".join(f"  - {candidate}" for candidate in _candidate_scannet_metadata_roots())
     raise FileNotFoundError(
-        "Could not locate ScanNet metadata root with 'scannetv2-labels.combined.tsv'. "
+        "Could not locate a READABLE ScanNet metadata root with 'scannetv2-labels.combined.tsv'. "
         "Set CHORUS_SCANNET_METADATA_ROOT to the directory containing the official ScanNet metadata files.\n"
         f"Searched:\n{searched}"
     )

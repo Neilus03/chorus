@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -10,11 +11,21 @@ from chorus.datasets.scannet.benchmark import (
     SCANNET_EVAL_BENCHMARK_20,
     SCANNET_EVAL_BENCHMARK_200,
     SCANNET_EVAL_BENCHMARK_ALL,
+    VALID_CLASS_IDS_20,
+    VALID_CLASS_IDS_200,
     get_valid_class_ids_for_benchmark,
     load_raw_category_label_map,
     normalize_scannet_eval_benchmark,
 )
 from chorus.datasets.scannet.metadata import IGNORE_INSTANCE_CLASSES
+
+
+@dataclass(frozen=True)
+class ScannetGTInstances:
+    """ScanNet instance ids plus benchmark-contiguous class labels."""
+
+    instance_ids: np.ndarray
+    instance_class_ids: dict[int, int]
 
 
 def _is_valid_instance_group_label(
@@ -51,12 +62,43 @@ def _is_valid_instance_group_label(
     return False
 
 
-def _load_instance_ids_from_aggregation(
+def _benchmark_class_id_for_label(
+    label: str,
+    eval_benchmark: str,
+    raw_category_label_map: dict[str, dict[str, int]] | None,
+) -> int | None:
+    """Return contiguous benchmark class id for a raw ScanNet label."""
+    if eval_benchmark == SCANNET_EVAL_BENCHMARK_ALL:
+        return None
+    if raw_category_label_map is None:
+        return None
+
+    normalized_label = str(label).strip().lower()
+    label_info = raw_category_label_map.get(normalized_label)
+    if label_info is None:
+        return None
+
+    if eval_benchmark == SCANNET_EVAL_BENCHMARK_20:
+        raw_class_id = int(label_info["nyu40id"])
+        if raw_class_id not in VALID_CLASS_IDS_20:
+            return None
+        return VALID_CLASS_IDS_20.index(raw_class_id)
+
+    if eval_benchmark == SCANNET_EVAL_BENCHMARK_200:
+        raw_class_id = int(label_info["id"])
+        if raw_class_id not in VALID_CLASS_IDS_200:
+            return None
+        return VALID_CLASS_IDS_200.index(raw_class_id)
+
+    return None
+
+
+def _load_instances_from_aggregation(
     scene_dir: Path,
     scene_name: str,
     n_vertices: int,
     eval_benchmark: str,
-) -> np.ndarray | None:
+) -> ScannetGTInstances | None:
     seg_paths = [
         scene_dir / f"{scene_name}_vh_clean_2.0.010000.segs.json",
         scene_dir / f"{scene_name}_vh_clean.segs.json",
@@ -87,6 +129,7 @@ def _load_instance_ids_from_aggregation(
         )
 
     seg_to_instance: dict[int, int] = {}
+    instance_class_ids: dict[int, int] = {}
     for group in agg_json.get("segGroups", []):
         label = group.get("label", "")
         if not _is_valid_instance_group_label(
@@ -101,6 +144,15 @@ def _load_instance_ids_from_aggregation(
             continue
         # Reserve 0 for ignored/background points so every kept instance is foreground.
         inst_id = raw_inst_id + 1
+        class_id = _benchmark_class_id_for_label(
+            label=label,
+            eval_benchmark=eval_benchmark,
+            raw_category_label_map=raw_category_label_map,
+        )
+        if eval_benchmark != SCANNET_EVAL_BENCHMARK_ALL and class_id is None:
+            continue
+        if class_id is not None:
+            instance_class_ids[inst_id] = int(class_id)
 
         for seg_id in group.get("segments", []):
             seg_to_instance[int(seg_id)] = inst_id
@@ -109,7 +161,10 @@ def _load_instance_ids_from_aggregation(
     for i, seg_id in enumerate(seg_indices):
         gt_instance_ids[i] = seg_to_instance.get(int(seg_id), 0)
 
-    return gt_instance_ids
+    return ScannetGTInstances(
+        instance_ids=gt_instance_ids,
+        instance_class_ids=instance_class_ids,
+    )
 
 
 def load_scannet_gt_instance_ids(
@@ -125,13 +180,44 @@ def load_scannet_gt_instance_ids(
     plydata = PlyData.read(str(labels_ply))
     n_vertices = len(plydata.elements[0].data)
 
-    gt_instance_ids = _load_instance_ids_from_aggregation(
+    gt_instances = _load_instances_from_aggregation(
         scene_dir,
         scene_name,
         n_vertices,
         eval_benchmark=eval_benchmark,
     )
-    if gt_instance_ids is not None:
-        return gt_instance_ids
+    if gt_instances is not None:
+        return gt_instances.instance_ids
+
+    raise RuntimeError("Could not find GT instance ids in aggregation+segments files.")
+
+
+def load_scannet_gt_instances(
+    scene_dir: Path,
+    scene_name: str,
+    eval_benchmark: str = SCANNET_EVAL_BENCHMARK_ALL,
+) -> ScannetGTInstances:
+    """Load ScanNet GT instances and contiguous benchmark class ids.
+
+    ``instance_ids`` follows the existing convention: 0 is ignored/background,
+    foreground ids are positive. ``instance_class_ids`` maps those positive ids
+    to contiguous class indices for the requested benchmark.
+    """
+    eval_benchmark = normalize_scannet_eval_benchmark(eval_benchmark)
+    labels_ply = scene_dir / f"{scene_name}_vh_clean_2.labels.ply"
+    if not labels_ply.exists():
+        raise FileNotFoundError(f"Missing ScanNet labels ply: {labels_ply}")
+
+    plydata = PlyData.read(str(labels_ply))
+    n_vertices = len(plydata.elements[0].data)
+
+    gt_instances = _load_instances_from_aggregation(
+        scene_dir,
+        scene_name,
+        n_vertices,
+        eval_benchmark=eval_benchmark,
+    )
+    if gt_instances is not None:
+        return gt_instances
 
     raise RuntimeError("Could not find GT instance ids in aggregation+segments files.")

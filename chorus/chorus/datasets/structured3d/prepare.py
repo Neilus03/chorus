@@ -10,8 +10,40 @@ import open3d as o3d
 from chorus.datasets.structured3d.reader import Structured3DReader
 
 
+PREPARED_VERSION = "structured3d_prepare_v2_axis_pose"
+CAMERA_AXIS_CONVERSION = np.array([[0, 0, 1], [0, -1, 0], [1, 0, 0]], dtype=np.float32)
+
+
 def is_prepared(scene_dir: Path) -> bool:
-    return (scene_dir / ".prepared").exists()
+    scene_dir = Path(scene_dir)
+    marker = scene_dir / ".prepared"
+    if not marker.exists():
+        return False
+
+    try:
+        version = marker.read_text(encoding="utf-8").strip()
+    except UnicodeDecodeError:
+        version = ""
+
+    required_paths = [
+        scene_dir / "color",
+        scene_dir / "depth",
+        scene_dir / "pose",
+        scene_dir / "intrinsic" / "intrinsic_color.txt",
+        scene_dir / "intrinsic" / "intrinsic_depth.txt",
+        scene_dir / f"{scene_dir.name}_vh_clean_2.ply",
+    ]
+    if not all(path.exists() for path in required_paths):
+        return False
+
+    return version == PREPARED_VERSION
+
+
+def _count_frame_files(scene_dir: Path) -> tuple[int, int, int]:
+    color_count = len([p for p in (scene_dir / "color").glob("*") if p.suffix.lower() in {".jpg", ".png"}])
+    depth_count = len([p for p in (scene_dir / "depth").glob("*.png")])
+    pose_count = len([p for p in (scene_dir / "pose").glob("*.txt")])
+    return color_count, depth_count, pose_count
 
 
 def prepare_structured3d_scene(scene_id: str, raw_zips_dir: str, output_scans_root: str) -> None:
@@ -74,7 +106,8 @@ def prepare_structured3d_scene(scene_id: str, raw_zips_dir: str, output_scans_ro
 
     global_coords: list[np.ndarray] = []
     global_colors: list[np.ndarray] = []
-    global_instances: list[np.ndarray] = []
+    global_instances: list[np.ndarray | None] = []
+    global_instance_lengths: list[int] = []
     any_instances = False
 
     frame_idx = 0
@@ -121,12 +154,14 @@ def prepare_structured3d_scene(scene_id: str, raw_zips_dir: str, output_scans_ro
             K[0, 0] = K[0, 2] / np.tan(fx)
             K[1, 1] = K[1, 2] / np.tan(fy)
 
-            # Pose: camera-to-world (C2W).
-            # Pointcept uses: Xw = (Xc @ cam_r.T) + cam_t (row-vector form),
-            # which corresponds to column-vector form Xw = cam_r @ Xc + cam_t.
-            # Therefore, cam_r is the C2W rotation.
+            # Pose: camera-to-world (C2W) in CHORUS pinhole-camera coordinates.
+            # The fused geometry below first converts pinhole camera coordinates with
+            # CAMERA_AXIS_CONVERSION, then applies Structured3D cam_r/cam_t:
+            #   Xw(row) = (Xcam(row) @ CAMERA_AXIS_CONVERSION) @ cam_r.T + cam_t
+            # For CHORUS projection to invert back to the original pinhole Xcam, the
+            # saved column-vector C2W rotation must include the same axis conversion.
             c2w = np.eye(4, dtype=np.float32)
-            c2w[:3, :3] = cam_r
+            c2w[:3, :3] = cam_r @ CAMERA_AXIS_CONVERSION.T
             c2w[:3, 3] = cam_t
 
             # 1) Export 2D frames
@@ -154,7 +189,7 @@ def prepare_structured3d_scene(scene_id: str, raw_zips_dir: str, output_scans_ro
             y = (v.astype(np.float32) - K[1, 2]) * z / K[1, 1]
 
             pts_camera = np.stack([x, y, z], axis=-1)
-            pts_camera = pts_camera @ np.array([[0, 0, 1], [0, -1, 0], [1, 0, 0]], dtype=np.float32)
+            pts_camera = pts_camera @ CAMERA_AXIS_CONVERSION
 
             # Pointcept: world = (coord/1000) @ cam_r.T + cam_t
             pts_world = (pts_camera @ cam_r.T) + cam_t
@@ -163,6 +198,10 @@ def prepare_structured3d_scene(scene_id: str, raw_zips_dir: str, output_scans_ro
             global_colors.append(color[valid_mask])
             if instance is not None:
                 global_instances.append(instance[valid_mask])
+                global_instance_lengths.append(int(v.size))
+            else:
+                global_instances.append(None)
+                global_instance_lengths.append(int(v.size))
 
             frame_idx += 1
 
@@ -173,7 +212,11 @@ def prepare_structured3d_scene(scene_id: str, raw_zips_dir: str, output_scans_ro
     all_colors = np.concatenate(global_colors, axis=0).astype(np.uint8)
     all_instances = None
     if any_instances and len(global_instances) > 0:
-        all_instances = np.concatenate(global_instances, axis=0).astype(np.int32)
+        filled_instances = [
+            inst if inst is not None else np.zeros(length, dtype=np.int32)
+            for inst, length in zip(global_instances, global_instance_lengths)
+        ]
+        all_instances = np.concatenate(filled_instances, axis=0).astype(np.int32)
 
     # NOTE: Do not apply an additional global axis flip here unless you also apply the
     # corresponding transform to every saved pose. CHORUS projects 2D masks using the poses
@@ -202,6 +245,9 @@ def prepare_structured3d_scene(scene_id: str, raw_zips_dir: str, output_scans_ro
     if down_instances is not None:
         np.save(str(scene_dir / "gt_instance_ids.npy"), down_instances)
 
-    (scene_dir / ".prepared").touch()
-    print(f"Finished {scene_id}. Saved {len(down_coords)} points and {frame_idx} frames.")
-
+    (scene_dir / ".prepared").write_text(PREPARED_VERSION + "\n", encoding="utf-8")
+    color_count, depth_count, pose_count = _count_frame_files(scene_dir)
+    print(
+        f"Finished {scene_id}. Saved {len(down_coords)} points and {frame_idx} frames "
+        f"(color={color_count}, depth={depth_count}, pose={pose_count})."
+    )

@@ -110,19 +110,13 @@ class ScanNetPPSceneAdapter(SceneAdapter):
         pose = np.loadtxt(frame.pose_path)
         if np.isnan(pose).any() or np.isinf(pose).any():
             raise ValueError(f"Invalid pose matrix in {frame.pose_path}")
-        
-        # Convert from ARKit (X-right, Y-up, Z-back) to OpenCV (X-right, Y-down, Z-forward)
-        conversion_matrix = np.array([
-            [1,  0,  0, 0],
-            [0, -1,  0, 0],
-            [0,  0, -1, 0],
-            [0,  0,  0, 1]
-        ], dtype=np.float32)
-        
-        return pose @ conversion_matrix
+        return pose
 
     def load_intrinsics(self, frame: FrameRecord) -> np.ndarray:
-        return np.loadtxt(frame.intrinsics_path)[:3, :3]
+        intrinsics_path = frame.intrinsics_path
+        if not intrinsics_path.exists():
+            intrinsics_path = self.scene_root / "intrinsic" / "intrinsic_color.txt"
+        return np.loadtxt(intrinsics_path)[:3, :3]
 
     def _geometry_path(self) -> Path:
         return self.scene_root / "scans" / "mesh_aligned_0.05.ply"

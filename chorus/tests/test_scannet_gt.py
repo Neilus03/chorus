@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from chorus.datasets.scannet.gt import load_scannet_gt_instance_ids
+from chorus.datasets.scannet.gt import load_scannet_gt_instance_ids, load_scannet_gt_instances
 
 
 class _FakePlyData:
@@ -62,6 +62,38 @@ def test_load_scannet_gt_instance_ids_filters_to_scannet200(monkeypatch, tmp_pat
     )
 
     np.testing.assert_array_equal(gt_ids, np.array([1, 1, 0, 0], dtype=np.int64))
+
+
+def test_load_scannet_gt_instances_returns_contiguous_scannet20_classes(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    scene_name = "scene0000_00"
+    scene_dir = tmp_path / scene_name
+    scene_dir.mkdir()
+    _write_scene_files(scene_dir, scene_name)
+
+    monkeypatch.setattr(
+        "chorus.datasets.scannet.gt.PlyData.read",
+        lambda _: _FakePlyData(n_vertices=4),
+    )
+    monkeypatch.setattr(
+        "chorus.datasets.scannet.gt.load_raw_category_label_map",
+        lambda: {
+            "chair": {"id": 2, "nyu40id": 5},
+            "wall": {"id": 1, "nyu40id": 1},
+            "mystery": {"id": 5000, "nyu40id": 0},
+        },
+    )
+
+    gt = load_scannet_gt_instances(
+        scene_dir=scene_dir,
+        scene_name=scene_name,
+        eval_benchmark="scannet20",
+    )
+
+    np.testing.assert_array_equal(gt.instance_ids, np.array([1, 1, 0, 0], dtype=np.int64))
+    assert gt.instance_class_ids == {1: 4}
 
 
 def test_load_scannet_gt_instance_ids_all_keeps_nonstuff_instances(
