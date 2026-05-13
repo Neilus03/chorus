@@ -23,3 +23,10 @@ student/logs/
 
 *.txt
 chorus/.venv*
+
+*.csv
+*.json
+*.log
+*.png
+*.err
+*.out
