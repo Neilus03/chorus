@@ -181,15 +181,18 @@ def aggregate_multi_scene_results(
         aggregate[f"real_AP50_mean_{bench}"] = _safe_mean(real_ap50_by_bench.get(bench, []))
         aggregate[f"real_NMI_mean_{bench}"] = _safe_mean(real_nmi_by_bench.get(bench, []))
         aggregate[f"real_ARI_mean_{bench}"] = _safe_mean(real_ari_by_bench.get(bench, []))
-        aggregate[f"real_class_AP25_mean_{bench}"] = _safe_mean(
-            real_class_ap25_by_bench.get(bench, [])
-        )
-        aggregate[f"real_class_AP50_mean_{bench}"] = _safe_mean(
-            real_class_ap50_by_bench.get(bench, [])
-        )
-        aggregate[f"real_sem_mIoU_mean_{bench}"] = _safe_mean(
-            real_sem_miou_by_bench.get(bench, [])
-        )
+        if real_class_ap25_by_bench.get(bench):
+            aggregate[f"real_class_AP25_mean_{bench}"] = _safe_mean(
+                real_class_ap25_by_bench[bench]
+            )
+        if real_class_ap50_by_bench.get(bench):
+            aggregate[f"real_class_AP50_mean_{bench}"] = _safe_mean(
+                real_class_ap50_by_bench[bench]
+            )
+        if real_sem_miou_by_bench.get(bench):
+            aggregate[f"real_sem_mIoU_mean_{bench}"] = _safe_mean(
+                real_sem_miou_by_bench[bench]
+            )
 
     all_iou_values: list[float] = []
     for g in granularities:

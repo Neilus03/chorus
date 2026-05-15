@@ -40,7 +40,11 @@ def extract_proposals(
     score_threshold: float = 0.3,
     mask_threshold: float = 0.5,
     min_points: int = 30,
-) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
+    return_stats: bool = False,
+) -> (
+    tuple[list[np.ndarray], np.ndarray, np.ndarray]
+    | tuple[list[np.ndarray], np.ndarray, np.ndarray, dict[str, int]]
+):
     """Convert decoder output into a list of binary proposal masks.
 
     Returns
@@ -58,18 +62,37 @@ def extract_proposals(
     proposals: list[np.ndarray] = []
     scores_out: list[float] = []
     indices_out: list[int] = []
+    num_score_pass = 0
+    num_min_points_removed = 0
 
     for q in range(mask_logits.shape[0]):
         if scores_sig[q] < score_threshold:
             continue
+        num_score_pass += 1
         mask = masks_binary[q]
         if mask.sum() < min_points:
+            num_min_points_removed += 1
             continue
         proposals.append(mask)
         scores_out.append(float(scores_sig[q]))
         indices_out.append(q)
 
-    return proposals, np.array(scores_out), np.array(indices_out, dtype=np.int64)
+    result = (
+        proposals,
+        np.array(scores_out),
+        np.array(indices_out, dtype=np.int64),
+    )
+    if not return_stats:
+        return result
+
+    stats = {
+        "num_queries": int(mask_logits.shape[0]),
+        "num_score_pass": int(num_score_pass),
+        "num_min_points_removed": int(num_min_points_removed),
+        "num_proposals": int(len(proposals)),
+        "min_points_per_proposal": int(min_points),
+    }
+    return (*result, stats)
 
 
 def extract_class_aware_proposals(
@@ -441,17 +464,18 @@ def evaluate_student_predictions(
     class_logits = pred.get("class_logits")
     class_logits_cpu = class_logits.detach().cpu() if class_logits is not None else None
 
-    proposals, scores, query_idx = extract_proposals(
+    proposals, scores, query_idx, proposal_stats = extract_proposals(
         mask_logits, score_logits,
         score_threshold=score_threshold,
         mask_threshold=mask_threshold,
         min_points=min_points,
+        return_stats=True,
     )
     N = mask_logits.shape[1]
     pred_labels = proposals_to_labels(proposals, N)
 
     result: dict[str, Any] = {
-        "num_proposals": len(proposals),
+        **proposal_stats,
         "score_threshold": score_threshold,
         "class_score_threshold": (
             score_threshold if class_score_threshold is None else class_score_threshold
@@ -492,6 +516,14 @@ def evaluate_student_predictions(
             class_scores,
             class_ids,
         )
+    log.info(
+        "  [proposals] score_pass=%d/%d  removed_min_points=%d  kept=%d  min_points=%d",
+        proposal_stats["num_score_pass"],
+        proposal_stats["num_queries"],
+        proposal_stats["num_min_points_removed"],
+        proposal_stats["num_proposals"],
+        proposal_stats["min_points_per_proposal"],
+    )
     log.info(
         "  [pseudo-GT] AP25=%.3f  AP50=%.3f  NMI=%.4f  ARI=%.4f  (%d GT instances)",
         pseudo_ap["AP25"], pseudo_ap["AP50"],

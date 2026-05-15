@@ -1498,20 +1498,32 @@ class MultiSceneTrainer:
             else None
         )
         prompt_suffix = f"  g_ft={learned_g:.4f}" if learned_g is not None else ""
-        log.info(
-            "  [val epoch %d] loss=%.4f  pseudo_AP50=%.3f  real_AP50=(%s)  "
-            "real_class_AP25=(%s)  real_class_AP50=(%s)  "
-            "real_sem_mIoU=(%s)  matched_mIoU=%.3f%s",
-            epoch,
-            agg["loss_mean"],
-            agg["pseudo_AP50_mean"],
-            real_ap50_str,
-            real_class_ap25_str,
-            real_class_ap50_str,
-            real_sem_miou_str,
-            agg["matched_mean_iou_mean"],
-            prompt_suffix,
-        )
+        if real_class_ap25_bits or real_class_ap50_bits or real_sem_miou_bits:
+            log.info(
+                "  [val epoch %d] loss=%.4f  pseudo_AP50=%.3f  real_AP50=(%s)  "
+                "real_class_AP25=(%s)  real_class_AP50=(%s)  "
+                "real_sem_mIoU=(%s)  matched_mIoU=%.3f%s",
+                epoch,
+                agg["loss_mean"],
+                agg["pseudo_AP50_mean"],
+                real_ap50_str,
+                real_class_ap25_str,
+                real_class_ap50_str,
+                real_sem_miou_str,
+                agg["matched_mean_iou_mean"],
+                prompt_suffix,
+            )
+        else:
+            log.info(
+                "  [val epoch %d] loss=%.4f  pseudo_AP50=%.3f  real_AP50=(%s)  "
+                "matched_mIoU=%.3f%s",
+                epoch,
+                agg["loss_mean"],
+                agg["pseudo_AP50_mean"],
+                real_ap50_str,
+                agg["matched_mean_iou_mean"],
+                prompt_suffix,
+            )
 
         row = {
             "epoch": epoch,
@@ -1608,24 +1620,40 @@ class MultiSceneTrainer:
             else None
         )
         prompt_suffix = f"  g_ft={learned_g:.4f}" if learned_g is not None else ""
-        log.info(
-            "  [train-eval epoch %d] loss=%.4f  "
-            "pseudo(AP25=%.3f, AP50=%.3f, NMI=%.4f, ARI=%.4f)  "
-            "real(AP50=(%s), class_AP25=(%s), class_AP50=(%s), sem_mIoU=(%s))  "
-            "matched_mIoU=%.3f%s",
-            epoch,
-            agg["loss_mean"],
-            agg["pseudo_AP25_mean"],
-            agg["pseudo_AP50_mean"],
-            agg["pseudo_NMI_mean"],
-            agg["pseudo_ARI_mean"],
-            real_ap50_str,
-            real_class_ap25_str,
-            real_class_ap50_str,
-            real_sem_miou_str,
-            agg["matched_mean_iou_mean"],
-            prompt_suffix,
-        )
+        if real_class_ap25_bits or real_class_ap50_bits or real_sem_miou_bits:
+            log.info(
+                "  [train-eval epoch %d] loss=%.4f  "
+                "pseudo(AP25=%.3f, AP50=%.3f, NMI=%.4f, ARI=%.4f)  "
+                "real(AP50=(%s), class_AP25=(%s), class_AP50=(%s), sem_mIoU=(%s))  "
+                "matched_mIoU=%.3f%s",
+                epoch,
+                agg["loss_mean"],
+                agg["pseudo_AP25_mean"],
+                agg["pseudo_AP50_mean"],
+                agg["pseudo_NMI_mean"],
+                agg["pseudo_ARI_mean"],
+                real_ap50_str,
+                real_class_ap25_str,
+                real_class_ap50_str,
+                real_sem_miou_str,
+                agg["matched_mean_iou_mean"],
+                prompt_suffix,
+            )
+        else:
+            log.info(
+                "  [train-eval epoch %d] loss=%.4f  "
+                "pseudo(AP25=%.3f, AP50=%.3f, NMI=%.4f, ARI=%.4f)  "
+                "real(AP50=(%s))  matched_mIoU=%.3f%s",
+                epoch,
+                agg["loss_mean"],
+                agg["pseudo_AP25_mean"],
+                agg["pseudo_AP50_mean"],
+                agg["pseudo_NMI_mean"],
+                agg["pseudo_ARI_mean"],
+                real_ap50_str,
+                agg["matched_mean_iou_mean"],
+                prompt_suffix,
+            )
 
         row = {
             "epoch": epoch,
