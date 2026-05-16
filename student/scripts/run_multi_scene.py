@@ -562,6 +562,7 @@ def main() -> None:
             class_weight=loss_cfg.get("class_weight", 0.0),
             no_object_weight=loss_cfg.get("no_object_weight", 0.1),
             cost_class_weight=loss_cfg.get("cost_class_weight", 0.0),
+            score_target_mode=loss_cfg.get("score_target_mode", "binary"),
         )
         gran_weights = loss_cfg.get("granularity_weights", None)
         aux_weight = float(loss_cfg.get("aux_weight", 0.0))
@@ -678,7 +679,7 @@ def main() -> None:
             ),
             train_eval_selection=args.eval_train_selection,
             save_every_epochs=train_cfg.get("save_every_epochs", 10),
-            best_val_metric_name=train_cfg.get("best_val_metric", "pseudo_AP50_mean"),
+            best_val_metric_name=train_cfg.get("best_val_metric", "pseudo_official_AP50_mean"),
             output_dir=out_dir,
             score_threshold=eval_cfg.get("score_threshold", 0.3),
             class_score_threshold=eval_cfg.get("class_score_threshold", None),
@@ -721,12 +722,14 @@ def main() -> None:
             is_main_process=is_main_process,
         )
 
+        loaded_checkpoint_path: Path | None = None
         if args.resume and args.finetune_from:
             raise ValueError("Use only one of --resume or --finetune-from.")
 
         if args.finetune_from:
+            loaded_checkpoint_path = Path(args.finetune_from)
             trainer.load_weights_only(
-                Path(args.finetune_from),
+                loaded_checkpoint_path,
                 strict=not bool(model_cfg.get("class_aware_instance", False)),
             )
             _dist_barrier()
@@ -735,12 +738,30 @@ def main() -> None:
                 ckpt_path = out_dir / "checkpoints" / f"{args.resume}.pt"
             else:
                 ckpt_path = Path(args.resume)
+            loaded_checkpoint_path = ckpt_path
             trainer.load_checkpoint(ckpt_path)
             _dist_barrier()
 
         if args.eval_only:
             _dist_barrier()
-            trainer._validate(epoch=trainer.current_epoch)
+            eval_result = trainer._validate(epoch=trainer.current_epoch)
+            if is_main_process:
+                eval_summary = {
+                    "config": cfg,
+                    "eval_only": True,
+                    "checkpoint": (
+                        str(loaded_checkpoint_path)
+                        if loaded_checkpoint_path is not None
+                        else None
+                    ),
+                    "epoch": trainer.current_epoch,
+                    "aggregate": eval_result.get("aggregate", {}),
+                }
+                with (out_dir / "eval_only_summary.json").open(
+                    "w", encoding="utf-8"
+                ) as f:
+                    json.dump(eval_summary, f, indent=2)
+                log.info("Saved eval-only summary to %s", out_dir / "eval_only_summary.json")
             _dist_barrier()
             return
 
@@ -765,7 +786,7 @@ def main() -> None:
                 "best_val_metrics": final_metrics.get("best_val_metrics", {}),
                 "best_epoch": final_metrics.get("best_epoch", -1),
                 "best_val_metric_name": final_metrics.get(
-                    "best_val_metric_name", train_cfg.get("best_val_metric", "pseudo_AP50_mean")
+                    "best_val_metric_name", train_cfg.get("best_val_metric", "pseudo_official_AP50_mean")
                 ),
                 "total_training_time_s": final_metrics.get("total_training_time_s", 0),
                 "per_epoch_time_s": final_metrics.get("per_epoch_time_s", []),
@@ -784,7 +805,7 @@ def main() -> None:
                 wb_final["final/best_epoch"] = final_metrics.get("best_epoch", -1)
                 wb_final["final/best_val_metric"] = final_metrics.get("best_val_metric", 0)
                 wb_final["final/best_val_metric_name"] = final_metrics.get(
-                    "best_val_metric_name", train_cfg.get("best_val_metric", "pseudo_AP50_mean")
+                    "best_val_metric_name", train_cfg.get("best_val_metric", "pseudo_official_AP50_mean")
                 )
                 wandb.summary.update(wb_final)
                 wandb.finish()

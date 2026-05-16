@@ -277,6 +277,7 @@ def main() -> None:
         bce_weight=loss_cfg.get("bce_weight", 1.0),
         dice_weight=loss_cfg.get("dice_weight", 1.0),
         score_weight=loss_cfg.get("score_weight", 0.5),
+        score_target_mode=loss_cfg.get("score_target_mode", "binary"),
     )
     criterion = MultiGranCriterion(
         criterion=base_criterion,
@@ -388,7 +389,7 @@ def main() -> None:
     agg = eval_result["aggregate"]
     print(f"  eval time        : {eval_ms:.0f} ms")
     print(f"  loss_mean        : {agg['loss_mean']:.4f}")
-    print(f"  pseudo_AP50_mean : {agg['pseudo_AP50_mean']:.4f}")
+    print(f"  pseudo_official_AP50_mean : {agg['pseudo_official_AP50_mean']:.4f}")
     print(f"  matched_iou_mean : {agg['matched_mean_iou_mean']:.4f}")
     eval_ok = "per_scene" in eval_result and "aggregate" in eval_result
     print(f"  result structure : {'OK' if eval_ok else 'BROKEN'}")

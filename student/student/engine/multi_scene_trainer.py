@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import random
 import statistics
 import time
@@ -48,6 +49,128 @@ from student.models.continuous_decoder import ContinuousQueryInstanceDecoder
 from student.models.finetune_wrapper import FineTuningWrapper
 
 log = logging.getLogger(__name__)
+
+
+_LEGACY_BEST_METRIC_ALIASES = {
+    "pseudo_AP_mean": "pseudo_official_AP_mean",
+    "pseudo_AP25_mean": "pseudo_official_AP25_mean",
+    "pseudo_AP50_mean": "pseudo_official_AP50_mean",
+}
+
+_SCORE_TARGET_DIAGNOSTIC_KEYS = (
+    "score_target_mean_matched",
+    "score_target_max_matched",
+    "score_target_min_matched",
+    "score_target_mean_all",
+    "num_score_targets_positive",
+)
+
+
+def _canonical_best_metric_name(name: str) -> str:
+    """Map old ambiguous AP config keys to new official keys for new runs."""
+    name = str(name)
+    if name in _LEGACY_BEST_METRIC_ALIASES:
+        return _LEGACY_BEST_METRIC_ALIASES[name]
+    if name.startswith("real_AP50_mean_"):
+        return f"real_full_scene_official_AP50_{name.removeprefix('real_AP50_mean_')}"
+    if name.startswith("real_AP25_mean_"):
+        return f"real_full_scene_official_AP25_{name.removeprefix('real_AP25_mean_')}"
+    if name.startswith("real_AP_mean_"):
+        return f"real_full_scene_official_AP_{name.removeprefix('real_AP_mean_')}"
+    return name
+
+
+def _is_loggable_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _maybe_stack_mean(values: list[torch.Tensor]) -> torch.Tensor | None:
+    return torch.stack(values).mean() if values else None
+
+
+def _copy_score_target_diagnostics(dst: dict[str, Any], src: dict[str, Any]) -> None:
+    for key in _SCORE_TARGET_DIAGNOSTIC_KEYS:
+        if key in src:
+            dst[key] = src[key]
+
+
+def _format_aggregate_bits(
+    agg: dict[str, Any],
+    *,
+    prefix: str,
+    suffix_prefix: str,
+) -> list[str]:
+    bits: list[str] = []
+    for key in sorted(agg):
+        value = agg.get(key)
+        if not _is_loggable_number(value):
+            continue
+        if not key.startswith(prefix):
+            continue
+        label = key.removeprefix(prefix)
+        if isinstance(value, float) and math.isnan(value):
+            bits.append(f"{label}=nan")
+        else:
+            bits.append(f"{label}={float(value):.3f}")
+    if bits:
+        return bits
+
+    # Backward-compatible fallback for class-aware legacy AP summaries.
+    if not suffix_prefix:
+        return bits
+    for key in sorted(agg):
+        value = agg.get(key)
+        if _is_loggable_number(value) and key.startswith(suffix_prefix):
+            bits.append(f"{key.removeprefix(suffix_prefix)}={float(value):.3f}")
+    return bits
+
+
+def _add_scene_legacy_metrics(
+    wb: dict[str, Any],
+    *,
+    prefix: str,
+    scene_id: str,
+    granularity: str,
+    g_eval: dict[str, Any],
+) -> None:
+    pseudo = g_eval.get("pseudo_gt", {})
+    if isinstance(pseudo, dict) and "legacy_matched_recall25" in pseudo:
+        wb[f"{prefix}/{scene_id}/pseudo_legacy_matched_recall25_{granularity}"] = pseudo[
+            "legacy_matched_recall25"
+        ]
+        wb[f"{prefix}/{scene_id}/pseudo_legacy_matched_recall50_{granularity}"] = pseudo[
+            "legacy_matched_recall50"
+        ]
+        wb[f"{prefix}/{scene_id}/pseudo_NMI_{granularity}"] = pseudo.get("NMI", 0)
+        wb[f"{prefix}/{scene_id}/pseudo_ARI_{granularity}"] = pseudo.get("ARI", 0)
+
+    real_by = g_eval.get("real_gt_by_benchmark")
+    if isinstance(real_by, dict):
+        real_items = real_by.items()
+    else:
+        real_primary = g_eval.get("real_gt", {})
+        bench = (
+            real_primary.get("eval_benchmark", "primary")
+            if isinstance(real_primary, dict)
+            else "primary"
+        )
+        real_items = [(bench, real_primary)]
+
+    for bench, real in real_items:
+        if not isinstance(real, dict) or "legacy_matched_recall25" not in real:
+            continue
+        bench_name = str(bench)
+        wb[f"{prefix}/{scene_id}/real_legacy_matched_recall25_{granularity}_{bench_name}"] = real[
+            "legacy_matched_recall25"
+        ]
+        wb[f"{prefix}/{scene_id}/real_legacy_matched_recall50_{granularity}_{bench_name}"] = real[
+            "legacy_matched_recall50"
+        ]
+        class_aware = real.get("class_aware", {})
+        if isinstance(class_aware, dict):
+            wb[f"{prefix}/{scene_id}/real_class_legacy_scene_AP25_{granularity}_{bench_name}"] = class_aware.get("AP25", 0)
+            wb[f"{prefix}/{scene_id}/real_class_legacy_scene_AP50_{granularity}_{bench_name}"] = class_aware.get("AP50", 0)
+            wb[f"{prefix}/{scene_id}/real_sem_mIoU_{granularity}_{bench_name}"] = class_aware.get("semantic_mIoU", 0)
 
 # ── granularity lookup tables ────────────────────────────────────────────
 
@@ -186,7 +309,7 @@ class MultiSceneTrainer:
         train_eval_scene_ids: list[str] | None = None,
         train_eval_selection: str = "first",
         save_every_epochs: int = 10,
-        best_val_metric_name: str = "pseudo_AP50_mean",
+        best_val_metric_name: str = "pseudo_official_AP50_mean",
         output_dir: Path | str,
         score_threshold: float = 0.3,
         class_score_threshold: float | None = None,
@@ -235,7 +358,15 @@ class MultiSceneTrainer:
         self.train_eval_scene_ids = train_eval_scene_ids
         self.train_eval_selection = train_eval_selection
         self.save_every_epochs = save_every_epochs
-        self.best_val_metric_name = str(best_val_metric_name)
+        raw_best_metric_name = str(best_val_metric_name)
+        self.best_val_metric_name = _canonical_best_metric_name(raw_best_metric_name)
+        if self.best_val_metric_name != raw_best_metric_name and is_main_process:
+            log.warning(
+                "Legacy best_val_metric %r remapped to official metric %r for this run; "
+                "old checkpoint summaries are left unchanged.",
+                raw_best_metric_name,
+                self.best_val_metric_name,
+            )
         self.output_dir = Path(output_dir)
         self.score_threshold = score_threshold
         self.class_score_threshold = class_score_threshold
@@ -720,6 +851,15 @@ class MultiSceneTrainer:
                     for x in scene_results
                 ]).mean(),
             }
+            for key in _SCORE_TARGET_DIAGNOSTIC_KEYS:
+                values = [
+                    x["heads"][g][key]
+                    for x in scene_results
+                    if key in x["heads"][g]
+                ]
+                mean_value = _maybe_stack_mean(values)
+                if mean_value is not None:
+                    result["heads"][g][key] = mean_value
 
         aux_values = [x["loss_aux"] for x in scene_results if "loss_aux" in x]
         if aux_values:
@@ -808,6 +948,7 @@ class MultiSceneTrainer:
                 "loss_score": result["loss_score"],
                 "loss_class": result.get("loss_class", result["loss_score"] * 0.0),
             }}
+            _copy_score_target_diagnostics(result["heads"][sampled_g_key], result)
             return result
 
         # Aggregate across scenes
@@ -838,6 +979,11 @@ class MultiSceneTrainer:
                 },
             },
         }
+        for key in _SCORE_TARGET_DIAGNOSTIC_KEYS:
+            values = [r[key] for r in scene_results if key in r]
+            mean_value = _maybe_stack_mean(values)
+            if mean_value is not None:
+                result["heads"][sampled_g_key][key] = mean_value
         aux_values = [r["loss_aux"] for r in scene_results if "loss_aux" in r]
         if aux_values:
             result["loss_aux"] = torch.stack(aux_values).mean()
@@ -1030,7 +1176,7 @@ class MultiSceneTrainer:
         self.current_epoch = int(checkpoint.get("epoch", 0))
         self.global_step = int(checkpoint.get("global_step", 0))
         saved_best_metric_name = str(
-            checkpoint.get("best_val_metric_name", "pseudo_AP50_mean")
+            checkpoint.get("best_val_metric_name", "pseudo_official_AP50_mean")
         )
         if saved_best_metric_name == self.best_val_metric_name:
             self.best_val_metric = float(checkpoint.get("best_val_metric", -1.0))
@@ -1264,6 +1410,9 @@ class MultiSceneTrainer:
                         step_metrics[f"loss_score_{g}"] = ld_g["loss_score"].item()
                         if "loss_class" in ld_g:
                             step_metrics[f"loss_class_{g}"] = ld_g["loss_class"].item()
+                        for key in _SCORE_TARGET_DIAGNOSTIC_KEYS:
+                            if key in ld_g:
+                                step_metrics[f"{key}_{g}"] = ld_g[key].item()
                 if "loss_aux" in loss_result:
                     step_metrics["loss_aux"] = loss_result["loss_aux"].item()
 
@@ -1329,6 +1478,10 @@ class MultiSceneTrainer:
                             row[f"loss_score_{g}"] = step_metrics[f"loss_score_{g}"]
                             if f"loss_class_{g}" in step_metrics:
                                 row[f"loss_class_{g}"] = step_metrics[f"loss_class_{g}"]
+                            for key in _SCORE_TARGET_DIAGNOSTIC_KEYS:
+                                metric_key = f"{key}_{g}"
+                                if metric_key in step_metrics:
+                                    row[metric_key] = step_metrics[metric_key]
                     if "loss_aux" in step_metrics:
                         row["loss_aux"] = step_metrics["loss_aux"]
                     self._log_row(row)
@@ -1355,6 +1508,10 @@ class MultiSceneTrainer:
                                 wb[f"train_scene/loss_score_{g}"] = step_metrics[f"loss_score_{g}"]
                                 if f"loss_class_{g}" in step_metrics:
                                     wb[f"train_scene/loss_class_{g}"] = step_metrics[f"loss_class_{g}"]
+                                for key in _SCORE_TARGET_DIAGNOSTIC_KEYS:
+                                    metric_key = f"{key}_{g}"
+                                    if metric_key in step_metrics:
+                                        wb[f"train_scene/{metric_key}"] = step_metrics[metric_key]
                         if "learned_granularity" in step_metrics:
                             wb["train_scene/learned_granularity"] = step_metrics["learned_granularity"]
                         if "loss_aux" in step_metrics:
@@ -1461,21 +1618,29 @@ class MultiSceneTrainer:
             return {}
 
         agg = val_result["aggregate"]
-        real_ap50_bits = [
-            f"{k.removeprefix('real_AP50_mean_')}={agg[k]:.3f}"
-            for k in sorted(agg.keys())
-            if k.startswith("real_AP50_mean_") and isinstance(agg.get(k), (int, float))
-        ]
-        real_class_ap50_bits = [
-            f"{k.removeprefix('real_class_AP50_mean_')}={agg[k]:.3f}"
-            for k in sorted(agg.keys())
-            if k.startswith("real_class_AP50_mean_") and isinstance(agg.get(k), (int, float))
-        ]
-        real_class_ap25_bits = [
-            f"{k.removeprefix('real_class_AP25_mean_')}={agg[k]:.3f}"
-            for k in sorted(agg.keys())
-            if k.startswith("real_class_AP25_mean_") and isinstance(agg.get(k), (int, float))
-        ]
+        real_ap50_bits = _format_aggregate_bits(
+            agg,
+            prefix="real_full_scene_official_AP50_",
+            suffix_prefix="real_AP50_mean_",
+        ) + _format_aggregate_bits(
+            agg,
+            prefix="real_crop_official_AP50_",
+            suffix_prefix="",
+        ) + _format_aggregate_bits(
+            agg,
+            prefix="real_mixed_official_AP50_",
+            suffix_prefix="",
+        )
+        real_class_ap50_bits = _format_aggregate_bits(
+            agg,
+            prefix="real_class_full_scene_official_AP50_",
+            suffix_prefix="real_class_AP50_mean_",
+        )
+        real_class_ap25_bits = _format_aggregate_bits(
+            agg,
+            prefix="real_class_full_scene_official_AP25_",
+            suffix_prefix="real_class_AP25_mean_",
+        )
         real_sem_miou_bits = [
             f"{k.removeprefix('real_sem_mIoU_mean_')}={agg[k]:.3f}"
             for k in sorted(agg.keys())
@@ -1500,12 +1665,14 @@ class MultiSceneTrainer:
         prompt_suffix = f"  g_ft={learned_g:.4f}" if learned_g is not None else ""
         if real_class_ap25_bits or real_class_ap50_bits or real_sem_miou_bits:
             log.info(
-                "  [val epoch %d] loss=%.4f  pseudo_AP50=%.3f  real_AP50=(%s)  "
-                "real_class_AP25=(%s)  real_class_AP50=(%s)  "
+                "  [val epoch %d] loss=%.4f  pseudo_official_AP50=%.3f  "
+                "pseudo_oracle_AP50=%.3f  real_official_AP50=(%s)  "
+                "real_class_official_AP25=(%s)  real_class_official_AP50=(%s)  "
                 "real_sem_mIoU=(%s)  matched_mIoU=%.3f%s",
                 epoch,
                 agg["loss_mean"],
-                agg["pseudo_AP50_mean"],
+                agg.get("pseudo_official_AP50_mean", 0.0),
+                agg.get("pseudo_oracle_AP50_mean", 0.0),
                 real_ap50_str,
                 real_class_ap25_str,
                 real_class_ap50_str,
@@ -1515,11 +1682,13 @@ class MultiSceneTrainer:
             )
         else:
             log.info(
-                "  [val epoch %d] loss=%.4f  pseudo_AP50=%.3f  real_AP50=(%s)  "
+                "  [val epoch %d] loss=%.4f  pseudo_official_AP50=%.3f  "
+                "pseudo_oracle_AP50=%.3f  real_official_AP50=(%s)  "
                 "matched_mIoU=%.3f%s",
                 epoch,
                 agg["loss_mean"],
-                agg["pseudo_AP50_mean"],
+                agg.get("pseudo_official_AP50_mean", 0.0),
+                agg.get("pseudo_oracle_AP50_mean", 0.0),
                 real_ap50_str,
                 agg["matched_mean_iou_mean"],
                 prompt_suffix,
@@ -1549,21 +1718,14 @@ class MultiSceneTrainer:
                 eval_data = scene_data.get("eval", {})
                 for g in self.granularities:
                     g_eval = eval_data.get(g, {})
-                    pseudo = g_eval.get("pseudo_gt", {})
-                    if isinstance(pseudo, dict) and "AP25" in pseudo:
-                        wb[f"val_scene/{scene_id}/pseudo_AP25_{g}"] = pseudo["AP25"]
-                        wb[f"val_scene/{scene_id}/pseudo_AP50_{g}"] = pseudo["AP50"]
-                        wb[f"val_scene/{scene_id}/pseudo_NMI_{g}"] = pseudo.get("NMI", 0)
-                        wb[f"val_scene/{scene_id}/pseudo_ARI_{g}"] = pseudo.get("ARI", 0)
-                    real = g_eval.get("real_gt", {})
-                    if isinstance(real, dict) and "AP25" in real:
-                        wb[f"val_scene/{scene_id}/real_AP25_{g}"] = real["AP25"]
-                        wb[f"val_scene/{scene_id}/real_AP50_{g}"] = real["AP50"]
-                        class_aware = real.get("class_aware", {})
-                        if isinstance(class_aware, dict):
-                            wb[f"val_scene/{scene_id}/real_class_AP25_{g}"] = class_aware.get("AP25", 0)
-                            wb[f"val_scene/{scene_id}/real_class_AP50_{g}"] = class_aware.get("AP50", 0)
-                            wb[f"val_scene/{scene_id}/real_sem_mIoU_{g}"] = class_aware.get("semantic_mIoU", 0)
+                    if isinstance(g_eval, dict):
+                        _add_scene_legacy_metrics(
+                            wb,
+                            prefix="val_scene",
+                            scene_id=scene_id,
+                            granularity=g,
+                            g_eval=g_eval,
+                        )
 
             wandb.log(wb)
 
@@ -1583,21 +1745,29 @@ class MultiSceneTrainer:
             return {}
 
         agg = train_result["aggregate"]
-        real_ap50_bits = [
-            f"{k.removeprefix('real_AP50_mean_')}={agg[k]:.3f}"
-            for k in sorted(agg.keys())
-            if k.startswith("real_AP50_mean_") and isinstance(agg.get(k), (int, float))
-        ]
-        real_class_ap50_bits = [
-            f"{k.removeprefix('real_class_AP50_mean_')}={agg[k]:.3f}"
-            for k in sorted(agg.keys())
-            if k.startswith("real_class_AP50_mean_") and isinstance(agg.get(k), (int, float))
-        ]
-        real_class_ap25_bits = [
-            f"{k.removeprefix('real_class_AP25_mean_')}={agg[k]:.3f}"
-            for k in sorted(agg.keys())
-            if k.startswith("real_class_AP25_mean_") and isinstance(agg.get(k), (int, float))
-        ]
+        real_ap50_bits = _format_aggregate_bits(
+            agg,
+            prefix="real_full_scene_official_AP50_",
+            suffix_prefix="real_AP50_mean_",
+        ) + _format_aggregate_bits(
+            agg,
+            prefix="real_crop_official_AP50_",
+            suffix_prefix="",
+        ) + _format_aggregate_bits(
+            agg,
+            prefix="real_mixed_official_AP50_",
+            suffix_prefix="",
+        )
+        real_class_ap50_bits = _format_aggregate_bits(
+            agg,
+            prefix="real_class_full_scene_official_AP50_",
+            suffix_prefix="real_class_AP50_mean_",
+        )
+        real_class_ap25_bits = _format_aggregate_bits(
+            agg,
+            prefix="real_class_full_scene_official_AP25_",
+            suffix_prefix="real_class_AP25_mean_",
+        )
         real_sem_miou_bits = [
             f"{k.removeprefix('real_sem_mIoU_mean_')}={agg[k]:.3f}"
             for k in sorted(agg.keys())
@@ -1623,13 +1793,14 @@ class MultiSceneTrainer:
         if real_class_ap25_bits or real_class_ap50_bits or real_sem_miou_bits:
             log.info(
                 "  [train-eval epoch %d] loss=%.4f  "
-                "pseudo(AP25=%.3f, AP50=%.3f, NMI=%.4f, ARI=%.4f)  "
-                "real(AP50=(%s), class_AP25=(%s), class_AP50=(%s), sem_mIoU=(%s))  "
+                "pseudo_official(AP25=%.3f, AP50=%.3f, oracle_AP50=%.3f, NMI=%.4f, ARI=%.4f)  "
+                "real_official(AP50=(%s), class_AP25=(%s), class_AP50=(%s), sem_mIoU=(%s))  "
                 "matched_mIoU=%.3f%s",
                 epoch,
                 agg["loss_mean"],
-                agg["pseudo_AP25_mean"],
-                agg["pseudo_AP50_mean"],
+                agg.get("pseudo_official_AP25_mean", 0.0),
+                agg.get("pseudo_official_AP50_mean", 0.0),
+                agg.get("pseudo_oracle_AP50_mean", 0.0),
                 agg["pseudo_NMI_mean"],
                 agg["pseudo_ARI_mean"],
                 real_ap50_str,
@@ -1642,12 +1813,13 @@ class MultiSceneTrainer:
         else:
             log.info(
                 "  [train-eval epoch %d] loss=%.4f  "
-                "pseudo(AP25=%.3f, AP50=%.3f, NMI=%.4f, ARI=%.4f)  "
-                "real(AP50=(%s))  matched_mIoU=%.3f%s",
+                "pseudo_official(AP25=%.3f, AP50=%.3f, oracle_AP50=%.3f, NMI=%.4f, ARI=%.4f)  "
+                "real_official(AP50=(%s))  matched_mIoU=%.3f%s",
                 epoch,
                 agg["loss_mean"],
-                agg["pseudo_AP25_mean"],
-                agg["pseudo_AP50_mean"],
+                agg.get("pseudo_official_AP25_mean", 0.0),
+                agg.get("pseudo_official_AP50_mean", 0.0),
+                agg.get("pseudo_oracle_AP50_mean", 0.0),
                 agg["pseudo_NMI_mean"],
                 agg["pseudo_ARI_mean"],
                 real_ap50_str,
@@ -1679,21 +1851,14 @@ class MultiSceneTrainer:
                 eval_data = scene_data.get("eval", {})
                 for g in self.granularities:
                     g_eval = eval_data.get(g, {})
-                    pseudo = g_eval.get("pseudo_gt", {})
-                    if isinstance(pseudo, dict) and "AP25" in pseudo:
-                        wb[f"train_eval_scene/{scene_id}/pseudo_AP25_{g}"] = pseudo["AP25"]
-                        wb[f"train_eval_scene/{scene_id}/pseudo_AP50_{g}"] = pseudo["AP50"]
-                        wb[f"train_eval_scene/{scene_id}/pseudo_NMI_{g}"] = pseudo.get("NMI", 0)
-                        wb[f"train_eval_scene/{scene_id}/pseudo_ARI_{g}"] = pseudo.get("ARI", 0)
-                    real = g_eval.get("real_gt", {})
-                    if isinstance(real, dict) and "AP25" in real:
-                        wb[f"train_eval_scene/{scene_id}/real_AP25_{g}"] = real["AP25"]
-                        wb[f"train_eval_scene/{scene_id}/real_AP50_{g}"] = real["AP50"]
-                        class_aware = real.get("class_aware", {})
-                        if isinstance(class_aware, dict):
-                            wb[f"train_eval_scene/{scene_id}/real_class_AP25_{g}"] = class_aware.get("AP25", 0)
-                            wb[f"train_eval_scene/{scene_id}/real_class_AP50_{g}"] = class_aware.get("AP50", 0)
-                            wb[f"train_eval_scene/{scene_id}/real_sem_mIoU_{g}"] = class_aware.get("semantic_mIoU", 0)
+                    if isinstance(g_eval, dict):
+                        _add_scene_legacy_metrics(
+                            wb,
+                            prefix="train_eval_scene",
+                            scene_id=scene_id,
+                            granularity=g,
+                            g_eval=g_eval,
+                        )
 
             wandb.log(wb)
 

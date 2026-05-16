@@ -93,9 +93,9 @@ def save_prediction_ply(
 ) -> None:
     path = Path(path)
     N = mask_logits.shape[1]
-    scores = score_logits.sigmoid().numpy()
+    scores = score_logits.detach().sigmoid().cpu().numpy()
     active = scores >= score_threshold
-    masks_binary = (mask_logits.sigmoid() >= mask_threshold).numpy()
+    masks_binary = (mask_logits.detach().sigmoid() >= mask_threshold).cpu().numpy()
 
     colors = np.full((N, 3), _UNMATCHED_COLOR, dtype=np.uint8)
     n_active = int(active.sum())
@@ -120,7 +120,7 @@ def save_gt_ply(
 ) -> None:
     path = Path(path)
     N = int(targets.supervision_mask.shape[0])
-    gt_masks = targets.gt_masks.numpy()
+    gt_masks = targets.gt_masks.detach().cpu().numpy()
 
     colors = np.full((N, 3), _UNSUPERVISED_COLOR, dtype=np.uint8)
     palette = _instance_palette(max(targets.num_instances, 1))

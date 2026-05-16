@@ -267,10 +267,11 @@ class ToyCriterion(nn.Module):
 def _stub_validate(self: MultiSceneTrainer, epoch: int) -> dict[str, object]:
     aggregate = {
         "loss_mean": max(0.0, 1.0 - 0.05 * epoch),
-        "pseudo_AP25_mean": 0.1 * epoch,
-        "pseudo_AP50_mean": 0.05 * epoch,
-        "real_AP25_mean": 0.02 * epoch,
-        "real_AP50_mean": 0.01 * epoch,
+        "pseudo_official_AP25_mean": 0.1 * epoch,
+        "pseudo_official_AP50_mean": 0.05 * epoch,
+        "pseudo_oracle_AP50_mean": 0.06 * epoch,
+        "real_full_scene_official_AP25_scannet20": 0.02 * epoch,
+        "real_full_scene_official_AP50_scannet20": 0.01 * epoch,
         "pseudo_NMI_mean": 0.0,
         "pseudo_ARI_mean": 0.0,
         "real_NMI_mean": 0.0,

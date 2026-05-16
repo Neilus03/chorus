@@ -27,7 +27,7 @@ from student.data.multi_scene_dataset import MultiSceneDataset
 from student.data.region_sampling import sphere_crop_indices_multi_center
 from student.engine.evaluator import (
     _compute_clustering_metrics,
-    _evaluate_ap_against_gt,
+    compute_legacy_best_match_recall,
     extract_proposals,
     proposals_to_labels,
 )
@@ -164,7 +164,7 @@ def evaluate_scene_fragment_merge(
                 result[g] = {"real_gt": {"error": "gt length mismatch"}, "pseudo_gt": {}}
                 continue
 
-            real_ap = _evaluate_ap_against_gt(real_gt, proposals)
+            real_legacy = compute_legacy_best_match_recall(real_gt, proposals)
             real_clustering = _compute_clustering_metrics(real_gt, merged_labels)
 
             result[g] = {
@@ -172,7 +172,7 @@ def evaluate_scene_fragment_merge(
                     "error": "skipped_in_fragment_merge_eval",
                 },
                 "real_gt": {
-                    **real_ap,
+                    **real_legacy,
                     **real_clustering,
                     "eval_benchmark": eval_benchmark,
                     "fragment_merge": True,
@@ -181,10 +181,10 @@ def evaluate_scene_fragment_merge(
                 },
             }
             log.info(
-                "  [fragment merge %s / real GT] AP25=%.3f  AP50=%.3f  NMI=%.4f  ARI=%.4f",
+                "  [fragment merge %s / real GT legacy] recall25=%.3f  recall50=%.3f  NMI=%.4f  ARI=%.4f",
                 g,
-                real_ap["AP25"],
-                real_ap["AP50"],
+                real_legacy["legacy_matched_recall25"],
+                real_legacy["legacy_matched_recall50"],
                 real_clustering["NMI"],
                 real_clustering["ARI"],
             )

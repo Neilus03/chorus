@@ -23,6 +23,10 @@ from student.data.multi_scene_dataset import MultiSceneDataset
 from student.data.target_builder import build_instance_targets_multi
 from student.engine.evaluator import evaluate_student_predictions_multi
 from student.engine.fragment_merge_eval import evaluate_scene_fragment_merge
+from student.metrics.official_instance_ap import (
+    evaluate_official_and_oracle_ap,
+    merge_ap_record_sets,
+)
 from student.metrics.pseudo_metrics import compute_pseudo_metrics_multi
 from student.models.continuous_decoder import ContinuousQueryInstanceDecoder
 
@@ -71,6 +75,26 @@ def _safe_mean(values: list[float]) -> float:
     return sum(clean) / len(clean) if clean else 0.0
 
 
+def _official_mean(values: list[float]) -> float:
+    """Mean for official AP values; all-empty/all-NaN remains undefined."""
+    clean = [float(v) for v in values if not math.isnan(float(v))]
+    return sum(clean) / len(clean) if clean else float("nan")
+
+
+def _metric_value(metrics: dict[str, Any], key: str) -> float:
+    value = metrics.get(key)
+    return float(value) if isinstance(value, Real) else float("nan")
+
+
+def _scope_from_values(scopes: list[str]) -> str:
+    clean = {str(s) for s in scopes if s}
+    if not clean:
+        return "full_scene"
+    if len(clean) == 1:
+        return next(iter(clean))
+    return "mixed"
+
+
 def _append_real(values: list[float], value: Any) -> None:
     if isinstance(value, Real):
         values.append(float(value))
@@ -83,20 +107,26 @@ def aggregate_multi_scene_results(
 ) -> dict[str, Any]:
     """Recompute aggregate metrics from per-scene evaluation outputs."""
     all_losses: list[float] = []
-    pseudo_ap25_all: list[float] = []
-    pseudo_ap50_all: list[float] = []
+    pseudo_legacy_recall25_all: list[float] = []
+    pseudo_legacy_recall50_all: list[float] = []
     pseudo_nmi_all: list[float] = []
     pseudo_ari_all: list[float] = []
     # Real GT metrics can be stored either as a legacy single dict (`real_gt`)
     # or as a dict of benchmark→metrics (`real_gt_by_benchmark`).
-    real_ap25_by_bench: dict[str, list[float]] = {}
-    real_ap50_by_bench: dict[str, list[float]] = {}
+    real_legacy_recall25_by_bench: dict[str, list[float]] = {}
+    real_legacy_recall50_by_bench: dict[str, list[float]] = {}
+    real_matched_iou_by_bench: dict[str, list[float]] = {}
     real_nmi_by_bench: dict[str, list[float]] = {}
     real_ari_by_bench: dict[str, list[float]] = {}
     real_class_ap25_by_bench: dict[str, list[float]] = {}
     real_class_ap50_by_bench: dict[str, list[float]] = {}
     real_sem_miou_by_bench: dict[str, list[float]] = {}
     matched_iou_by_gran: dict[str, list[float]] = {g: [] for g in granularities}
+    pseudo_records_by_gran: dict[str, list[dict[str, Any]]] = {g: [] for g in granularities}
+    pseudo_scope_by_gran: dict[str, list[str]] = {g: [] for g in granularities}
+    real_records_by_bench_gran: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    real_class_records_by_bench_gran: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    real_scope_by_bench_gran: dict[str, dict[str, list[str]]] = {}
 
     for scene_data in per_scene.values():
         _append_real(all_losses, scene_data.get("loss"))
@@ -121,26 +151,50 @@ def aggregate_multi_scene_results(
                 continue
 
             pseudo = g_eval.get("pseudo_gt", {})
-            if isinstance(pseudo, dict) and "AP25" in pseudo and "AP50" in pseudo:
-                _append_real(pseudo_ap25_all, pseudo.get("AP25"))
-                _append_real(pseudo_ap50_all, pseudo.get("AP50"))
+            if isinstance(pseudo, dict):
+                _append_real(
+                    pseudo_legacy_recall25_all,
+                    pseudo.get("legacy_matched_recall25"),
+                )
+                _append_real(
+                    pseudo_legacy_recall50_all,
+                    pseudo.get("legacy_matched_recall50"),
+                )
                 _append_real(pseudo_nmi_all, pseudo.get("NMI"))
                 _append_real(pseudo_ari_all, pseudo.get("ARI"))
+                records = pseudo.get("official_records")
+                if isinstance(records, dict):
+                    pseudo_records_by_gran[g].append(records)
+                    pseudo_scope_by_gran[g].append(str(g_eval.get("eval_scope", "full_scene")))
 
             real_by = g_eval.get("real_gt_by_benchmark", None)
             if isinstance(real_by, dict):
                 for bench, real in real_by.items():
                     if not isinstance(real, dict):
                         continue
-                    if "AP25" in real and "AP50" in real:
-                        real_ap25_by_bench.setdefault(str(bench), [])
-                        real_ap50_by_bench.setdefault(str(bench), [])
+                    if "legacy_matched_recall25" in real and "legacy_matched_recall50" in real:
+                        real_legacy_recall25_by_bench.setdefault(str(bench), [])
+                        real_legacy_recall50_by_bench.setdefault(str(bench), [])
+                        real_matched_iou_by_bench.setdefault(str(bench), [])
                         real_nmi_by_bench.setdefault(str(bench), [])
                         real_ari_by_bench.setdefault(str(bench), [])
-                        _append_real(real_ap25_by_bench[str(bench)], real.get("AP25"))
-                        _append_real(real_ap50_by_bench[str(bench)], real.get("AP50"))
+                        _append_real(
+                            real_legacy_recall25_by_bench[str(bench)],
+                            real.get("legacy_matched_recall25"),
+                        )
+                        _append_real(
+                            real_legacy_recall50_by_bench[str(bench)],
+                            real.get("legacy_matched_recall50"),
+                        )
+                        _append_real(real_matched_iou_by_bench[str(bench)], real.get("matched_mean_iou"))
                         _append_real(real_nmi_by_bench[str(bench)], real.get("NMI"))
                         _append_real(real_ari_by_bench[str(bench)], real.get("ARI"))
+                        records = real.get("official_records")
+                        if isinstance(records, dict):
+                            real_records_by_bench_gran.setdefault(str(bench), {}).setdefault(g, []).append(records)
+                            real_scope_by_bench_gran.setdefault(str(bench), {}).setdefault(g, []).append(
+                                str(g_eval.get("eval_scope", "full_scene"))
+                            )
                         class_aware = real.get("class_aware", {})
                         if isinstance(class_aware, dict):
                             real_class_ap25_by_bench.setdefault(str(bench), [])
@@ -152,33 +206,72 @@ def aggregate_multi_scene_results(
                                 real_sem_miou_by_bench[str(bench)],
                                 class_aware.get("semantic_mIoU"),
                             )
+                            class_records = class_aware.get("official_records")
+                            if isinstance(class_records, dict):
+                                real_class_records_by_bench_gran.setdefault(str(bench), {}).setdefault(g, []).append(class_records)
                 continue
 
             # Legacy fallback: single real_gt dict
             real = g_eval.get("real_gt", {})
-            if isinstance(real, dict) and "AP25" in real and "AP50" in real:
+            if isinstance(real, dict) and "legacy_matched_recall25" in real and "legacy_matched_recall50" in real:
                 bench = str(real.get("eval_benchmark", "unknown"))
-                real_ap25_by_bench.setdefault(bench, [])
-                real_ap50_by_bench.setdefault(bench, [])
+                real_legacy_recall25_by_bench.setdefault(bench, [])
+                real_legacy_recall50_by_bench.setdefault(bench, [])
+                real_matched_iou_by_bench.setdefault(bench, [])
                 real_nmi_by_bench.setdefault(bench, [])
                 real_ari_by_bench.setdefault(bench, [])
-                _append_real(real_ap25_by_bench[bench], real.get("AP25"))
-                _append_real(real_ap50_by_bench[bench], real.get("AP50"))
+                _append_real(real_legacy_recall25_by_bench[bench], real.get("legacy_matched_recall25"))
+                _append_real(real_legacy_recall50_by_bench[bench], real.get("legacy_matched_recall50"))
+                _append_real(real_matched_iou_by_bench[bench], real.get("matched_mean_iou"))
                 _append_real(real_nmi_by_bench[bench], real.get("NMI"))
                 _append_real(real_ari_by_bench[bench], real.get("ARI"))
+                records = real.get("official_records")
+                if isinstance(records, dict):
+                    real_records_by_bench_gran.setdefault(bench, {}).setdefault(g, []).append(records)
+                    real_scope_by_bench_gran.setdefault(bench, {}).setdefault(g, []).append(
+                        str(g_eval.get("eval_scope", "full_scene"))
+                    )
 
     aggregate: dict[str, Any] = {
         "loss_mean": _safe_mean(all_losses),
-        "pseudo_AP25_mean": _safe_mean(pseudo_ap25_all),
-        "pseudo_AP50_mean": _safe_mean(pseudo_ap50_all),
+        "legacy_pseudo_matched_recall25_mean": _safe_mean(pseudo_legacy_recall25_all),
+        "legacy_pseudo_matched_recall50_mean": _safe_mean(pseudo_legacy_recall50_all),
         "pseudo_NMI_mean": _safe_mean(pseudo_nmi_all),
         "pseudo_ARI_mean": _safe_mean(pseudo_ari_all),
     }
 
+    pseudo_ap: list[float] = []
+    pseudo_ap50: list[float] = []
+    pseudo_ap25: list[float] = []
+    pseudo_oracle_ap50: list[float] = []
+    for g in granularities:
+        record_sets = pseudo_records_by_gran.get(g, [])
+        if not record_sets:
+            continue
+        records = merge_ap_record_sets(record_sets)
+        metrics = evaluate_official_and_oracle_ap(records)
+        aggregate[f"pseudo_{g}_official_AP"] = _metric_value(metrics, "AP")
+        aggregate[f"pseudo_{g}_official_AP50"] = _metric_value(metrics, "AP50")
+        aggregate[f"pseudo_{g}_official_AP25"] = _metric_value(metrics, "AP25")
+        aggregate[f"pseudo_{g}_oracle_AP50"] = _metric_value(metrics, "oracle_AP50")
+        aggregate[f"pseudo_{g}_official_total_gt"] = int(metrics.get("total_gt_instances", 0))
+        aggregate[f"pseudo_{g}_official_num_predictions"] = int(metrics.get("num_predictions", 0))
+        aggregate[f"pseudo_{g}_eval_scope"] = _scope_from_values(pseudo_scope_by_gran.get(g, []))
+        pseudo_ap.append(_metric_value(metrics, "AP"))
+        pseudo_ap50.append(_metric_value(metrics, "AP50"))
+        pseudo_ap25.append(_metric_value(metrics, "AP25"))
+        pseudo_oracle_ap50.append(_metric_value(metrics, "oracle_AP50"))
+
+    aggregate["pseudo_official_AP_mean"] = _official_mean(pseudo_ap)
+    aggregate["pseudo_official_AP50_mean"] = _official_mean(pseudo_ap50)
+    aggregate["pseudo_official_AP25_mean"] = _official_mean(pseudo_ap25)
+    aggregate["pseudo_oracle_AP50_mean"] = _official_mean(pseudo_oracle_ap50)
+
     # Per-benchmark real GT aggregates (no primary)
-    for bench in sorted(real_ap25_by_bench):
-        aggregate[f"real_AP25_mean_{bench}"] = _safe_mean(real_ap25_by_bench[bench])
-        aggregate[f"real_AP50_mean_{bench}"] = _safe_mean(real_ap50_by_bench.get(bench, []))
+    for bench in sorted(real_legacy_recall25_by_bench):
+        aggregate[f"legacy_matched_recall25_{bench}"] = _safe_mean(real_legacy_recall25_by_bench[bench])
+        aggregate[f"legacy_matched_recall50_{bench}"] = _safe_mean(real_legacy_recall50_by_bench.get(bench, []))
+        aggregate[f"matched_mean_iou_{bench}"] = _safe_mean(real_matched_iou_by_bench.get(bench, []))
         aggregate[f"real_NMI_mean_{bench}"] = _safe_mean(real_nmi_by_bench.get(bench, []))
         aggregate[f"real_ARI_mean_{bench}"] = _safe_mean(real_ari_by_bench.get(bench, []))
         if real_class_ap25_by_bench.get(bench):
@@ -193,6 +286,70 @@ def aggregate_multi_scene_results(
             aggregate[f"real_sem_mIoU_mean_{bench}"] = _safe_mean(
                 real_sem_miou_by_bench[bench]
             )
+
+    for bench, by_gran in sorted(real_records_by_bench_gran.items()):
+        per_g_ap: list[float] = []
+        per_g_ap50: list[float] = []
+        per_g_ap25: list[float] = []
+        per_g_oracle_ap50: list[float] = []
+        scopes: list[str] = []
+        for g in granularities:
+            record_sets = by_gran.get(g, [])
+            if not record_sets:
+                continue
+            records = merge_ap_record_sets(record_sets)
+            metrics = evaluate_official_and_oracle_ap(records)
+            scope = _scope_from_values(
+                real_scope_by_bench_gran.get(bench, {}).get(g, [])
+            )
+            scopes.append(scope)
+            aggregate[f"real_{g}_{scope}_official_AP_{bench}"] = _metric_value(metrics, "AP")
+            aggregate[f"real_{g}_{scope}_official_AP50_{bench}"] = _metric_value(metrics, "AP50")
+            aggregate[f"real_{g}_{scope}_official_AP25_{bench}"] = _metric_value(metrics, "AP25")
+            aggregate[f"real_{g}_{scope}_oracle_AP50_{bench}"] = _metric_value(metrics, "oracle_AP50")
+            aggregate[f"real_{g}_{scope}_official_total_gt_{bench}"] = int(metrics.get("total_gt_instances", 0))
+            aggregate[f"real_{g}_{scope}_official_num_predictions_{bench}"] = int(metrics.get("num_predictions", 0))
+            per_g_ap.append(_metric_value(metrics, "AP"))
+            per_g_ap50.append(_metric_value(metrics, "AP50"))
+            per_g_ap25.append(_metric_value(metrics, "AP25"))
+            per_g_oracle_ap50.append(_metric_value(metrics, "oracle_AP50"))
+
+        scope = _scope_from_values(scopes)
+        aggregate[f"real_{scope}_official_AP_{bench}"] = _official_mean(per_g_ap)
+        aggregate[f"real_{scope}_official_AP50_{bench}"] = _official_mean(per_g_ap50)
+        aggregate[f"real_{scope}_official_AP25_{bench}"] = _official_mean(per_g_ap25)
+        aggregate[f"real_{scope}_oracle_AP50_{bench}"] = _official_mean(per_g_oracle_ap50)
+
+    for bench, by_gran in sorted(real_class_records_by_bench_gran.items()):
+        per_g_ap: list[float] = []
+        per_g_ap50: list[float] = []
+        per_g_ap25: list[float] = []
+        per_g_oracle_ap50: list[float] = []
+        scopes: list[str] = []
+        for g in granularities:
+            record_sets = by_gran.get(g, [])
+            if not record_sets:
+                continue
+            records = merge_ap_record_sets(record_sets)
+            metrics = evaluate_official_and_oracle_ap(records)
+            scope = _scope_from_values(
+                real_scope_by_bench_gran.get(bench, {}).get(g, [])
+            )
+            scopes.append(scope)
+            per_g_ap.append(_metric_value(metrics, "AP"))
+            per_g_ap50.append(_metric_value(metrics, "AP50"))
+            per_g_ap25.append(_metric_value(metrics, "AP25"))
+            per_g_oracle_ap50.append(_metric_value(metrics, "oracle_AP50"))
+            aggregate[f"real_class_{g}_{scope}_official_AP_{bench}"] = _metric_value(metrics, "AP")
+            aggregate[f"real_class_{g}_{scope}_official_AP50_{bench}"] = _metric_value(metrics, "AP50")
+            aggregate[f"real_class_{g}_{scope}_official_AP25_{bench}"] = _metric_value(metrics, "AP25")
+            aggregate[f"real_class_{g}_{scope}_oracle_AP50_{bench}"] = _metric_value(metrics, "oracle_AP50")
+        if per_g_ap50:
+            scope = _scope_from_values(scopes)
+            aggregate[f"real_class_{scope}_official_AP_{bench}"] = _official_mean(per_g_ap)
+            aggregate[f"real_class_{scope}_official_AP50_{bench}"] = _official_mean(per_g_ap50)
+            aggregate[f"real_class_{scope}_official_AP25_{bench}"] = _official_mean(per_g_ap25)
+            aggregate[f"real_class_{scope}_oracle_AP50_{bench}"] = _official_mean(per_g_oracle_ap50)
 
     all_iou_values: list[float] = []
     for g in granularities:

@@ -58,6 +58,23 @@ def sigmoid_dice_loss(
     return 1.0 - (2.0 * intersection + eps) / (cardinality + eps)
 
 
+def soft_iou_score_target(
+    mask_logits: torch.Tensor,
+    gt_masks: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Soft mask IoU target for score supervision.
+
+    Inputs are already sliced to the supervised point universe.  The returned
+    target is detached by callers before it is used in the score loss.
+    """
+    pred_prob = mask_logits.sigmoid()
+    gt_float = gt_masks.float()
+    intersection = (pred_prob * gt_float).sum(dim=1)
+    union = (pred_prob + gt_float - pred_prob * gt_float).sum(dim=1)
+    return intersection / union.clamp_min(eps)
+
+
 # ── pairwise cost matrix ────────────────────────────────────────────────
 
 
@@ -201,6 +218,10 @@ class MaskSetCriterion(nn.Module):
     cost_bce_weight / cost_dice_weight:
         Weights used inside the matching cost matrix (can differ from
         the loss weights).
+    score_target_mode:
+        ``"binary"`` keeps the legacy objectness target: matched queries are 1,
+        unmatched queries are 0.  ``"iou"`` trains matched query scores to
+        predict detached soft mask IoU against their assigned target.
     """
 
     def __init__(
@@ -213,8 +234,14 @@ class MaskSetCriterion(nn.Module):
         class_weight: float = 0.0,
         no_object_weight: float = 0.1,
         cost_class_weight: float = 0.0,
+        score_target_mode: str = "binary",
     ) -> None:
         super().__init__()
+        score_target_mode = str(score_target_mode).strip().lower()
+        if score_target_mode not in {"binary", "iou"}:
+            raise ValueError(
+                f"score_target_mode must be 'binary' or 'iou', got {score_target_mode!r}"
+            )
         self.bce_weight = bce_weight
         self.dice_weight = dice_weight
         self.score_weight = score_weight
@@ -223,6 +250,7 @@ class MaskSetCriterion(nn.Module):
         self.class_weight = class_weight
         self.no_object_weight = no_object_weight
         self.cost_class_weight = cost_class_weight
+        self.score_target_mode = score_target_mode
 
     def forward(
         self,
@@ -326,10 +354,42 @@ class MaskSetCriterion(nn.Module):
             loss_mask_dice = mask_logits.sum() * 0.0
 
         # ── score loss ──
-        score_targets = torch.zeros(Q, device=score_logits.device)
-        score_targets[pred_idx_t] = 1.0
+        score_targets = torch.zeros(
+            Q,
+            device=score_logits.device,
+            dtype=score_logits.dtype,
+        )
+        if len(pred_idx) > 0:
+            if self.score_target_mode == "binary":
+                matched_score_targets = torch.ones(
+                    len(pred_idx),
+                    device=score_logits.device,
+                    dtype=score_logits.dtype,
+                )
+            else:
+                matched_score_targets = soft_iou_score_target(
+                    matched_pred,
+                    matched_gt,
+                ).detach().to(dtype=score_logits.dtype)
+            score_targets[pred_idx_t] = matched_score_targets
+        else:
+            matched_score_targets = score_logits.new_zeros((0,))
         loss_score = F.binary_cross_entropy_with_logits(
             score_logits, score_targets, reduction="mean",
+        )
+        if matched_score_targets.numel() > 0:
+            score_target_mean_matched = matched_score_targets.mean()
+            score_target_max_matched = matched_score_targets.max()
+            score_target_min_matched = matched_score_targets.min()
+        else:
+            score_target_mean_matched = score_logits.new_tensor(0.0)
+            score_target_max_matched = score_logits.new_tensor(0.0)
+            score_target_min_matched = score_logits.new_tensor(0.0)
+        score_target_mean_all = (
+            score_targets.mean() if score_targets.numel() else score_logits.new_tensor(0.0)
+        )
+        num_score_targets_positive = (score_targets > 0).sum().to(
+            dtype=score_logits.dtype,
         )
 
         # ── class/no-object loss (Mask3D-style, optional) ──
@@ -374,6 +434,12 @@ class MaskSetCriterion(nn.Module):
             "loss_mask_dice": loss_mask_dice.detach(),
             "loss_score": loss_score.detach(),
             "loss_class": loss_class.detach(),
+            "score_target_mean_matched": score_target_mean_matched.detach(),
+            "score_target_max_matched": score_target_max_matched.detach(),
+            "score_target_min_matched": score_target_min_matched.detach(),
+            "score_target_mean_all": score_target_mean_all.detach(),
+            "num_score_targets_positive": num_score_targets_positive.detach(),
+            "score_target_mode": self.score_target_mode,
             "num_matches": len(pred_idx),
             "matched_pred_indices": pred_idx,
             "matched_gt_indices": gt_idx,

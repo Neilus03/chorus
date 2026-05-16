@@ -359,26 +359,38 @@ class SingleSceneTrainer:
                         wb_full: dict[str, Any] = {"step": self.step}
                         for g, eval_g in last_full_eval.items():
                             pseudo = eval_g.get("pseudo_gt", {})
-                            if isinstance(pseudo, dict) and "AP25" in pseudo:
-                                wb_full[f"eval/pseudo_AP25_{g}"] = pseudo["AP25"]
-                                wb_full[f"eval/pseudo_AP50_{g}"] = pseudo["AP50"]
+                            if isinstance(pseudo, dict) and "legacy_matched_recall25" in pseudo:
+                                wb_full[f"eval/pseudo_legacy_matched_recall25_{g}"] = pseudo[
+                                    "legacy_matched_recall25"
+                                ]
+                                wb_full[f"eval/pseudo_legacy_matched_recall50_{g}"] = pseudo[
+                                    "legacy_matched_recall50"
+                                ]
                                 wb_full[f"eval/pseudo_NMI_{g}"] = pseudo.get("NMI", 0)
                                 wb_full[f"eval/pseudo_ARI_{g}"] = pseudo.get("ARI", 0)
                             real_by = eval_g.get("real_gt_by_benchmark", None)
                             if isinstance(real_by, dict):
                                 for bench, real in real_by.items():
-                                    if isinstance(real, dict) and "AP25" in real:
+                                    if isinstance(real, dict) and "legacy_matched_recall25" in real:
                                         b = str(bench)
-                                        wb_full[f"eval/real_AP25_{g}_{b}"] = real["AP25"]
-                                        wb_full[f"eval/real_AP50_{g}_{b}"] = real["AP50"]
+                                        wb_full[f"eval/real_legacy_matched_recall25_{g}_{b}"] = real[
+                                            "legacy_matched_recall25"
+                                        ]
+                                        wb_full[f"eval/real_legacy_matched_recall50_{g}_{b}"] = real[
+                                            "legacy_matched_recall50"
+                                        ]
                                         wb_full[f"eval/real_NMI_{g}_{b}"] = real.get("NMI", 0)
                                         wb_full[f"eval/real_ARI_{g}_{b}"] = real.get("ARI", 0)
                             else:
                                 real = eval_g.get("real_gt", {})
-                                if isinstance(real, dict) and "AP25" in real:
+                                if isinstance(real, dict) and "legacy_matched_recall25" in real:
                                     b = str(real.get("eval_benchmark", "unknown"))
-                                    wb_full[f"eval/real_AP25_{g}_{b}"] = real["AP25"]
-                                    wb_full[f"eval/real_AP50_{g}_{b}"] = real["AP50"]
+                                    wb_full[f"eval/real_legacy_matched_recall25_{g}_{b}"] = real[
+                                        "legacy_matched_recall25"
+                                    ]
+                                    wb_full[f"eval/real_legacy_matched_recall50_{g}_{b}"] = real[
+                                        "legacy_matched_recall50"
+                                    ]
                                     wb_full[f"eval/real_NMI_{g}_{b}"] = real.get("NMI", 0)
                                     wb_full[f"eval/real_ARI_{g}_{b}"] = real.get("ARI", 0)
                             wb_full[f"eval/num_proposals_{g}"] = eval_g.get("num_proposals", 0)

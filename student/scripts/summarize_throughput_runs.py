@@ -113,8 +113,13 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "warm_optim_ms_mean": warm.get("warm_optim_ms_mean"),
         "warm_metrics_sync_ms_mean": warm.get("warm_metrics_sync_ms_mean"),
         "val_loss_mean": agg.get("loss_mean"),
-        "val_pseudo_AP50_mean": agg.get("pseudo_AP50_mean"),
-        "val_real_AP50_mean": agg.get("real_AP50_mean"),
+        "val_pseudo_official_AP50_mean": agg.get("pseudo_official_AP50_mean"),
+        "val_real_full_scene_official_AP50_scannet20": agg.get(
+            "real_full_scene_official_AP50_scannet20"
+        ),
+        "val_real_full_scene_official_AP50_scannet200": agg.get(
+            "real_full_scene_official_AP50_scannet200"
+        ),
         "val_matched_mean_iou_mean": agg.get("matched_mean_iou_mean"),
         "total_training_time_s": final_summary.get("total_training_time_s"),
     }

@@ -2,7 +2,7 @@
 #
 # This run uses ScanNet20 semantic labels only to filter valid GT instances in
 # the ScanNet loader. The model predicts objectness + masks, not semantic
-# classes, and evaluation/reporting should use class-agnostic real_AP metrics.
+# classes, and evaluation/reporting should use class-agnostic official AP metrics.
 #
 # Launch from repo root after `mkdir -p student/logs`:
 #   sbatch student/scripts/run_multi_scene_full_scannet_ft_gt.sbatch \
@@ -59,6 +59,7 @@ loss:
   bce_weight: 1.0
   dice_weight: 1.0
   score_weight: 0.5
+  score_target_mode: iou
   class_weight: 0.0
   cost_class_weight: 0.0
   aux_weight: 0.2
@@ -76,7 +77,7 @@ train:
   save_every_epochs: 10
   log_every_steps: 50
   warmup_epochs: 15
-  best_val_metric: real_AP50_mean_scannet20
+  best_val_metric: real_full_scene_official_AP50_scannet20
   prompt_finetune:
     enabled: true
     init_g: 0.5

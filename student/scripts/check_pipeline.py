@@ -299,6 +299,7 @@ def main() -> None:
         bce_weight=loss_cfg.get("bce_weight", 1.0),
         dice_weight=loss_cfg.get("dice_weight", 1.0),
         score_weight=loss_cfg.get("score_weight", 0.5),
+        score_target_mode=loss_cfg.get("score_target_mode", "binary"),
     )
     gran_weights = loss_cfg.get("granularity_weights", None)
     criterion = MultiGranCriterion(

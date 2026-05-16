@@ -1,10 +1,8 @@
 """End-of-training evaluation for the student model.
 
-Computes AP25/AP50, NMI, ARI against:
+Builds compact official-AP records plus legacy matched-recall diagnostics for:
   1. Real ScanNet ground truth (if available)
   2. CHORUS pseudo-labels (from training pack)
-
-Reuses evaluation logic from the CHORUS codebase.
 """
 
 from __future__ import annotations
@@ -18,6 +16,10 @@ import numpy as np
 import torch
 
 from student.data.target_builder import InstanceTargets
+from student.metrics.official_instance_ap import (
+    SCANNET_MIN_REGION_SIZE,
+    build_instance_ap_records,
+)
 
 log = logging.getLogger(__name__)
 
@@ -150,38 +152,66 @@ def proposals_to_labels(
     return labels
 
 
-# ── AP evaluation (reuses CHORUS logic) ──────────────────────────────────
+# ── legacy best-match recall diagnostics ─────────────────────────────────
+
+
+def compute_legacy_best_match_recall(
+    gt_ids: np.ndarray,
+    proposals: list[np.ndarray],
+    *,
+    thresholds: tuple[float, ...] = (0.25, 0.50),
+) -> dict[str, Any]:
+    """Recall-like old metric: fraction of GT with any proposal above IoU.
+
+    This is kept only as a diagnostic. It is not average precision: prediction
+    scores are ignored and duplicate predictions are not false positives.
+    """
+    gt_local = np.asarray(gt_ids, dtype=np.int64)
+    gt_instances = [int(x) for x in np.unique(gt_local) if int(x) > 0]
+    gt_masks = {gt_id: gt_local == gt_id for gt_id in gt_instances}
+    gt_sizes = {gt_id: int(mask.sum()) for gt_id, mask in gt_masks.items()}
+    prop_masks = [np.asarray(p, dtype=bool) for p in proposals]
+    prop_sizes = [int(p.sum()) for p in prop_masks]
+
+    matched_by_threshold: dict[float, int] = {float(t): 0 for t in thresholds}
+    best_ious: list[float] = []
+    for gt_id in gt_instances:
+        gt_mask = gt_masks[gt_id]
+        best_iou = 0.0
+        for prop_mask, prop_size in zip(prop_masks, prop_sizes):
+            inter = int(np.logical_and(prop_mask, gt_mask).sum())
+            if inter <= 0:
+                continue
+            union = prop_size + gt_sizes[gt_id] - inter
+            iou = float(inter / union) if union > 0 else 0.0
+            if iou > best_iou:
+                best_iou = iou
+        best_ious.append(best_iou)
+        for threshold in thresholds:
+            if best_iou >= float(threshold):
+                matched_by_threshold[float(threshold)] += 1
+
+    total_gt = len(gt_instances)
+    recall25 = matched_by_threshold.get(0.25, 0) / max(total_gt, 1)
+    recall50 = matched_by_threshold.get(0.50, 0) / max(total_gt, 1)
+
+    return {
+        "legacy_matched_recall25": float(recall25),
+        "legacy_matched_recall50": float(recall50),
+        "legacy_best_match_recall25": float(recall25),
+        "legacy_best_match_recall50": float(recall50),
+        "matched_mean_iou": float(np.mean(best_ious)) if best_ious else 0.0,
+        "total_gt_instances": total_gt,
+        "legacy_note": "best-match GT recall; scores and duplicate false positives are ignored",
+    }
 
 
 def _evaluate_ap_against_gt(
     gt_ids: np.ndarray,
     proposals: list[np.ndarray],
 ) -> dict[str, Any]:
-    """Compute AP25/AP50 by size bucket + overall, using CHORUS oracle eval."""
-    _ensure_chorus_importable()
-    from chorus.eval.scannet_oracle import evaluate_oracle_ap
-
-    bucket_results = evaluate_oracle_ap(gt_ids, proposals, thresholds=(0.25, 0.50))
-
-    all_ap25 = []
-    all_ap50 = []
-    total_gt = 0
-    for bucket_name, vals in bucket_results.items():
-        count = vals.get("Count", 0)
-        total_gt += count
-        if count > 0:
-            all_ap25.append(vals["AP25"] * count)
-            all_ap50.append(vals["AP50"] * count)
-
-    overall_ap25 = sum(all_ap25) / max(total_gt, 1)
-    overall_ap50 = sum(all_ap50) / max(total_gt, 1)
-
-    return {
-        "AP25": overall_ap25,
-        "AP50": overall_ap50,
-        "total_gt_instances": total_gt,
-        "by_bucket": bucket_results,
-    }
+    """Backward-compatible alias for the old recall-like diagnostic."""
+    return compute_legacy_best_match_recall(gt_ids, proposals)
 
 
 def _instance_masks_and_classes(
@@ -448,8 +478,8 @@ def evaluate_student_predictions(
     """Full evaluation of student predictions.
 
     Computes metrics against:
-      - Real ScanNet GT (AP25, AP50, NMI, ARI)
-      - CHORUS pseudo-GT (AP25, AP50, NMI, ARI)
+      - Real ScanNet GT (official-AP records, legacy recall, NMI, ARI)
+      - CHORUS pseudo-GT (official-AP records, legacy recall, NMI, ARI)
 
     Parameters
     ----------
@@ -471,6 +501,13 @@ def evaluate_student_predictions(
         min_points=min_points,
         return_stats=True,
     )
+    official_proposals, official_scores, official_query_idx, official_proposal_stats = extract_proposals(
+        mask_logits, score_logits,
+        score_threshold=0.0,
+        mask_threshold=mask_threshold,
+        min_points=min_points,
+        return_stats=True,
+    )
     N = mask_logits.shape[1]
     pred_labels = proposals_to_labels(proposals, N)
 
@@ -481,11 +518,18 @@ def evaluate_student_predictions(
             score_threshold if class_score_threshold is None else class_score_threshold
         ),
         "mask_threshold": mask_threshold,
+        "official_score_threshold": 0.0,
+        "official_num_proposals": official_proposal_stats["num_proposals"],
+        "eval_scope": "crop" if vertex_indices is not None else "full_scene",
     }
 
     class_proposals: list[np.ndarray] = []
     class_scores = np.zeros(0, dtype=np.float32)
     class_ids = np.zeros(0, dtype=np.int64)
+    official_class_proposals: list[np.ndarray] = []
+    official_class_scores = np.zeros(0, dtype=np.float32)
+    official_class_ids = np.zeros(0, dtype=np.int64)
+    official_class_query_idx = np.zeros(0, dtype=np.int64)
     if class_logits_cpu is not None:
         class_proposals, class_scores, class_ids, _ = extract_class_aware_proposals(
             mask_logits,
@@ -497,15 +541,38 @@ def evaluate_student_predictions(
             min_points=min_points,
         )
         result["num_class_proposals"] = len(class_proposals)
+        (
+            official_class_proposals,
+            official_class_scores,
+            official_class_ids,
+            official_class_query_idx,
+        ) = extract_class_aware_proposals(
+            mask_logits,
+            class_logits_cpu,
+            class_score_threshold=0.0,
+            mask_threshold=mask_threshold,
+            min_points=min_points,
+        )
+        result["official_num_class_proposals"] = len(official_class_proposals)
 
     # ── 1. evaluate against pseudo-GT ──
     pseudo_gt_ids = _build_pseudo_gt_ids(targets)
-    pseudo_ap = _evaluate_ap_against_gt(pseudo_gt_ids, proposals)
+    pseudo_legacy = compute_legacy_best_match_recall(pseudo_gt_ids, proposals)
     pseudo_clustering = _compute_clustering_metrics(pseudo_gt_ids, pred_labels)
+    pseudo_official_records = build_instance_ap_records(
+        scene_id=scene_id,
+        gt_ids=pseudo_gt_ids,
+        proposals=official_proposals,
+        scores=official_scores,
+        query_indices=official_query_idx,
+        class_agnostic=True,
+        eval_mask=targets.supervision_mask.detach().cpu().numpy(),
+    )
 
     result["pseudo_gt"] = {
-        **pseudo_ap,
+        **pseudo_legacy,
         **pseudo_clustering,
+        "official_records": pseudo_official_records,
     }
     pseudo_class_map = _pseudo_instance_class_map(targets)
     if class_logits_cpu is not None and pseudo_class_map is not None:
@@ -525,10 +592,10 @@ def evaluate_student_predictions(
         proposal_stats["min_points_per_proposal"],
     )
     log.info(
-        "  [pseudo-GT] AP25=%.3f  AP50=%.3f  NMI=%.4f  ARI=%.4f  (%d GT instances)",
-        pseudo_ap["AP25"], pseudo_ap["AP50"],
+        "  [pseudo-GT legacy] recall25=%.3f  recall50=%.3f  NMI=%.4f  ARI=%.4f  (%d GT instances)",
+        pseudo_legacy["legacy_matched_recall25"], pseudo_legacy["legacy_matched_recall50"],
         pseudo_clustering["NMI"], pseudo_clustering["ARI"],
-        pseudo_ap["total_gt_instances"],
+        pseudo_legacy["total_gt_instances"],
     )
 
     # ── 2. evaluate against real ScanNet GT (optionally multiple benchmarks) ──
@@ -589,11 +656,22 @@ def evaluate_student_predictions(
                     real_by_benchmark[bench] = {"error": real_gt_error, "eval_benchmark": bench}
                     continue
 
-                real_ap = _evaluate_ap_against_gt(real_gt_local, proposals)
+                real_legacy = compute_legacy_best_match_recall(real_gt_local, proposals)
                 real_clustering = _compute_clustering_metrics(real_gt_local, pred_labels)
+                real_official_records = build_instance_ap_records(
+                    scene_id=scene_id,
+                    gt_ids=real_gt_local,
+                    proposals=official_proposals,
+                    scores=official_scores,
+                    query_indices=official_query_idx,
+                    class_agnostic=True,
+                    min_valid_gt_points=SCANNET_MIN_REGION_SIZE,
+                    min_valid_pred_points=SCANNET_MIN_REGION_SIZE,
+                )
                 real_by_benchmark[bench] = {
-                    **real_ap,
+                    **real_legacy,
                     **real_clustering,
+                    "official_records": real_official_records,
                     "eval_benchmark": bench,
                 }
                 if class_logits_cpu is not None and real_instances is not None:
@@ -612,18 +690,30 @@ def evaluate_student_predictions(
                         class_ids,
                         num_classes=int(class_logits_cpu.shape[-1] - 1),
                     )
+                    class_ap["official_records"] = build_instance_ap_records(
+                        scene_id=scene_id,
+                        gt_ids=real_gt_local,
+                        proposals=official_class_proposals,
+                        scores=official_class_scores,
+                        query_indices=official_class_query_idx,
+                        class_agnostic=False,
+                        gt_instance_class_ids=real_instances.instance_class_ids,
+                        pred_class_ids=official_class_ids,
+                        min_valid_gt_points=SCANNET_MIN_REGION_SIZE,
+                        min_valid_pred_points=SCANNET_MIN_REGION_SIZE,
+                    )
                     real_by_benchmark[bench]["class_aware"] = class_ap
                 log.info(
-                    "  [real GT %s] AP25=%.3f  AP50=%.3f  NMI=%.4f  ARI=%.4f  (%d GT instances)",
+                    "  [real GT %s legacy] recall25=%.3f  recall50=%.3f  NMI=%.4f  ARI=%.4f  (%d GT instances)",
                     bench,
-                    real_ap["AP25"], real_ap["AP50"],
+                    real_legacy["legacy_matched_recall25"], real_legacy["legacy_matched_recall50"],
                     real_clustering["NMI"], real_clustering["ARI"],
-                    real_ap["total_gt_instances"],
+                    real_legacy["total_gt_instances"],
                 )
                 if "class_aware" in real_by_benchmark[bench]:
                     ca = real_by_benchmark[bench]["class_aware"]
                     log.info(
-                        "  [real GT %s class-aware] AP25=%.3f  AP50=%.3f  sem_mIoU=%.3f  (%d predictions)",
+                        "  [real GT %s class-aware scene] AP25=%.3f  AP50=%.3f  sem_mIoU=%.3f  (%d predictions)",
                         bench,
                         ca["AP25"],
                         ca["AP50"],

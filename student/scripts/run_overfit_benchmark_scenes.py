@@ -144,8 +144,8 @@ def _extract_metrics_summary(metrics: dict[str, Any]) -> dict[str, Any]:
             continue
         pg = ev[g].get("pseudo_gt") or {}
         rg = ev[g].get("real_gt") or {}
-        out[f"pseudo_AP25_{g}"] = pg.get("AP25")
-        out[f"real_AP25_{g}"] = rg.get("AP25")
+        out[f"pseudo_legacy_matched_recall25_{g}"] = pg.get("legacy_matched_recall25")
+        out[f"real_legacy_matched_recall25_{g}"] = rg.get("legacy_matched_recall25")
     return out
 
 

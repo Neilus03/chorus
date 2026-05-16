@@ -322,6 +322,18 @@ def _candidate_scannet_metadata_roots() -> list[Path]:
     if env_root:
         candidates.append(Path(os.path.expanduser(os.path.expandvars(env_root))).resolve())
 
+    litept_root = os.environ.get("LITEPT_ROOT")
+    if litept_root:
+        candidates.append(
+            (
+                Path(os.path.expanduser(os.path.expandvars(litept_root)))
+                / "datasets"
+                / "preprocessing"
+                / "scannet"
+                / "meta_data"
+            ).resolve()
+        )
+
     # --- Search the current working directory ---
     candidates.append(Path.cwd().resolve())
 
@@ -344,11 +356,17 @@ def _candidate_scannet_metadata_roots() -> list[Path]:
     return unique_candidates
 
 
+def _has_readable_scannet_labels(candidate: Path) -> bool:
+    labels_path = candidate / "scannetv2-labels.combined.tsv"
+    try:
+        return labels_path.is_file() and os.access(labels_path, os.R_OK)
+    except OSError:
+        return False
+
+
 def resolve_scannet_metadata_root() -> Path:
     for candidate in _candidate_scannet_metadata_roots():
-        labels_path = candidate / "scannetv2-labels.combined.tsv"
-        # --- Check for read permission (os.R_OK), not just existence ---
-        if labels_path.exists() and os.access(labels_path, os.R_OK):
+        if _has_readable_scannet_labels(candidate):
             return candidate
 
     searched = "\n".join(f"  - {candidate}" for candidate in _candidate_scannet_metadata_roots())
