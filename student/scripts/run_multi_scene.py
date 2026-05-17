@@ -563,6 +563,9 @@ def main() -> None:
             no_object_weight=loss_cfg.get("no_object_weight", 0.1),
             cost_class_weight=loss_cfg.get("cost_class_weight", 0.0),
             score_target_mode=loss_cfg.get("score_target_mode", "binary"),
+            score_loss_balance_mode=loss_cfg.get("score_loss_balance_mode", "none"),
+            score_pos_weight=loss_cfg.get("score_pos_weight", 1.0),
+            score_neg_weight=loss_cfg.get("score_neg_weight", 1.0),
         )
         gran_weights = loss_cfg.get("granularity_weights", None)
         aux_weight = float(loss_cfg.get("aux_weight", 0.0))

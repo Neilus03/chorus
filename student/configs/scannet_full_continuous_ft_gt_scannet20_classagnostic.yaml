@@ -60,6 +60,9 @@ loss:
   dice_weight: 1.0
   score_weight: 0.5
   score_target_mode: iou
+  score_loss_balance_mode: pos_neg_balanced
+  score_pos_weight: 1.0
+  score_neg_weight: 2.0
   class_weight: 0.0
   cost_class_weight: 0.0
   aux_weight: 0.2
@@ -97,7 +100,7 @@ train:
 eval:
   scannet_benchmark: scannet20
   scannet_benchmarks: ["scannet20"]
-  score_threshold: 0.01
+  score_threshold: 0.1
   mask_threshold: 0.5
   min_points_per_proposal: 30
   fragment_merge_eval: false

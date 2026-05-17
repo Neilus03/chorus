@@ -41,10 +41,58 @@ def test_binary_score_target_mode_keeps_legacy_targets() -> None:
         reduction="mean",
     )
     torch.testing.assert_close(result["loss_score"], expected)
+    assert result["score_loss_balance_mode"] == "none"
+    torch.testing.assert_close(
+        result["score_loss_pos"],
+        F.binary_cross_entropy_with_logits(score_logits[:1], torch.tensor([1.0])),
+    )
+    torch.testing.assert_close(
+        result["score_loss_neg"],
+        F.binary_cross_entropy_with_logits(score_logits[1:], torch.tensor([0.0])),
+    )
     assert result["score_target_mean_matched"].item() == 1.0
     assert result["score_target_max_matched"].item() == 1.0
     assert result["score_target_min_matched"].item() == 1.0
     assert result["score_target_mean_all"].item() == 0.5
+    assert result["num_score_targets_positive"].item() == 1.0
+
+
+def test_pos_neg_balanced_score_loss_uses_separate_means() -> None:
+    targets = _targets([1, 1])
+    mask_logits = torch.tensor(
+        [
+            [20.0, 20.0],
+            [-20.0, -20.0],
+            [-20.0, -20.0],
+        ]
+    )
+    score_logits = torch.tensor([0.7, -0.2, -1.0])
+    criterion = MaskSetCriterion(
+        bce_weight=0.0,
+        dice_weight=0.0,
+        score_weight=1.0,
+        score_target_mode="binary",
+        score_loss_balance_mode="pos_neg_balanced",
+        score_pos_weight=2.0,
+        score_neg_weight=0.5,
+    )
+
+    result = criterion({"mask_logits": mask_logits, "score_logits": score_logits}, targets)
+
+    pos_expected = F.binary_cross_entropy_with_logits(
+        score_logits[:1],
+        torch.tensor([1.0]),
+        reduction="mean",
+    )
+    neg_expected = F.binary_cross_entropy_with_logits(
+        score_logits[1:],
+        torch.zeros(2),
+        reduction="mean",
+    )
+    torch.testing.assert_close(result["score_loss_pos"], pos_expected)
+    torch.testing.assert_close(result["score_loss_neg"], neg_expected)
+    torch.testing.assert_close(result["loss_score"], 2.0 * pos_expected + 0.5 * neg_expected)
+    assert result["score_loss_balance_mode"] == "pos_neg_balanced"
     assert result["num_score_targets_positive"].item() == 1.0
 
 
@@ -120,6 +168,7 @@ def test_iou_score_target_is_detached_from_mask_logits() -> None:
         dice_weight=0.0,
         score_weight=1.0,
         score_target_mode="iou",
+        score_loss_balance_mode="pos_neg_balanced",
     )
 
     result = criterion({"mask_logits": mask_logits, "score_logits": score_logits}, targets)
@@ -129,6 +178,62 @@ def test_iou_score_target_is_detached_from_mask_logits() -> None:
     assert torch.any(score_logits.grad.abs() > 0)
     if mask_logits.grad is not None:
         torch.testing.assert_close(mask_logits.grad, torch.zeros_like(mask_logits.grad))
+
+
+def test_pos_neg_balanced_score_loss_handles_no_positive_queries() -> None:
+    targets = _targets([-1, -1])
+    mask_logits = torch.tensor(
+        [
+            [0.3, -0.2],
+            [-0.4, 0.1],
+        ]
+    )
+    score_logits = torch.tensor([0.5, -0.5])
+    criterion = MaskSetCriterion(
+        bce_weight=0.0,
+        dice_weight=0.0,
+        score_weight=1.0,
+        score_loss_balance_mode="pos_neg_balanced",
+    )
+
+    result = criterion({"mask_logits": mask_logits, "score_logits": score_logits}, targets)
+
+    neg_expected = F.binary_cross_entropy_with_logits(
+        score_logits,
+        torch.zeros_like(score_logits),
+        reduction="mean",
+    )
+    assert torch.isfinite(result["loss_score"])
+    torch.testing.assert_close(result["score_loss_pos"], torch.tensor(0.0))
+    torch.testing.assert_close(result["score_loss_neg"], neg_expected)
+    torch.testing.assert_close(result["loss_score"], neg_expected)
+    assert result["num_score_targets_positive"].item() == 0.0
+
+
+def test_pos_neg_balanced_score_loss_handles_no_negative_queries() -> None:
+    targets = _targets([1, 1])
+    mask_logits = torch.tensor([[20.0, 20.0]])
+    score_logits = torch.tensor([0.5])
+    criterion = MaskSetCriterion(
+        bce_weight=0.0,
+        dice_weight=0.0,
+        score_weight=1.0,
+        score_target_mode="binary",
+        score_loss_balance_mode="pos_neg_balanced",
+    )
+
+    result = criterion({"mask_logits": mask_logits, "score_logits": score_logits}, targets)
+
+    pos_expected = F.binary_cross_entropy_with_logits(
+        score_logits,
+        torch.ones_like(score_logits),
+        reduction="mean",
+    )
+    assert torch.isfinite(result["loss_score"])
+    torch.testing.assert_close(result["score_loss_pos"], pos_expected)
+    torch.testing.assert_close(result["score_loss_neg"], torch.tensor(0.0))
+    torch.testing.assert_close(result["loss_score"], pos_expected)
+    assert result["num_score_targets_positive"].item() == 1.0
 
 
 def test_multigran_criterion_preserves_score_target_diagnostics() -> None:
@@ -155,6 +260,8 @@ def test_multigran_criterion_preserves_score_target_diagnostics() -> None:
     assert torch.isfinite(result["loss_total"])
     assert result["heads"]["g02"]["score_target_mean_matched"].item() > 0.99
     assert 0.1 < result["heads"]["g05"]["score_target_mean_matched"].item() < 0.9
+    assert "score_loss_pos" in result["heads"]["g02"]
+    assert result["heads"]["g02"]["score_loss_balance_mode"] == "none"
 
 
 def test_singlegran_criterion_preserves_score_target_diagnostics() -> None:
@@ -173,3 +280,5 @@ def test_singlegran_criterion_preserves_score_target_diagnostics() -> None:
     assert torch.isfinite(result["loss_total"])
     assert result["score_target_mean_matched"].item() > 0.99
     assert result["score_target_mean_all"].item() < result["score_target_mean_matched"].item()
+    assert "score_logits_mean_matched" in result
+    assert result["score_loss_balance_mode"] == "none"

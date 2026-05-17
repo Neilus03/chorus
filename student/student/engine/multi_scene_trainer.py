@@ -63,6 +63,16 @@ _SCORE_TARGET_DIAGNOSTIC_KEYS = (
     "score_target_min_matched",
     "score_target_mean_all",
     "num_score_targets_positive",
+    "score_loss_pos",
+    "score_loss_neg",
+    "score_logits_mean_matched",
+    "score_logits_mean_unmatched",
+    "score_prob_mean_matched",
+    "score_prob_mean_unmatched",
+)
+
+_SCORE_TARGET_TEXT_DIAGNOSTIC_KEYS = (
+    "score_loss_balance_mode",
 )
 
 
@@ -90,6 +100,9 @@ def _maybe_stack_mean(values: list[torch.Tensor]) -> torch.Tensor | None:
 
 def _copy_score_target_diagnostics(dst: dict[str, Any], src: dict[str, Any]) -> None:
     for key in _SCORE_TARGET_DIAGNOSTIC_KEYS:
+        if key in src:
+            dst[key] = src[key]
+    for key in _SCORE_TARGET_TEXT_DIAGNOSTIC_KEYS:
         if key in src:
             dst[key] = src[key]
 
@@ -860,6 +873,12 @@ class MultiSceneTrainer:
                 mean_value = _maybe_stack_mean(values)
                 if mean_value is not None:
                     result["heads"][g][key] = mean_value
+            for key in _SCORE_TARGET_TEXT_DIAGNOSTIC_KEYS:
+                for scene_result in scene_results:
+                    value = scene_result["heads"][g].get(key)
+                    if value is not None:
+                        result["heads"][g][key] = value
+                        break
 
         aux_values = [x["loss_aux"] for x in scene_results if "loss_aux" in x]
         if aux_values:
@@ -984,6 +1003,12 @@ class MultiSceneTrainer:
             mean_value = _maybe_stack_mean(values)
             if mean_value is not None:
                 result["heads"][sampled_g_key][key] = mean_value
+        for key in _SCORE_TARGET_TEXT_DIAGNOSTIC_KEYS:
+            for scene_result in scene_results:
+                value = scene_result.get(key)
+                if value is not None:
+                    result["heads"][sampled_g_key][key] = value
+                    break
         aux_values = [r["loss_aux"] for r in scene_results if "loss_aux" in r]
         if aux_values:
             result["loss_aux"] = torch.stack(aux_values).mean()
@@ -1472,6 +1497,7 @@ class MultiSceneTrainer:
                         row["learned_granularity"] = step_metrics["learned_granularity"]
                     for g in active_grans:
                         if f"loss_{g}" in step_metrics:
+                            ld_g = loss_result.get("heads", {}).get(g, {})
                             row[f"loss_{g}"] = step_metrics[f"loss_{g}"]
                             row[f"loss_mask_bce_{g}"] = step_metrics[f"loss_mask_bce_{g}"]
                             row[f"loss_mask_dice_{g}"] = step_metrics[f"loss_mask_dice_{g}"]
@@ -1482,6 +1508,9 @@ class MultiSceneTrainer:
                                 metric_key = f"{key}_{g}"
                                 if metric_key in step_metrics:
                                     row[metric_key] = step_metrics[metric_key]
+                            for key in _SCORE_TARGET_TEXT_DIAGNOSTIC_KEYS:
+                                if key in ld_g:
+                                    row[f"{key}_{g}"] = ld_g[key]
                     if "loss_aux" in step_metrics:
                         row["loss_aux"] = step_metrics["loss_aux"]
                     self._log_row(row)
