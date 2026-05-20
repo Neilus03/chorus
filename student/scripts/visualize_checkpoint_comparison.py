@@ -39,7 +39,7 @@ from student.data.multi_scene_dataset import MultiSceneDataset, build_scene_list
 from student.data.target_builder import InstanceTargets, build_instance_targets_multi
 from student.engine.evaluator import evaluate_student_predictions_multi
 from student.engine.vis import _recolor_mesh, _resolve_source_mesh, save_gt_ply
-from student.models.continuous_decoder import ContinuousQueryInstanceDecoder
+from student.models.continuous_base import is_continuous_decoder
 from student.models.finetune_wrapper import FineTuningWrapper
 from student.models.student_model import build_student_model
 
@@ -96,6 +96,7 @@ def _build_base_model(cfg: dict[str, Any], granularities: tuple[str, ...]) -> to
             if bool(model_cfg.get("class_aware_instance", False))
             else None
         ),
+        continuous_decoder_v2=model_cfg.get("continuous_decoder_v2", None),
     )
 
 
@@ -173,7 +174,7 @@ def _predict_multihead(
     with torch.no_grad():
         if isinstance(model, FineTuningWrapper):
             flat = model(points, features)
-        elif isinstance(getattr(model, "decoder", None), ContinuousQueryInstanceDecoder):
+        elif is_continuous_decoder(getattr(model, "decoder", None)):
             flat = model(points, features, target_g=_gran_key_to_float(granularity))
         else:
             pred = model(points, features)

@@ -37,6 +37,7 @@ from student.config_utils import (
 )
 from student.data.multi_scene_dataset import MultiSceneDataset, build_scene_list
 from student.losses import (
+    ContinuousGeometryCriterion,
     MaskSetCriterion,
     MultiGranCriterion,
     SingleGranCriterion,
@@ -491,8 +492,11 @@ def main() -> None:
         else:
             raise TypeError("train.prompt_finetune must be a bool or mapping")
         if prompt_ft_enabled:
-            if decoder_type != "continuous":
-                raise ValueError("train.prompt_finetune.enabled requires model.decoder_type=continuous")
+            if decoder_type not in {"continuous", "continuous_v2"}:
+                raise ValueError(
+                    "train.prompt_finetune.enabled requires "
+                    "model.decoder_type=continuous or continuous_v2"
+                )
             if len(granularities) != 1:
                 raise ValueError(
                     "Prompt fine-tuning uses one real-GT target scale; set "
@@ -522,6 +526,7 @@ def main() -> None:
                 if bool(model_cfg.get("class_aware_instance", False))
                 else None
             ),
+            continuous_decoder_v2=model_cfg.get("continuous_decoder_v2", None),
         )
         if prompt_ft_enabled:
             init_g = float(prompt_ft_cfg.get("init_g", 0.5))
@@ -548,7 +553,12 @@ def main() -> None:
                 prompt_backbone_lr_scale,
             )
         total_params = sum(p.numel() for p in model.parameters())
-        log.info("Model: %s params (%d heads)", f"{total_params:,}", len(granularities))
+        log.info(
+            "Model: %s params (%d granularities, %d attention heads)",
+            f"{total_params:,}",
+            len(granularities),
+            int(model_cfg.get("num_decoder_heads", 8)),
+        )
         if args.print_model:
             for line in str(model).splitlines():
                 log.info("%s", line)
@@ -566,6 +576,9 @@ def main() -> None:
             score_loss_balance_mode=loss_cfg.get("score_loss_balance_mode", "none"),
             score_pos_weight=loss_cfg.get("score_pos_weight", 1.0),
             score_neg_weight=loss_cfg.get("score_neg_weight", 1.0),
+            score_unmatched_target_mode=loss_cfg.get("score_unmatched_target_mode", "zero"),
+            score_unmatched_iou_weight=loss_cfg.get("score_unmatched_iou_weight", 0.25),
+            score_unmatched_iou_cap=loss_cfg.get("score_unmatched_iou_cap", 0.25),
         )
         gran_weights = loss_cfg.get("granularity_weights", None)
         aux_weight = float(loss_cfg.get("aux_weight", 0.0))
@@ -574,6 +587,14 @@ def main() -> None:
                 base_criterion,
                 aux_weight=aux_weight,
                 granularity_weights=gran_weights,
+            )
+        elif decoder_type == "continuous_v2":
+            v2_loss_cfg = loss_cfg.get("continuous_v2", {}) or {}
+            criterion = ContinuousGeometryCriterion(
+                base_criterion,
+                aux_weight=aux_weight,
+                granularity_weights=gran_weights,
+                center_weight=float(v2_loss_cfg.get("center_weight", 0.05)),
             )
         else:
             criterion = MultiGranCriterion(
@@ -701,6 +722,12 @@ def main() -> None:
             fragment_merge_seed=int(eval_cfg.get("fragment_merge_seed", seed)),
             prompt_finetune=prompt_ft_enabled,
             prompt_target_granularity=granularities[0] if prompt_ft_enabled else None,
+            anchor_refinement_warmup_epochs=int(
+                train_cfg.get("anchor_refinement_warmup_epochs", 0)
+            ),
+            anchor_refinement_warmup_start_scale=float(
+                train_cfg.get("anchor_refinement_warmup_start_scale", 0.0)
+            ),
             num_workers=int(train_cfg.get("num_workers", 0)),
             log_every_steps=int(train_cfg.get("log_every_steps", 1)),
             batch_scenes_per_step=int(train_cfg.get("batch_scenes_per_step", 1)),
@@ -731,6 +758,49 @@ def main() -> None:
 
         if args.finetune_from:
             loaded_checkpoint_path = Path(args.finetune_from)
+            if (
+                decoder_type == "continuous_v2"
+                and not bool(model_cfg.get("allow_partial_decoder_load", False))
+            ):
+                try:
+                    probe = torch.load(
+                        loaded_checkpoint_path,
+                        map_location="cpu",
+                        weights_only=False,
+                    )
+                except TypeError:
+                    probe = torch.load(loaded_checkpoint_path, map_location="cpu")
+                saved_cfg = probe.get("config", {}) if isinstance(probe, dict) else {}
+                saved_decoder_type = (
+                    ((saved_cfg.get("model") or {}).get("decoder_type"))
+                    if isinstance(saved_cfg, dict)
+                    else None
+                )
+                state = probe.get("model_state_dict", probe) if isinstance(probe, dict) else {}
+                state_keys = set(state.keys()) if isinstance(state, dict) else set()
+                has_v2_signature = any(
+                    key.startswith("decoder.granularity_encoder.")
+                    or key.startswith("model.decoder.granularity_encoder.")
+                    for key in state_keys
+                )
+                has_v1_signature = any(
+                    key.startswith("decoder.granularity_mlp.")
+                    or key.startswith("model.decoder.granularity_mlp.")
+                    for key in state_keys
+                )
+                if saved_decoder_type != "continuous_v2" and not has_v2_signature:
+                    signature = (
+                        "V1 continuous decoder signature"
+                        if has_v1_signature
+                        else f"saved decoder_type={saved_decoder_type!r}"
+                    )
+                    raise ValueError(
+                        "Refusing to load a non-V2 decoder checkpoint into "
+                        "model.decoder_type=continuous_v2 without an explicit "
+                        "partial-load implementation. "
+                        f"Checkpoint appears to have {signature}. "
+                        "Use a continuous_v2 checkpoint or initialize V2 fresh."
+                    )
             trainer.load_weights_only(
                 loaded_checkpoint_path,
                 strict=not bool(model_cfg.get("class_aware_instance", False)),

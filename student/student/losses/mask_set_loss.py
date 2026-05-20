@@ -75,6 +75,40 @@ def soft_iou_score_target(
     return intersection / union.clamp_min(eps)
 
 
+@torch.no_grad()
+def unmatched_soft_iou_score_targets(
+    mask_logits: torch.Tensor,
+    gt_masks: torch.Tensor,
+    supervision_mask: torch.Tensor,
+    unmatched_mask: torch.Tensor,
+    *,
+    weight: float = 0.25,
+    cap: float = 0.25,
+    gt_chunk_size: int = 32,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Small soft score targets for unmatched queries that overlap any GT."""
+    unmatched_idx = unmatched_mask.nonzero(as_tuple=False).flatten()
+    if unmatched_idx.numel() == 0 or gt_masks.shape[0] == 0:
+        return mask_logits.new_zeros((int(unmatched_idx.numel()),))
+    supervised = supervision_mask.bool()
+    if int(supervised.sum().item()) == 0:
+        return mask_logits.new_zeros((int(unmatched_idx.numel()),))
+
+    pred_prob = mask_logits[unmatched_idx][:, supervised].sigmoid().float()
+    gt_sup = gt_masks[:, supervised].float()
+    pred_sum = pred_prob.sum(dim=1, keepdim=True)
+    max_iou = pred_prob.new_zeros((pred_prob.shape[0],))
+    chunk = max(int(gt_chunk_size), 1)
+    for start in range(0, int(gt_sup.shape[0]), chunk):
+        gt_chunk = gt_sup[start:start + chunk]
+        inter = pred_prob @ gt_chunk.T
+        gt_sum = gt_chunk.sum(dim=1).view(1, -1)
+        union = pred_sum + gt_sum - inter
+        max_iou = torch.maximum(max_iou, (inter / union.clamp_min(eps)).max(dim=1).values)
+    return (max_iou * float(weight)).clamp(max=float(cap)).to(dtype=mask_logits.dtype)
+
+
 # ── pairwise cost matrix ────────────────────────────────────────────────
 
 
@@ -226,6 +260,10 @@ class MaskSetCriterion(nn.Module):
         ``"none"`` keeps the legacy score BCE reduction over all queries.
         ``"pos_neg_balanced"`` averages matched and unmatched query BCE terms
         separately before applying ``score_pos_weight`` / ``score_neg_weight``.
+    score_unmatched_target_mode:
+        ``"zero"`` keeps unmatched query targets at 0. ``"soft_iou"`` assigns a
+        small detached IoU-proportional target to unmatched duplicate/partial
+        proposals, reducing the pressure to push every non-Hungarian query to 0.
     """
 
     def __init__(
@@ -242,6 +280,9 @@ class MaskSetCriterion(nn.Module):
         score_loss_balance_mode: str = "none",
         score_pos_weight: float = 1.0,
         score_neg_weight: float = 1.0,
+        score_unmatched_target_mode: str = "zero",
+        score_unmatched_iou_weight: float = 0.25,
+        score_unmatched_iou_cap: float = 0.25,
     ) -> None:
         super().__init__()
         score_target_mode = str(score_target_mode).strip().lower()
@@ -255,6 +296,12 @@ class MaskSetCriterion(nn.Module):
                 "score_loss_balance_mode must be 'none' or 'pos_neg_balanced', "
                 f"got {score_loss_balance_mode!r}"
             )
+        score_unmatched_target_mode = str(score_unmatched_target_mode).strip().lower()
+        if score_unmatched_target_mode not in {"zero", "soft_iou"}:
+            raise ValueError(
+                "score_unmatched_target_mode must be 'zero' or 'soft_iou', "
+                f"got {score_unmatched_target_mode!r}"
+            )
         self.bce_weight = bce_weight
         self.dice_weight = dice_weight
         self.score_weight = score_weight
@@ -267,6 +314,9 @@ class MaskSetCriterion(nn.Module):
         self.score_loss_balance_mode = score_loss_balance_mode
         self.score_pos_weight = float(score_pos_weight)
         self.score_neg_weight = float(score_neg_weight)
+        self.score_unmatched_target_mode = score_unmatched_target_mode
+        self.score_unmatched_iou_weight = float(score_unmatched_iou_weight)
+        self.score_unmatched_iou_cap = float(score_unmatched_iou_cap)
 
     def forward(
         self,
@@ -393,6 +443,20 @@ class MaskSetCriterion(nn.Module):
         else:
             matched_score_targets = score_logits.new_zeros((0,))
         score_negative_mask = ~score_positive_mask
+        if self.score_unmatched_target_mode == "soft_iou" and score_negative_mask.any():
+            unmatched_score_targets = unmatched_soft_iou_score_targets(
+                mask_logits,
+                gt_masks,
+                supervision_mask,
+                score_negative_mask,
+                weight=self.score_unmatched_iou_weight,
+                cap=self.score_unmatched_iou_cap,
+            )
+            score_targets[score_negative_mask] = unmatched_score_targets
+        elif score_negative_mask.any():
+            unmatched_score_targets = score_targets[score_negative_mask]
+        else:
+            unmatched_score_targets = score_logits.new_zeros((0,))
         score_bce_per_query = F.binary_cross_entropy_with_logits(
             score_logits, score_targets, reduction="none",
         )
@@ -429,9 +493,15 @@ class MaskSetCriterion(nn.Module):
         if score_negative_mask.any():
             score_logits_mean_unmatched = score_logits[score_negative_mask].mean()
             score_prob_mean_unmatched = score_logits[score_negative_mask].sigmoid().mean()
+            score_target_mean_unmatched = unmatched_score_targets.mean()
+            score_target_max_unmatched = unmatched_score_targets.max()
+            score_target_min_unmatched = unmatched_score_targets.min()
         else:
             score_logits_mean_unmatched = score_logits.new_tensor(0.0)
             score_prob_mean_unmatched = score_logits.new_tensor(0.0)
+            score_target_mean_unmatched = score_logits.new_tensor(0.0)
+            score_target_max_unmatched = score_logits.new_tensor(0.0)
+            score_target_min_unmatched = score_logits.new_tensor(0.0)
         score_target_mean_all = (
             score_targets.mean() if score_targets.numel() else score_logits.new_tensor(0.0)
         )
@@ -484,6 +554,9 @@ class MaskSetCriterion(nn.Module):
             "score_target_mean_matched": score_target_mean_matched.detach(),
             "score_target_max_matched": score_target_max_matched.detach(),
             "score_target_min_matched": score_target_min_matched.detach(),
+            "score_target_mean_unmatched": score_target_mean_unmatched.detach(),
+            "score_target_max_unmatched": score_target_max_unmatched.detach(),
+            "score_target_min_unmatched": score_target_min_unmatched.detach(),
             "score_target_mean_all": score_target_mean_all.detach(),
             "num_score_targets_positive": num_score_targets_positive.detach(),
             "score_loss_pos": score_loss_pos.detach(),
@@ -494,6 +567,7 @@ class MaskSetCriterion(nn.Module):
             "score_prob_mean_matched": score_prob_mean_matched.detach(),
             "score_prob_mean_unmatched": score_prob_mean_unmatched.detach(),
             "score_target_mode": self.score_target_mode,
+            "score_unmatched_target_mode": self.score_unmatched_target_mode,
             "num_matches": len(pred_idx),
             "matched_pred_indices": pred_idx,
             "matched_gt_indices": gt_idx,

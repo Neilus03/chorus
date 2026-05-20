@@ -13,9 +13,11 @@ import torch
 import torch.nn as nn
 
 from student.data.batched_scene_batch import split_tensor_by_offsets
+from student.models.continuous_base import is_continuous_decoder
 from student.models.litept_wrapper import LitePTBackbone, LitePTBackboneOutput
 from student.models.instance_decoder import MultiHeadQueryInstanceDecoder
 from student.models.continuous_decoder import ContinuousQueryInstanceDecoder
+from student.models.continuous_decoder_v2 import ContinuousGeometryQueryDecoderV2
 
 
 class StudentInstanceSegModel(nn.Module):
@@ -35,12 +37,16 @@ class StudentInstanceSegModel(nn.Module):
     def __init__(
         self,
         backbone: LitePTBackbone,
-        decoder: MultiHeadQueryInstanceDecoder | ContinuousQueryInstanceDecoder,
+        decoder: (
+            MultiHeadQueryInstanceDecoder
+            | ContinuousQueryInstanceDecoder
+            | ContinuousGeometryQueryDecoderV2
+        ),
     ) -> None:
         super().__init__()
         self.backbone = backbone
         self.decoder = decoder
-        self._continuous = isinstance(decoder, ContinuousQueryInstanceDecoder)
+        self._continuous = is_continuous_decoder(decoder)
 
     @property
     def out_channels(self) -> int:
@@ -166,6 +172,7 @@ def build_student_model(
     multi_scale_indices: list[int] | None = None,
     decoder_type: str = "multi_head",
     num_instance_classes: int | None = None,
+    continuous_decoder_v2: dict | None = None,
 ) -> StudentInstanceSegModel:
     """Convenience factory from scalar config values.
 
@@ -195,6 +202,7 @@ def build_student_model(
     decoder_type:
         ``"multi_head"`` (default) — discrete per-granularity heads.
         ``"continuous"`` — single-head with continuous granularity conditioning.
+        ``"continuous_v2"`` — geometry-query continuous decoder V2.
     """
     backbone = LitePTBackbone(
         litept_root=litept_root,
@@ -214,7 +222,11 @@ def build_student_model(
         effective_ratio = learned_query_ratio
 
     if decoder_type == "continuous":
-        decoder: MultiHeadQueryInstanceDecoder | ContinuousQueryInstanceDecoder = (
+        decoder: (
+            MultiHeadQueryInstanceDecoder
+            | ContinuousQueryInstanceDecoder
+            | ContinuousGeometryQueryDecoderV2
+        ) = (
             ContinuousQueryInstanceDecoder(
                 in_channels=backbone.out_channels,
                 hidden_dim=hidden_dim,
@@ -226,6 +238,19 @@ def build_student_model(
                 multi_scale_channels=backbone.multi_scale_channels,
                 num_instance_classes=num_instance_classes,
             )
+        )
+    elif decoder_type == "continuous_v2":
+        decoder = ContinuousGeometryQueryDecoderV2(
+            in_channels=backbone.out_channels,
+            hidden_dim=hidden_dim,
+            num_queries=num_queries,
+            num_layers=num_decoder_layers,
+            num_heads=num_decoder_heads,
+            learned_ratio=effective_ratio,
+            use_positional_guidance=use_positional_guidance,
+            multi_scale_channels=backbone.multi_scale_channels,
+            num_instance_classes=num_instance_classes,
+            continuous_v2_cfg=continuous_decoder_v2,
         )
     elif decoder_type == "multi_head":
         if num_queries_by_granularity:
@@ -250,7 +275,8 @@ def build_student_model(
         )
     else:
         raise ValueError(
-            f"Unknown decoder_type={decoder_type!r}; expected 'multi_head' or 'continuous'"
+            f"Unknown decoder_type={decoder_type!r}; expected 'multi_head', "
+            "'continuous', or 'continuous_v2'"
         )
 
     return StudentInstanceSegModel(backbone=backbone, decoder=decoder)

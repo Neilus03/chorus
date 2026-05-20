@@ -220,12 +220,14 @@ def main() -> None:
         learned_query_ratio=model_cfg.get("learned_query_ratio", 0.25),
         multi_scale=bb_cfg.get("multi_scale", False),
         multi_scale_indices=bb_cfg.get("multi_scale_indices", None),
+        decoder_type=model_cfg.get("decoder_type", "multi_head"),
+        continuous_decoder_v2=model_cfg.get("continuous_decoder_v2", None),
     ).to(device)
     print(f"  built in {time.time() - t0:.2f}s")
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  total params     : {total_params:,}")
     print(f"  backbone out_ch  : {model.backbone.out_channels}")
-    print(f"  num_queries      : {model.decoder.num_queries_per_head}")
+    print(f"  num_queries      : {getattr(model.decoder, 'num_queries_per_head', model.decoder.num_queries)}")
     print(f"  decoder layers   : {len(model.decoder.layers)}")
 
     # ── 7. Forward + cache invalidation ──────────────────────────

@@ -4,9 +4,10 @@ Replaces :class:`SingleSceneTrainer` for multi-scene experiments.
 Reuses existing criterion, evaluator, and metric functions — only
 the training loop structure changes.
 
-Supports two decoder modes:
+Supports decoder modes:
   - ``"multi_head"`` — discrete per-granularity heads (original)
   - ``"continuous"`` — single-head with continuous granularity conditioning
+  - ``"continuous_v2"`` — geometry-query continuous granularity conditioning
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import random
 import statistics
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import torch
 import torch.nn as nn
@@ -45,7 +46,7 @@ from student.engine.multi_scene_evaluator import (
     evaluate_multi_scene,
 )
 from student.losses.mask_set_loss import MultiGranCriterion, SingleGranCriterion
-from student.models.continuous_decoder import ContinuousQueryInstanceDecoder
+from student.models.continuous_base import is_continuous_decoder
 from student.models.finetune_wrapper import FineTuningWrapper
 
 log = logging.getLogger(__name__)
@@ -61,6 +62,9 @@ _SCORE_TARGET_DIAGNOSTIC_KEYS = (
     "score_target_mean_matched",
     "score_target_max_matched",
     "score_target_min_matched",
+    "score_target_mean_unmatched",
+    "score_target_max_unmatched",
+    "score_target_min_unmatched",
     "score_target_mean_all",
     "num_score_targets_positive",
     "score_loss_pos",
@@ -73,6 +77,41 @@ _SCORE_TARGET_DIAGNOSTIC_KEYS = (
 
 _SCORE_TARGET_TEXT_DIAGNOSTIC_KEYS = (
     "score_loss_balance_mode",
+    "score_unmatched_target_mode",
+)
+
+_GEOMETRY_DIAGNOSTIC_KEYS = (
+    "loss_center",
+    "center_error_mean",
+    "loss_center_aux",
+)
+
+_DECODER_DIAGNOSTIC_KEYS = (
+    "query_anchor_xyz_mean",
+    "query_anchor_xyz_std",
+    "query_anchor_xyz_min",
+    "query_anchor_xyz_max",
+    "query_delta_xyz_raw_mean",
+    "query_delta_xyz_raw_max",
+    "query_delta_xyz_mean",
+    "query_delta_xyz_max",
+    "query_delta_step_norm_mean",
+    "query_delta_step_norm_max",
+    "query_anchor_in_scene_ratio",
+    "anchor_refinement_scale",
+    "head_logit_scale_raw",
+    "head_logit_scale",
+    "query_radius_mean",
+    "query_radius_min",
+    "query_radius_max",
+    "local_neighbor_count_mean",
+    "local_neighbor_count_min",
+    "local_neighbor_count_max",
+    "local_neighbor_zero_frac",
+    "scale_selector_weight_level_0",
+    "scale_selector_weight_level_1",
+    "scale_selector_weight_level_2",
+    "scale_selector_weight_level_3",
 )
 
 
@@ -105,6 +144,18 @@ def _copy_score_target_diagnostics(dst: dict[str, Any], src: dict[str, Any]) -> 
     for key in _SCORE_TARGET_TEXT_DIAGNOSTIC_KEYS:
         if key in src:
             dst[key] = src[key]
+
+
+def _copy_geometry_diagnostics(dst: dict[str, Any], src: dict[str, Any]) -> None:
+    for key in _GEOMETRY_DIAGNOSTIC_KEYS:
+        if key in src:
+            dst[key] = src[key]
+    decoder_diagnostics = src.get("decoder_diagnostics")
+    if isinstance(decoder_diagnostics, dict):
+        for key in _DECODER_DIAGNOSTIC_KEYS:
+            value = decoder_diagnostics.get(key)
+            if isinstance(value, torch.Tensor) and value.numel() == 1:
+                dst[key] = value.detach()
 
 
 def _format_aggregate_bits(
@@ -359,6 +410,8 @@ class MultiSceneTrainer:
         fragment_merge_seed: int = 0,
         prompt_finetune: bool = False,
         prompt_target_granularity: str | None = None,
+        anchor_refinement_warmup_epochs: int = 0,
+        anchor_refinement_warmup_start_scale: float = 0.0,
     ) -> None:
         self.device = device
         self.lr = lr
@@ -423,10 +476,13 @@ class MultiSceneTrainer:
             if prompt_target_granularity is not None
             else (granularities[0] if granularities else None)
         )
+        self.anchor_refinement_warmup_epochs = max(int(anchor_refinement_warmup_epochs), 0)
+        self.anchor_refinement_warmup_start_scale = float(anchor_refinement_warmup_start_scale)
+        self._last_anchor_refinement_scale: float | None = None
 
         # Detect continuous decoder mode
         base_decoder = getattr(_unwrap_prompt_model(model), "decoder", None)
-        self._continuous = isinstance(base_decoder, ContinuousQueryInstanceDecoder)
+        self._continuous = is_continuous_decoder(base_decoder)
         if self.prompt_finetune:
             if not isinstance(model, FineTuningWrapper):
                 raise TypeError("prompt_finetune=True requires model to be FineTuningWrapper")
@@ -582,6 +638,41 @@ class MultiSceneTrainer:
     def _sync_device(self) -> None:
         if str(self.device).startswith("cuda"):
             torch.cuda.synchronize(self.device)
+
+    def _grad_norm(self, parameters: Iterable[torch.nn.Parameter]) -> float:
+        sq_sum = 0.0
+        for param in parameters:
+            if param.grad is None:
+                continue
+            grad = param.grad.detach()
+            sq_sum += float(torch.sum(grad.float() * grad.float()).item())
+        return math.sqrt(sq_sum)
+
+    def _set_anchor_refinement_scale(self, epoch: int) -> float:
+        scale = 1.0
+        if self.anchor_refinement_warmup_epochs > 0:
+            progress = min(
+                max((int(epoch) - 1) / float(self.anchor_refinement_warmup_epochs), 0.0),
+                1.0,
+            )
+            start = self.anchor_refinement_warmup_start_scale
+            scale = start + (1.0 - start) * progress
+            scale = max(0.0, min(1.0, scale))
+
+        base_model = self._base_model_module()
+        decoder = getattr(base_model, "decoder", None)
+        if decoder is not None and hasattr(decoder, "set_anchor_refinement_scale"):
+            decoder.set_anchor_refinement_scale(scale)
+            if (
+                self.is_main_process
+                and (
+                    self._last_anchor_refinement_scale is None
+                    or abs(scale - self._last_anchor_refinement_scale) > 1e-6
+                )
+            ):
+                log.info("Anchor refinement scale: %.3f", scale)
+            self._last_anchor_refinement_scale = scale
+        return scale
 
     def _gather_scene_ids(self, scene_ids: list[str]) -> list[list[str]]:
         if not self.distributed:
@@ -949,6 +1040,8 @@ class MultiSceneTrainer:
             scene_loss = self.criterion(
                 scene_pred, targets_g, context=ctx, granularity_key=sampled_g_key,
             )
+            if isinstance(scene_pred, dict) and isinstance(scene_pred.get("diagnostics"), dict):
+                scene_loss["decoder_diagnostics"] = scene_pred["diagnostics"]
             scene_results.append(scene_loss)
 
         def _head_loss_total(r: dict[str, Any]) -> torch.Tensor:
@@ -968,6 +1061,7 @@ class MultiSceneTrainer:
                 "loss_class": result.get("loss_class", result["loss_score"] * 0.0),
             }}
             _copy_score_target_diagnostics(result["heads"][sampled_g_key], result)
+            _copy_geometry_diagnostics(result["heads"][sampled_g_key], result)
             return result
 
         # Aggregate across scenes
@@ -1009,6 +1103,23 @@ class MultiSceneTrainer:
                 if value is not None:
                     result["heads"][sampled_g_key][key] = value
                     break
+        for key in _GEOMETRY_DIAGNOSTIC_KEYS:
+            values = [r[key] for r in scene_results if key in r]
+            mean_value = _maybe_stack_mean(values)
+            if mean_value is not None:
+                result["heads"][sampled_g_key][key] = mean_value
+        for key in _DECODER_DIAGNOSTIC_KEYS:
+            values = [
+                r["decoder_diagnostics"][key]
+                for r in scene_results
+                if isinstance(r.get("decoder_diagnostics"), dict)
+                and key in r["decoder_diagnostics"]
+                and isinstance(r["decoder_diagnostics"][key], torch.Tensor)
+                and r["decoder_diagnostics"][key].numel() == 1
+            ]
+            mean_value = _maybe_stack_mean(values)
+            if mean_value is not None:
+                result["heads"][sampled_g_key][key] = mean_value
         aux_values = [r["loss_aux"] for r in scene_results if "loss_aux" in r]
         if aux_values:
             result["loss_aux"] = torch.stack(aux_values).mean()
@@ -1394,9 +1505,17 @@ class MultiSceneTrainer:
             if profile_this_step:
                 self._sync_device()
             optim_start = time.perf_counter()
-            grad_norm = clip_grad_norm_(
-                self._model_module().parameters(), self.grad_clip_norm,
-            ).item()
+            trainable_params = tuple(
+                p for p in self._model_module().parameters() if p.requires_grad
+            )
+            if self.grad_clip_norm is not None and float(self.grad_clip_norm) > 0.0:
+                grad_norm_pre_clip = clip_grad_norm_(
+                    trainable_params, float(self.grad_clip_norm),
+                ).item()
+            else:
+                grad_norm_pre_clip = self._grad_norm(trainable_params)
+            grad_norm_post_clip = self._grad_norm(trainable_params)
+            grad_norm = grad_norm_pre_clip
             self.optimizer.step()
             if profile_this_step:
                 self._sync_device()
@@ -1412,6 +1531,8 @@ class MultiSceneTrainer:
                 step_metrics: dict[str, float] = {
                     "loss_total": loss_total,
                     "grad_norm": grad_norm,
+                    "grad_norm_pre_clip": grad_norm_pre_clip,
+                    "grad_norm_post_clip": grad_norm_post_clip,
                     "step_ms": step_total_ms,
                     "num_scenes": float(len(scene_ids_local)),
                     "num_points_total": float(num_points_total),
@@ -1437,6 +1558,9 @@ class MultiSceneTrainer:
                             step_metrics[f"loss_class_{g}"] = ld_g["loss_class"].item()
                         for key in _SCORE_TARGET_DIAGNOSTIC_KEYS:
                             if key in ld_g:
+                                step_metrics[f"{key}_{g}"] = ld_g[key].item()
+                        for key in _GEOMETRY_DIAGNOSTIC_KEYS + _DECODER_DIAGNOSTIC_KEYS:
+                            if key in ld_g and isinstance(ld_g[key], torch.Tensor):
                                 step_metrics[f"{key}_{g}"] = ld_g[key].item()
                 if "loss_aux" in loss_result:
                     step_metrics["loss_aux"] = loss_result["loss_aux"].item()
@@ -1466,13 +1590,14 @@ class MultiSceneTrainer:
                         scene_label = ",".join(scene_ids_local)
                     log.info(
                         "  epoch %d  step %d  scenes=%s  loss=%.4f  [%s]  "
-                        "gnorm=%.3f  %.0fms  pts=%d  max_scene_pts=%d",
+                        "gnorm=%.3f->%.3f  %.0fms  pts=%d  max_scene_pts=%d",
                         epoch,
                         self.global_step,
                         scene_label,
                         step_metrics["loss_total"],
                         per_head_str,
-                        step_metrics["grad_norm"],
+                        step_metrics["grad_norm_pre_clip"],
+                        step_metrics["grad_norm_post_clip"],
                         step_metrics["step_ms"],
                         int(step_metrics["num_points_total"]),
                         int(step_metrics["num_points_max_scene"]),
@@ -1484,6 +1609,8 @@ class MultiSceneTrainer:
                         "scene_ids": scene_ids_local,
                         "loss_total": step_metrics["loss_total"],
                         "grad_norm": step_metrics["grad_norm"],
+                        "grad_norm_pre_clip": step_metrics["grad_norm_pre_clip"],
+                        "grad_norm_post_clip": step_metrics["grad_norm_post_clip"],
                         "step_ms": step_metrics["step_ms"],
                         "num_scenes": int(step_metrics["num_scenes"]),
                         "num_points_total": int(step_metrics["num_points_total"]),
@@ -1508,6 +1635,10 @@ class MultiSceneTrainer:
                                 metric_key = f"{key}_{g}"
                                 if metric_key in step_metrics:
                                     row[metric_key] = step_metrics[metric_key]
+                            for key in _GEOMETRY_DIAGNOSTIC_KEYS + _DECODER_DIAGNOSTIC_KEYS:
+                                metric_key = f"{key}_{g}"
+                                if metric_key in step_metrics:
+                                    row[metric_key] = step_metrics[metric_key]
                             for key in _SCORE_TARGET_TEXT_DIAGNOSTIC_KEYS:
                                 if key in ld_g:
                                     row[f"{key}_{g}"] = ld_g[key]
@@ -1521,12 +1652,16 @@ class MultiSceneTrainer:
                             "epoch": epoch,
                             "train_step/loss": step_metrics["loss_total"],
                             "train_step/grad_norm": step_metrics["grad_norm"],
+                            "train_step/grad_norm_pre_clip": step_metrics["grad_norm_pre_clip"],
+                            "train_step/grad_norm_post_clip": step_metrics["grad_norm_post_clip"],
                             "train_step/step_ms": step_metrics["step_ms"],
                             "train_step/num_scenes": step_metrics["num_scenes"],
                             "train_step/num_points_total": step_metrics["num_points_total"],
                             "train_step/num_points_max_scene": step_metrics["num_points_max_scene"],
                             "train_scene/loss": step_metrics["loss_total"],
                             "train_scene/grad_norm": step_metrics["grad_norm"],
+                            "train_scene/grad_norm_pre_clip": step_metrics["grad_norm_pre_clip"],
+                            "train_scene/grad_norm_post_clip": step_metrics["grad_norm_post_clip"],
                             "train_scene/step_ms": step_metrics["step_ms"],
                         }
                         for g in active_grans:
@@ -1538,6 +1673,10 @@ class MultiSceneTrainer:
                                 if f"loss_class_{g}" in step_metrics:
                                     wb[f"train_scene/loss_class_{g}"] = step_metrics[f"loss_class_{g}"]
                                 for key in _SCORE_TARGET_DIAGNOSTIC_KEYS:
+                                    metric_key = f"{key}_{g}"
+                                    if metric_key in step_metrics:
+                                        wb[f"train_scene/{metric_key}"] = step_metrics[metric_key]
+                                for key in _GEOMETRY_DIAGNOSTIC_KEYS + _DECODER_DIAGNOSTIC_KEYS:
                                     metric_key = f"{key}_{g}"
                                     if metric_key in step_metrics:
                                         wb[f"train_scene/{metric_key}"] = step_metrics[metric_key]
@@ -1924,6 +2063,7 @@ class MultiSceneTrainer:
                 )
         for epoch in range(start_epoch, self.max_epochs + 1):
             self.current_epoch = epoch
+            self._set_anchor_refinement_scale(epoch)
             t_epoch = time.time()
 
             self._train_one_epoch(epoch)

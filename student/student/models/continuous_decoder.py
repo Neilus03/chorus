@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from student.models.continuous_base import ContinuousDecoderMixin
 from student.models.instance_decoder import (
     FourierPosEnc,
     GranularityHead,
@@ -30,7 +31,7 @@ from student.models.instance_decoder import (
 )
 
 
-class ContinuousQueryInstanceDecoder(nn.Module):
+class ContinuousQueryInstanceDecoder(ContinuousDecoderMixin, nn.Module):
     """Iterative query-refinement decoder with continuous granularity conditioning.
 
     Instead of per-granularity query pools and output heads, a single query

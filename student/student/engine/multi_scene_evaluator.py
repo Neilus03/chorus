@@ -28,7 +28,7 @@ from student.metrics.official_instance_ap import (
     merge_ap_record_sets,
 )
 from student.metrics.pseudo_metrics import compute_pseudo_metrics_multi
-from student.models.continuous_decoder import ContinuousQueryInstanceDecoder
+from student.models.continuous_base import is_continuous_decoder
 
 log = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ def _gran_key_to_float(key: str) -> float:
 
 
 def _is_continuous_model(model: nn.Module) -> bool:
-    """Check if model uses a ContinuousQueryInstanceDecoder."""
+    """Check if model uses a continuous granularity decoder."""
     # Unwrap DDP / FineTuningWrapper
     m = model
     if hasattr(m, "module"):
@@ -59,7 +59,7 @@ def _is_continuous_model(model: nn.Module) -> bool:
     if hasattr(m, "model"):
         m = m.model
     decoder = getattr(m, "decoder", None)
-    return isinstance(decoder, ContinuousQueryInstanceDecoder)
+    return is_continuous_decoder(decoder)
 
 
 def _clear_backbone_cache(model: nn.Module) -> None:

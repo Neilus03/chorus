@@ -29,10 +29,14 @@ def main() -> None:
     has_head = any(k.startswith("decoder.head.") for k in keys)
     has_initializer = any(k.startswith("decoder.initializer.") for k in keys)
     has_gran_mlp = any(k.startswith("decoder.granularity_mlp.") for k in keys)
+    has_v2_gran_encoder = any(k.startswith("decoder.granularity_encoder.") for k in keys)
+    has_v2_scale_selector = any(k.startswith("decoder.scale_selector.") for k in keys)
 
     print("\nSignature:")
     print("  expects-continuous-ish (decoder.head / decoder.initializer / granularity_mlp):",
           has_head, has_initializer, has_gran_mlp)
+    print("  expects-continuous-v2-ish (decoder.granularity_encoder / scale_selector):",
+          has_v2_gran_encoder, has_v2_scale_selector)
     print("  has-per-granularity (decoder.heads.g02 / decoder.initializers.g02):",
           has_heads, has_initializers)
 

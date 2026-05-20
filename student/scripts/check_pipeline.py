@@ -173,6 +173,8 @@ def main() -> None:
         learned_query_ratio=model_cfg.get("learned_query_ratio", 0.25),
         multi_scale=bb_cfg.get("multi_scale", False),
         multi_scale_indices=bb_cfg.get("multi_scale_indices", None),
+        decoder_type=model_cfg.get("decoder_type", "multi_head"),
+        continuous_decoder_v2=model_cfg.get("continuous_decoder_v2", None),
     ).to(device)
     print(f"  built in {time.time() - t0:.2f}s")
 

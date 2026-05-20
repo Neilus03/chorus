@@ -69,6 +69,7 @@ def build_from_config(config_path: Path):
             if bool(model_cfg.get("class_aware_instance", False))
             else None
         ),
+        continuous_decoder_v2=model_cfg.get("continuous_decoder_v2", None),
     )
 
     prompt_ft_cfg = train_cfg.get("prompt_finetune", {})

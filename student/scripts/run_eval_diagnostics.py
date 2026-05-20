@@ -38,7 +38,7 @@ from student.metrics.eval_diagnostics import (
     to_jsonable,
 )
 from student.metrics.official_instance_ap import SCANNET_MIN_REGION_SIZE, build_instance_ap_records
-from student.models.continuous_decoder import ContinuousQueryInstanceDecoder
+from student.models.continuous_base import is_continuous_decoder
 from student.models.finetune_wrapper import FineTuningWrapper
 from student.models.student_model import build_student_model
 
@@ -224,6 +224,7 @@ def _build_model(cfg: dict[str, Any], granularities: tuple[str, ...], device: st
             if bool(model_cfg.get("class_aware_instance", False))
             else None
         ),
+        continuous_decoder_v2=model_cfg.get("continuous_decoder_v2", None),
     )
 
     prompt_ft_cfg = train_cfg.get("prompt_finetune", {})
@@ -276,7 +277,7 @@ def _is_continuous_model(model: torch.nn.Module) -> bool:
     unwrapped = model
     if isinstance(unwrapped, FineTuningWrapper):
         unwrapped = unwrapped.model
-    return isinstance(getattr(unwrapped, "decoder", None), ContinuousQueryInstanceDecoder)
+    return is_continuous_decoder(getattr(unwrapped, "decoder", None))
 
 
 def _set_eval_mode_like_existing_eval(model: torch.nn.Module) -> None:

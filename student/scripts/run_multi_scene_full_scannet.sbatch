@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=student_full_scannet_ddp4
-#SBATCH --output=logs/full_scannet_ddp4_%j.out
-#SBATCH --error=logs/full_scannet_ddp4_%j.err
+#SBATCH --job-name=scannet_v2_pretrain_ddp4
+#SBATCH --output=logs/scannet_v2_pretrain_ddp4_%j.out
+#SBATCH --error=logs/scannet_v2_pretrain_ddp4_%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem-per-cpu=4G
-#SBATCH --gpus=rtx_4090:4,rtx_3090:4,a100:4
-#SBATCH --time=48:00:00
+#SBATCH --gpus=rtx_3090:4
+#SBATCH --time=96:00:00
 
 set -euo pipefail
 
@@ -75,4 +75,3 @@ echo "  NPROC_PER_NODE=4"
 echo "  EXTRA_ARGS=$*"
 
 torchrun --standalone --nnodes=1 --nproc_per_node=4 scripts/run_multi_scene.py --config "${CONFIG_PATH}" "$@"
-
