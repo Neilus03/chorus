@@ -48,7 +48,9 @@ model:
       film: true
       film_targets: [query, memory, mask_head, score_head]
       scale_selector: true
+      use_scale_selector: true
       scale_selector_temperature: 1.0
+      scale_selector_prior_strength: 0.0
       scale_selector_prior_only: true
       freeze_scale_selector: true
 
@@ -63,12 +65,16 @@ model:
 
     anchors:
       enabled: true
+      use_delta_refinement: true
       delta_scale: 0.05
       delta_norm_max: 0.50
+      delta_max_norm: 0.50
+      delta_max_step: 0.03
       clamp_to_scene_bounds: true
       center_loss: true
 
     head:
+      use_film_heads: true
       logit_scale_init: 5.0
       logit_scale_min: 1.0
       logit_scale_max: 10.0
@@ -76,6 +82,8 @@ model:
 
     local_aggregation:
       enabled: true
+      use_local_aggregation: true
+      gate_init_prob: 0.10
       source: sparse_tokens
       radius_min: 0.15
       radius_max: 1.20
@@ -84,6 +92,7 @@ model:
 
     relation_self_attention:
       enabled: true
+      use_relation_bias: true
       geometry_bias_hidden_dim: 64
       include_radius: true
       include_granularity: true
@@ -134,6 +143,7 @@ train:
   backbone_lr_scale: 0.1
   weight_decay: 1.0e-5
   grad_clip_norm: 1.0
+  delta_disable_epochs: 50
   anchor_refinement_warmup_epochs: 20
   anchor_refinement_warmup_start_scale: 0.0
   max_epochs: 120
@@ -157,6 +167,7 @@ eval:
   scannet_benchmark: all
   scannet_benchmarks: ["scannet20", "scannet200"]
   score_threshold: 0.01
+  score_thresholds_by_granularity: null
   mask_threshold: 0.5
   min_points_per_proposal: 30
   fragment_merge_eval: false

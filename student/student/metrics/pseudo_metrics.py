@@ -13,6 +13,21 @@ import numpy as np
 
 from student.data.target_builder import InstanceTargets
 
+ScoreThresholdSpec = float | dict[str, float]
+
+
+def _score_threshold_for_granularity(
+    score_threshold: ScoreThresholdSpec,
+    granularity: str,
+) -> float:
+    if isinstance(score_threshold, dict):
+        if granularity in score_threshold:
+            return float(score_threshold[granularity])
+        if "default" in score_threshold:
+            return float(score_threshold["default"])
+        return 0.3
+    return float(score_threshold)
+
 
 def compute_matched_iou(
     mask_logits: torch.Tensor,
@@ -110,7 +125,7 @@ def compute_pseudo_metrics_multi(
     targets_by_granularity: dict[str, InstanceTargets],
     loss_result: dict,
     *,
-    score_threshold: float = 0.3,
+    score_threshold: ScoreThresholdSpec = 0.3,
     mask_threshold: float = 0.5,
 ) -> dict[str, dict[str, Any]]:
     """Compute pseudo metrics for each granularity head.
@@ -136,7 +151,7 @@ def compute_pseudo_metrics_multi(
             targets_g,
             head_loss["matched_pred_indices"],
             head_loss["matched_gt_indices"],
-            score_threshold=score_threshold,
+            score_threshold=_score_threshold_for_granularity(score_threshold, g),
             mask_threshold=mask_threshold,
         )
     return result

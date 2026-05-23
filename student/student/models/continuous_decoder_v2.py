@@ -13,6 +13,7 @@ geometry-first V2 components:
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -84,11 +85,15 @@ class GranularityScaleSelector(nn.Module):
         num_scales: int,
         temperature: float = 1.0,
         prior_only: bool = False,
+        use_scale_selector: bool = True,
+        prior_strength: float = 1.0,
     ) -> None:
         super().__init__()
         self.num_scales = int(max(num_scales, 1))
         self.temperature = float(max(temperature, 1e-4))
         self.prior_only = bool(prior_only)
+        self.use_scale_selector = bool(use_scale_selector)
+        self.prior_strength = float(prior_strength)
         self.learned_logits = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
@@ -103,11 +108,13 @@ class GranularityScaleSelector(nn.Module):
     def forward(self, g_emb: torch.Tensor, target_g: torch.Tensor) -> torch.Tensor:
         if self.num_scales == 1:
             return g_emb.new_ones((1,))
+        if not self.use_scale_selector:
+            return g_emb.new_full((self.num_scales,), 1.0 / float(self.num_scales))
 
         g = _as_granularity_float(target_g)
         idx = torch.arange(self.num_scales, device=g_emb.device, dtype=g_emb.dtype)
         desired = (1.0 - g) * float(self.num_scales - 1)
-        prior = -((idx - desired) ** 2) / self.temperature
+        prior = self.prior_strength * (-((idx - desired) ** 2) / self.temperature)
         learned = torch.zeros_like(prior) if self.prior_only else self.learned_logits(g_emb.view(1, -1)).squeeze(0)
         logits = learned + prior
         return logits.softmax(dim=0)
@@ -381,9 +388,17 @@ class LocalQueryAggregator(nn.Module):
 class RelationAwareQuerySelfAttention(nn.Module):
     """Query self-attention with additive relative-geometry bias."""
 
-    def __init__(self, hidden_dim: int, num_heads: int, geometry_hidden_dim: int = 64) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        geometry_hidden_dim: int = 64,
+        *,
+        use_relation_bias: bool = True,
+    ) -> None:
         super().__init__()
         self.num_heads = int(num_heads)
+        self.use_relation_bias = bool(use_relation_bias)
         self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
         self.rel_bias = nn.Sequential(
             nn.Linear(7, geometry_hidden_dim),
@@ -420,7 +435,7 @@ class RelationAwareQuerySelfAttention(nn.Module):
         target_g: torch.Tensor,
     ) -> torch.Tensor:
         q_with_pos = q + q_pos
-        bias = self._bias(q_xyz, query_radius, target_g)
+        bias = self._bias(q_xyz, query_radius, target_g) if self.use_relation_bias else None
         out, _ = self.attn(q_with_pos, q_with_pos, q, attn_mask=bias)
         return out
 
@@ -435,12 +450,14 @@ class GeometryDecoderLayer(nn.Module):
         num_heads: int = 8,
         ff_mult: int = 4,
         geometry_bias_hidden_dim: int = 64,
+        use_relation_bias: bool = True,
     ) -> None:
         super().__init__()
         self.self_attn = RelationAwareQuerySelfAttention(
             hidden_dim,
             num_heads,
             geometry_hidden_dim=geometry_bias_hidden_dim,
+            use_relation_bias=use_relation_bias,
         )
         self.cross_attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
         self.norm_sa = nn.LayerNorm(hidden_dim)
@@ -488,11 +505,13 @@ class FiLMGranularityHead(nn.Module):
         logit_scale_min: float | None = None,
         logit_scale_max: float | None = None,
         freeze_logit_scale: bool = False,
+        use_film_heads: bool = True,
     ) -> None:
         super().__init__()
         self.num_classes = int(num_classes) if num_classes is not None else None
         self.logit_scale_min = None if logit_scale_min is None else float(logit_scale_min)
         self.logit_scale_max = None if logit_scale_max is None else float(logit_scale_max)
+        self.use_film_heads = bool(use_film_heads)
         self.mask_body = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
@@ -522,10 +541,16 @@ class FiLMGranularityHead(nn.Module):
             self.logit_scale.requires_grad_(False)
 
     def mask_embed(self, query_embed: torch.Tensor, g_emb: torch.Tensor) -> torch.Tensor:
-        return self.mask_out(self.mask_film(self.mask_body(query_embed), g_emb))
+        x = self.mask_body(query_embed)
+        if self.use_film_heads:
+            x = self.mask_film(x, g_emb)
+        return self.mask_out(x)
 
     def score_logits(self, query_embed: torch.Tensor, g_emb: torch.Tensor) -> torch.Tensor:
-        return self.score_out(self.score_film(self.score_body(query_embed), g_emb)).squeeze(-1)
+        x = self.score_body(query_embed)
+        if self.use_film_heads:
+            x = self.score_film(x, g_emb)
+        return self.score_out(x).squeeze(-1)
 
     def class_logits(self, query_embed: torch.Tensor) -> torch.Tensor | None:
         if self.class_head is None:
@@ -569,9 +594,16 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
         self.num_queries = int(num_queries)
         self.use_positional_guidance = bool(use_positional_guidance)
         self.delta_scale = float(anchor_cfg.get("delta_scale", 0.10))
-        self.delta_norm_max = float(anchor_cfg.get("delta_norm_max", 0.0) or 0.0)
+        self.use_delta_refinement = bool(anchor_cfg.get("use_delta_refinement", True))
+        delta_norm_cfg = anchor_cfg.get("delta_max_norm", anchor_cfg.get("delta_norm_max", 0.0))
+        self.delta_norm_max = float(delta_norm_cfg or 0.0)
+        delta_step_cfg = anchor_cfg.get("delta_max_step", None)
+        self.delta_max_step = None if delta_step_cfg is None else float(delta_step_cfg)
         self.anchor_refinement_runtime_scale = 1.0
         self.clamp_to_scene_bounds = bool(anchor_cfg.get("clamp_to_scene_bounds", True))
+        self.use_local_aggregation = bool(
+            local_cfg.get("use_local_aggregation", local_cfg.get("enabled", True))
+        )
         self.local_radius_min = float(local_cfg.get("radius_min", 0.15))
         self.local_radius_max = float(local_cfg.get("radius_max", 1.20))
 
@@ -582,6 +614,10 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
             num_scales,
             temperature=float(gran_cfg.get("scale_selector_temperature", 1.0)),
             prior_only=bool(gran_cfg.get("scale_selector_prior_only", False)),
+            use_scale_selector=bool(
+                gran_cfg.get("use_scale_selector", gran_cfg.get("scale_selector", True))
+            ),
+            prior_strength=float(gran_cfg.get("scale_selector_prior_strength", 1.0)),
         )
         if bool(gran_cfg.get("freeze_scale_selector", False)):
             for param in self.scale_selector.learned_logits.parameters():
@@ -640,6 +676,14 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
             nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Sigmoid())
             for _ in range(num_layers)
         ])
+        gate_init_prob = float(local_cfg.get("gate_init_prob", 0.10))
+        gate_init_prob = min(max(gate_init_prob, 1e-4), 1.0 - 1e-4)
+        gate_init_logit = math.log(gate_init_prob / (1.0 - gate_init_prob))
+        for gate in self.local_gates:
+            linear = gate[0]
+            assert isinstance(linear, nn.Linear)
+            nn.init.zeros_(linear.weight)
+            nn.init.constant_(linear.bias, gate_init_logit)
         self.layer_query_films = nn.ModuleList([
             FiLMModulator(hidden_dim) for _ in range(num_layers)
         ])
@@ -649,6 +693,9 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
                 num_heads=num_heads,
                 geometry_bias_hidden_dim=int(
                     relation_cfg.get("geometry_bias_hidden_dim", 64),
+                ),
+                use_relation_bias=bool(
+                    relation_cfg.get("use_relation_bias", relation_cfg.get("enabled", True))
                 ),
             )
             for _ in range(num_layers)
@@ -675,6 +722,7 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
             logit_scale_min=head_cfg.get("logit_scale_min", None),
             logit_scale_max=head_cfg.get("logit_scale_max", None),
             freeze_logit_scale=bool(head_cfg.get("freeze_logit_scale", False)),
+            use_film_heads=bool(head_cfg.get("use_film_heads", True)),
         )
 
     def set_anchor_refinement_scale(self, scale: float) -> None:
@@ -796,6 +844,9 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
         raw_delta_norms: list[torch.Tensor] = []
         delta_norms: list[torch.Tensor] = []
         delta_step_norms: list[torch.Tensor] = []
+        delta_norm_layer_means: list[torch.Tensor] = []
+        delta_step_norm_layer_means: list[torch.Tensor] = []
+        local_gate_layer_means: list[torch.Tensor] = []
         anchor_in_scene_ratios: list[torch.Tensor] = []
         xyz_min = scene_xyz.min(dim=0, keepdim=True).values
         xyz_max = scene_xyz.max(dim=0, keepdim=True).values
@@ -809,15 +860,25 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
             mem_b = (mem * scale_gain).unsqueeze(0)
             pos_b = mem_pos.unsqueeze(0)
 
-            local_feat, local_stats = self.local_aggregator(
-                q_xyz,
-                mem,
-                mem_xyz,
-                q_radius,
-            )
+            if self.use_local_aggregation:
+                local_feat, local_stats = self.local_aggregator(
+                    q_xyz,
+                    mem,
+                    mem_xyz,
+                    q_radius,
+                )
+                gate = self.local_gates[layer_idx](g_emb).view(1, self.hidden_dim)
+                q_b = q_b + (gate * local_feat).unsqueeze(0)
+                local_gate_layer_means.append(gate.detach().mean())
+            else:
+                local_stats = {
+                    "neighbor_count_mean": point_feat.new_tensor(0.0),
+                    "neighbor_count_min": point_feat.new_tensor(0.0),
+                    "neighbor_count_max": point_feat.new_tensor(0.0),
+                    "neighbor_zero_frac": point_feat.new_tensor(0.0),
+                }
+                local_gate_layer_means.append(point_feat.new_tensor(0.0))
             local_stats_accum.append(local_stats)
-            gate = self.local_gates[layer_idx](g_emb).view(1, self.hidden_dim)
-            q_b = q_b + (gate * local_feat).unsqueeze(0)
 
             q_layer = self.layer_query_films[layer_idx](q_b.squeeze(0), g_emb)
             q_b = q_layer.unsqueeze(0)
@@ -829,14 +890,23 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
             if self.delta_norm_max > 0.0:
                 raw_norm = torch.linalg.norm(delta, dim=-1, keepdim=True).clamp_min(1e-6)
                 delta = delta * torch.clamp(self.delta_norm_max / raw_norm, max=1.0)
-            delta_norms.append(torch.linalg.norm(delta, dim=-1).detach())
+            delta_norm = torch.linalg.norm(delta, dim=-1)
+            delta_norms.append(delta_norm.detach())
+            delta_norm_layer_means.append(delta_norm.detach().mean())
             delta_step = (
                 self.anchor_refinement_runtime_scale
                 * self.delta_scale
                 * delta
                 * q_radius[:, None].clamp_min(1e-3)
             )
-            delta_step_norms.append(torch.linalg.norm(delta_step, dim=-1).detach())
+            if not self.use_delta_refinement:
+                delta_step = torch.zeros_like(delta_step)
+            if self.delta_max_step is not None and self.delta_max_step > 0.0:
+                step_norm = torch.linalg.norm(delta_step, dim=-1, keepdim=True).clamp_min(1e-6)
+                delta_step = delta_step * torch.clamp(self.delta_max_step / step_norm, max=1.0)
+            delta_step_norm = torch.linalg.norm(delta_step, dim=-1)
+            delta_step_norms.append(delta_step_norm.detach())
+            delta_step_norm_layer_means.append(delta_step_norm.detach().mean())
             q_xyz_pre_clamp = q_xyz + delta_step
             anchor_in_scene_ratios.append(
                 ((q_xyz_pre_clamp >= xyz_min) & (q_xyz_pre_clamp <= xyz_max))
@@ -941,6 +1011,12 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
         }
         for i, weight in enumerate(scale_weights):
             diagnostics[f"scale_selector_weight_level_{i}"] = weight.detach()
+        for i, value in enumerate(delta_norm_layer_means):
+            diagnostics[f"delta_norm_layer_{i}"] = value.detach()
+        for i, value in enumerate(delta_step_norm_layer_means):
+            diagnostics[f"delta_step_norm_layer_{i}"] = value.detach()
+        for i, value in enumerate(local_gate_layer_means):
+            diagnostics[f"local_gate_mean_layer_{i}"] = value.detach()
         out["diagnostics"] = diagnostics
 
         return out

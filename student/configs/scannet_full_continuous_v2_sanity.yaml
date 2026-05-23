@@ -1,8 +1,9 @@
-# ContinuousGeometryQueryDecoderV2 — LitePT aug, 4-GPU DDP batched scenes.
-# Launch: torchrun --standalone --nnodes=1 --nproc_per_node=4 scripts/run_multi_scene.py --config configs/scannet_full_continuous_v2.yaml
+# 40-epoch V2 stability sanity run.
+# Purpose: check gradients, proposal/score diagnostics, scale weights, local gates,
+# and bounded anchor refinement before launching full pretraining.
 
 experiment:
-  name: scannet_full_continuous_v2
+  name: scannet_full_continuous_v2_sanity
   seed: 42
   output_root: ${CHORUS_OUTPUT_ROOT:-/scratch2/nedela/student_runs}
 
@@ -48,7 +49,9 @@ model:
       scale_selector: true
       use_scale_selector: true
       scale_selector_temperature: 1.0
-      scale_selector_prior_strength: 1.0
+      scale_selector_prior_strength: 0.0
+      scale_selector_prior_only: false
+      freeze_scale_selector: false
 
     query_init:
       geometry_ratio: 0.40
@@ -62,18 +65,19 @@ model:
     anchors:
       enabled: true
       use_delta_refinement: true
-      delta_scale: 0.10
-      delta_max_norm: 1.0
-      delta_max_step: null
+      delta_scale: 0.05
+      delta_norm_max: 0.50
+      delta_max_norm: 0.50
+      delta_max_step: 0.03
       clamp_to_scene_bounds: true
       center_loss: true
 
     head:
       use_film_heads: true
-      logit_scale_init: 10.0
-      logit_scale_min: null
-      logit_scale_max: null
-      freeze_logit_scale: false
+      logit_scale_init: 5.0
+      logit_scale_min: 1.0
+      logit_scale_max: 10.0
+      freeze_logit_scale: true
 
     local_aggregation:
       enabled: true
@@ -100,7 +104,10 @@ loss:
   score_target_mode: iou
   score_loss_balance_mode: pos_neg_balanced
   score_pos_weight: 1.0
-  score_neg_weight: 1.0
+  score_neg_weight: 0.5
+  score_unmatched_target_mode: soft_iou
+  score_unmatched_iou_weight: 0.25
+  score_unmatched_iou_cap: 0.25
   granularity_weights:
     g02: 0.207
     g05: 0.368
@@ -131,16 +138,17 @@ loss:
 
 train:
   device: cuda
-  lr: 3.0e-4
+  lr: 2.0e-5
+  backbone_lr_scale: 0.1
   weight_decay: 1.0e-5
   grad_clip_norm: 1.0
-  max_epochs: 1000
+  max_epochs: 40
   eval_every_epochs: 20
   save_every_epochs: 20
   log_every_steps: 50
   warmup_epochs: 20
-  delta_disable_epochs: 0
-  anchor_refinement_warmup_epochs: 0
+  delta_disable_epochs: 50
+  anchor_refinement_warmup_epochs: 20
   anchor_refinement_warmup_start_scale: 0.0
   num_workers: 2
   batch_scenes_per_step: 2
@@ -157,7 +165,7 @@ train:
 eval:
   scannet_benchmark: all
   scannet_benchmarks: ["scannet20", "scannet200"]
-  score_threshold: 0.1
+  score_threshold: 0.0
   score_thresholds_by_granularity: null
   mask_threshold: 0.5
   min_points_per_proposal: 30

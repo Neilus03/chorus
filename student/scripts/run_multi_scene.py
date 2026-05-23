@@ -672,6 +672,9 @@ def main() -> None:
 
         # ── 7. train ──
         log.info("Constructing trainer ...")
+        score_threshold_cfg = eval_cfg.get("score_thresholds_by_granularity", None)
+        if score_threshold_cfg is None:
+            score_threshold_cfg = eval_cfg.get("score_threshold", 0.3)
         trainer = MultiSceneTrainer(
             model=model,
             criterion=criterion,
@@ -705,7 +708,7 @@ def main() -> None:
             save_every_epochs=train_cfg.get("save_every_epochs", 10),
             best_val_metric_name=train_cfg.get("best_val_metric", "pseudo_official_AP50_mean"),
             output_dir=out_dir,
-            score_threshold=eval_cfg.get("score_threshold", 0.3),
+            score_threshold=score_threshold_cfg,
             class_score_threshold=eval_cfg.get("class_score_threshold", None),
             mask_threshold=eval_cfg.get("mask_threshold", 0.5),
             min_points_per_proposal=eval_cfg.get("min_points_per_proposal", 30),
@@ -728,6 +731,7 @@ def main() -> None:
             anchor_refinement_warmup_start_scale=float(
                 train_cfg.get("anchor_refinement_warmup_start_scale", 0.0)
             ),
+            delta_disable_epochs=int(train_cfg.get("delta_disable_epochs", 0)),
             num_workers=int(train_cfg.get("num_workers", 0)),
             log_every_steps=int(train_cfg.get("log_every_steps", 1)),
             batch_scenes_per_step=int(train_cfg.get("batch_scenes_per_step", 1)),
