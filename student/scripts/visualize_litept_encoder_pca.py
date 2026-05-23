@@ -176,6 +176,9 @@ def _build_model(cfg: dict[str, Any], checkpoint_path: Path, device: torch.devic
         raise KeyError(f"{checkpoint_path} does not contain model_state_dict")
     if any(k.startswith("module.") for k in state):
         state = {k.removeprefix("module."): v for k, v in state.items()}
+    if any(k.startswith("model.") for k in state):
+        state = {k.removeprefix("model."): v for k, v in state.items()}
+    state.pop("g_ft_logit", None)
     model.load_state_dict(state, strict=True)
     model.to(device)
     model.eval()
@@ -233,6 +236,8 @@ def pca_rgb(
         x_fit = x
 
     q_eff = min(int(q), x_fit.shape[0], x_fit.shape[1])
+    if style == "agile3d":
+        q_eff = min(3, x_fit.shape[0], x_fit.shape[1])
     if q_eff <= 0:
         raise ValueError(f"Cannot PCA feature tensor with shape {tuple(feat.shape)}")
 
@@ -247,7 +252,12 @@ def pca_rgb(
         if rgb.shape[1] < 3:
             rgb = F.pad(rgb, (0, 3 - rgb.shape[1]))
 
-    if robust_scale:
+    if style == "agile3d":
+        # AGILE3D's feature visualization fits a 3-D PCA projection, then
+        # rescales all projected values with one global min/max range.
+        lo = rgb.min()
+        hi = rgb.max()
+    elif robust_scale:
         lo = torch.quantile(rgb, q_low, dim=0, keepdim=True)
         hi = torch.quantile(rgb, q_high, dim=0, keepdim=True)
     else:
@@ -256,6 +266,19 @@ def pca_rgb(
 
     rgb = (rgb - lo) / (hi - lo).clamp_min(1e-6)
     return (rgb * brightness).clamp(0.0, 1.0)
+
+
+def _normalize_concat_block(feat: torch.Tensor, mode: str) -> torch.Tensor:
+    feat = feat.float()
+    if mode == "none":
+        return feat
+    if mode == "l2":
+        return F.normalize(feat, dim=1)
+    if mode == "zscore":
+        mean = feat.mean(dim=0, keepdim=True)
+        std = feat.std(dim=0, keepdim=True).clamp_min(1e-6)
+        return (feat - mean) / std
+    raise ValueError(f"Unknown concat normalization mode: {mode}")
 
 
 def _to_uint8(colors: np.ndarray | torch.Tensor) -> np.ndarray:
@@ -416,7 +439,7 @@ def main() -> None:
     parser.add_argument("--max-points", type=int, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--bn-mode", choices=("eval", "train"), default="eval")
-    parser.add_argument("--style", choices=("paper", "top3"), default="paper")
+    parser.add_argument("--style", choices=("paper", "top3", "agile3d"), default="paper")
     parser.add_argument("--pca-q", type=int, default=6)
     parser.add_argument("--pca-niter", type=int, default=5)
     parser.add_argument("--pca-fit-max-points", type=int, default=200_000)
@@ -427,6 +450,21 @@ def main() -> None:
     parser.add_argument("--brightness", type=float, default=1.15)
     parser.add_argument("--png-max-points", type=int, default=180_000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--concat-projected-stages",
+        action="store_true",
+        help=(
+            "Project every encoder stage back to input points, concatenate the "
+            "multiscale features per point, and PCA-color that concatenated "
+            "point feature."
+        ),
+    )
+    parser.add_argument(
+        "--concat-stage-normalize",
+        choices=("none", "l2", "zscore"),
+        default="none",
+        help="Optional per-stage normalization before multiscale concatenation.",
+    )
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
 
@@ -481,6 +519,8 @@ def main() -> None:
             "l2_normalize": args.l2_normalize,
             "robust_scale": args.robust_scale,
             "brightness": args.brightness,
+            "concat_projected_stages": args.concat_projected_stages,
+            "concat_stage_normalize": args.concat_stage_normalize,
         },
         "scenes": {},
     }
@@ -529,6 +569,7 @@ def main() -> None:
                 "num_points": int(points.shape[0]),
                 "stages": {},
             }
+            projected_stage_feats: list[tuple[str, torch.Tensor]] = []
 
             for cap in tap.captures:
                 log.info(
@@ -551,6 +592,8 @@ def main() -> None:
                     brightness=args.brightness,
                 )
                 point_to_stage = cap.input_voxel_to_stage[inverse_map]
+                if args.concat_projected_stages:
+                    projected_stage_feats.append((cap.name, cap.feat[point_to_stage].detach()))
                 point_rgb = token_rgb[point_to_stage]
 
                 native_path = scene_out / f"{cap.name}_native_tokens_pca.ply"
@@ -576,6 +619,61 @@ def main() -> None:
                     "projected_points_ply": str(projected_path),
                     "projected_mesh_ply": str(mesh_path) if mesh_written else None,
                 }
+
+            if args.concat_projected_stages:
+                concat_name = (
+                    "Eall_concat"
+                    if args.concat_stage_normalize == "none"
+                    else f"Eall_concat_{args.concat_stage_normalize}"
+                )
+                log.info(
+                    "[%s] %s stages=%s normalize=%s",
+                    scene_id,
+                    concat_name,
+                    ",".join(name for name, _feat in projected_stage_feats),
+                    args.concat_stage_normalize,
+                )
+                concat_blocks = [
+                    _normalize_concat_block(feat, args.concat_stage_normalize)
+                    for _name, feat in projected_stage_feats
+                ]
+                concat_feat = torch.cat(concat_blocks, dim=1)
+                concat_rgb = pca_rgb(
+                    concat_feat,
+                    style=args.style,
+                    q=args.pca_q,
+                    niter=args.pca_niter,
+                    fit_max_points=args.pca_fit_max_points,
+                    l2_normalize=args.l2_normalize,
+                    robust_scale=args.robust_scale,
+                    q_low=args.q_low,
+                    q_high=args.q_high,
+                    brightness=args.brightness,
+                )
+                concat_projected_path = scene_out / f"{concat_name}_projected_points_pca.ply"
+                concat_mesh_path = scene_out / f"{concat_name}_projected_mesh_pca.ply"
+                save_point_cloud_ply(points_np, concat_rgb, concat_projected_path)
+
+                concat_mesh_written = False
+                if source_mesh is not None:
+                    try:
+                        _recolor_mesh(source_mesh, _to_uint8(concat_rgb), concat_mesh_path)
+                        concat_mesh_written = True
+                    except Exception as exc:
+                        log.warning("[%s] %s mesh recolor failed: %s", scene_id, concat_name, exc)
+
+                concat_rgb_u8 = _to_uint8(concat_rgb)
+                panels.append((f"{concat_name} {concat_feat.shape[1]}d", concat_rgb_u8))
+                scene_manifest["concat_projected_stages"] = {
+                    "name": concat_name,
+                    "stages": [name for name, _feat in projected_stage_feats],
+                    "channels": int(concat_feat.shape[1]),
+                    "normalize": args.concat_stage_normalize,
+                    "projected_points_ply": str(concat_projected_path),
+                    "projected_mesh_ply": str(concat_mesh_path) if concat_mesh_written else None,
+                }
+                del concat_blocks, concat_feat, concat_rgb
+                torch.cuda.empty_cache()
 
             topdown_path = scene_out / "encoder_pca_topdown.png"
             _save_topdown_png(topdown_path, points_np, panels, max_points=args.png_max_points)

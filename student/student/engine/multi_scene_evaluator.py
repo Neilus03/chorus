@@ -122,6 +122,9 @@ def aggregate_multi_scene_results(
     real_class_ap50_by_bench: dict[str, list[float]] = {}
     real_sem_miou_by_bench: dict[str, list[float]] = {}
     matched_iou_by_gran: dict[str, list[float]] = {g: [] for g in granularities}
+    proposal_score_pass_by_gran: dict[str, list[float]] = {g: [] for g in granularities}
+    proposal_kept_by_gran: dict[str, list[float]] = {g: [] for g in granularities}
+    proposal_removed_by_gran: dict[str, list[float]] = {g: [] for g in granularities}
     pseudo_records_by_gran: dict[str, list[dict[str, Any]]] = {g: [] for g in granularities}
     pseudo_scope_by_gran: dict[str, list[str]] = {g: [] for g in granularities}
     real_records_by_bench_gran: dict[str, dict[str, list[dict[str, Any]]]] = {}
@@ -149,6 +152,12 @@ def aggregate_multi_scene_results(
             g_eval = eval_result.get(g, {})
             if not isinstance(g_eval, dict):
                 continue
+            _append_real(proposal_score_pass_by_gran[g], g_eval.get("num_score_pass"))
+            _append_real(proposal_kept_by_gran[g], g_eval.get("num_proposals"))
+            _append_real(
+                proposal_removed_by_gran[g],
+                g_eval.get("num_min_points_removed"),
+            )
 
             pseudo = g_eval.get("pseudo_gt", {})
             if isinstance(pseudo, dict):
@@ -239,11 +248,28 @@ def aggregate_multi_scene_results(
         "pseudo_NMI_mean": _safe_mean(pseudo_nmi_all),
         "pseudo_ARI_mean": _safe_mean(pseudo_ari_all),
     }
+    all_score_pass: list[float] = []
+    all_kept: list[float] = []
+    all_removed: list[float] = []
+    for g in granularities:
+        score_pass = proposal_score_pass_by_gran.get(g, [])
+        kept = proposal_kept_by_gran.get(g, [])
+        removed = proposal_removed_by_gran.get(g, [])
+        aggregate[f"proposal_score_pass_{g}"] = _safe_mean(score_pass)
+        aggregate[f"proposal_kept_{g}"] = _safe_mean(kept)
+        aggregate[f"proposal_removed_min_points_{g}"] = _safe_mean(removed)
+        all_score_pass.extend(score_pass)
+        all_kept.extend(kept)
+        all_removed.extend(removed)
+    aggregate["proposal_score_pass_mean"] = _safe_mean(all_score_pass)
+    aggregate["proposal_kept_mean"] = _safe_mean(all_kept)
+    aggregate["proposal_removed_min_points_mean"] = _safe_mean(all_removed)
 
     pseudo_ap: list[float] = []
     pseudo_ap50: list[float] = []
     pseudo_ap25: list[float] = []
     pseudo_oracle_ap50: list[float] = []
+    pseudo_oracle_ap25: list[float] = []
     for g in granularities:
         record_sets = pseudo_records_by_gran.get(g, [])
         if not record_sets:
@@ -254,6 +280,7 @@ def aggregate_multi_scene_results(
         aggregate[f"pseudo_{g}_official_AP50"] = _metric_value(metrics, "AP50")
         aggregate[f"pseudo_{g}_official_AP25"] = _metric_value(metrics, "AP25")
         aggregate[f"pseudo_{g}_oracle_AP50"] = _metric_value(metrics, "oracle_AP50")
+        aggregate[f"pseudo_{g}_oracle_AP25"] = _metric_value(metrics, "oracle_AP25")
         aggregate[f"pseudo_{g}_official_total_gt"] = int(metrics.get("total_gt_instances", 0))
         aggregate[f"pseudo_{g}_official_num_predictions"] = int(metrics.get("num_predictions", 0))
         aggregate[f"pseudo_{g}_eval_scope"] = _scope_from_values(pseudo_scope_by_gran.get(g, []))
@@ -261,11 +288,13 @@ def aggregate_multi_scene_results(
         pseudo_ap50.append(_metric_value(metrics, "AP50"))
         pseudo_ap25.append(_metric_value(metrics, "AP25"))
         pseudo_oracle_ap50.append(_metric_value(metrics, "oracle_AP50"))
+        pseudo_oracle_ap25.append(_metric_value(metrics, "oracle_AP25"))
 
     aggregate["pseudo_official_AP_mean"] = _official_mean(pseudo_ap)
     aggregate["pseudo_official_AP50_mean"] = _official_mean(pseudo_ap50)
     aggregate["pseudo_official_AP25_mean"] = _official_mean(pseudo_ap25)
     aggregate["pseudo_oracle_AP50_mean"] = _official_mean(pseudo_oracle_ap50)
+    aggregate["pseudo_oracle_AP25_mean"] = _official_mean(pseudo_oracle_ap25)
 
     # Per-benchmark real GT aggregates (no primary)
     for bench in sorted(real_legacy_recall25_by_bench):
@@ -473,7 +502,7 @@ def evaluate_multi_scene(
     *,
     device: str,
     granularities: tuple[str, ...],
-    score_threshold: float = 0.3,
+    score_threshold: float | dict[str, float] = 0.3,
     class_score_threshold: float | None = None,
     mask_threshold: float = 0.5,
     min_points: int = 30,
@@ -611,6 +640,7 @@ def evaluate_multi_scene(
                     scene_dir=sample["scene_dir"],
                     scene_id=scene_id,
                     score_threshold=score_threshold,
+                    class_score_threshold=class_score_threshold,
                     mask_threshold=mask_threshold,
                     min_points=min_points,
                     eval_benchmarks=(eval_benchmarks if eval_benchmarks is not None else eval_benchmark),

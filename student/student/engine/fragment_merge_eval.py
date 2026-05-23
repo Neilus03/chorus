@@ -27,6 +27,7 @@ from student.data.multi_scene_dataset import MultiSceneDataset
 from student.data.region_sampling import sphere_crop_indices_multi_center
 from student.engine.evaluator import (
     _compute_clustering_metrics,
+    _score_threshold_for_granularity,
     compute_legacy_best_match_recall,
     extract_proposals,
     proposals_to_labels,
@@ -97,7 +98,7 @@ def evaluate_scene_fragment_merge(
     *,
     device: str,
     granularities: tuple[str, ...],
-    score_threshold: float = 0.3,
+    score_threshold: float | dict[str, float] = 0.3,
     mask_threshold: float = 0.5,
     min_points: int = 30,
     eval_benchmark: str = "scannet200",
@@ -139,7 +140,7 @@ def evaluate_scene_fragment_merge(
             props, scores, _qi = extract_proposals(
                 head["mask_logits"].detach().cpu(),
                 head["score_logits"].detach().cpu(),
-                score_threshold=score_threshold,
+                score_threshold=_score_threshold_for_granularity(score_threshold, g),
                 mask_threshold=mask_threshold,
                 min_points=min_points,
             )

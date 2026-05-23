@@ -24,12 +24,26 @@ from student.metrics.official_instance_ap import (
 log = logging.getLogger(__name__)
 
 _CHORUS_ROOT = Path(__file__).resolve().parents[3] / "chorus"
+ScoreThresholdSpec = float | dict[str, float]
 
 
 def _ensure_chorus_importable() -> None:
     chorus_str = str(_CHORUS_ROOT)
     if chorus_str not in sys.path:
         sys.path.insert(0, chorus_str)
+
+
+def _score_threshold_for_granularity(
+    score_threshold: ScoreThresholdSpec,
+    granularity: str,
+) -> float:
+    if isinstance(score_threshold, dict):
+        if granularity in score_threshold:
+            return float(score_threshold[granularity])
+        if "default" in score_threshold:
+            return float(score_threshold["default"])
+        return 0.3
+    return float(score_threshold)
 
 
 # ── extract proposals from model output ──────────────────────────────────
@@ -745,7 +759,7 @@ def evaluate_student_predictions_multi(
     scene_dir: str | Path,
     scene_id: str,
     *,
-    score_threshold: float = 0.3,
+    score_threshold: ScoreThresholdSpec = 0.3,
     class_score_threshold: float | None = None,
     mask_threshold: float = 0.5,
     min_points: int = 30,
@@ -759,12 +773,14 @@ def evaluate_student_predictions_multi(
     result: dict[str, Any] = {}
     for g, targets_g in targets_by_granularity.items():
         head_pred = pred["heads"][g]
+        g_score_threshold = _score_threshold_for_granularity(score_threshold, g)
+        log.info("  [granularity %s] score_threshold=%.3f", g, g_score_threshold)
         result[g] = evaluate_student_predictions(
             head_pred,
             targets_g,
             scene_dir=scene_dir,
             scene_id=scene_id,
-            score_threshold=score_threshold,
+            score_threshold=g_score_threshold,
             class_score_threshold=class_score_threshold,
             mask_threshold=mask_threshold,
             min_points=min_points,

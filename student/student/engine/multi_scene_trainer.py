@@ -112,6 +112,18 @@ _DECODER_DIAGNOSTIC_KEYS = (
     "scale_selector_weight_level_1",
     "scale_selector_weight_level_2",
     "scale_selector_weight_level_3",
+    "delta_norm_layer_0",
+    "delta_norm_layer_1",
+    "delta_norm_layer_2",
+    "delta_norm_layer_3",
+    "delta_step_norm_layer_0",
+    "delta_step_norm_layer_1",
+    "delta_step_norm_layer_2",
+    "delta_step_norm_layer_3",
+    "local_gate_mean_layer_0",
+    "local_gate_mean_layer_1",
+    "local_gate_mean_layer_2",
+    "local_gate_mean_layer_3",
 )
 
 
@@ -131,6 +143,33 @@ def _canonical_best_metric_name(name: str) -> str:
 
 def _is_loggable_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _percentile(values: list[float], q: float) -> float:
+    finite = sorted(float(v) for v in values if math.isfinite(float(v)))
+    if not finite:
+        return float("nan")
+    if len(finite) == 1:
+        return finite[0]
+    q = max(0.0, min(1.0, float(q)))
+    pos = q * float(len(finite) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return finite[lo]
+    frac = pos - float(lo)
+    return finite[lo] * (1.0 - frac) + finite[hi] * frac
+
+
+def _rolling_grad_stats(values: list[float]) -> dict[str, float]:
+    finite = [float(v) for v in values if math.isfinite(float(v))]
+    if not finite:
+        return {"p50": float("nan"), "p95": float("nan"), "max": float("nan")}
+    return {
+        "p50": _percentile(finite, 0.50),
+        "p95": _percentile(finite, 0.95),
+        "max": max(finite),
+    }
 
 
 def _maybe_stack_mean(values: list[torch.Tensor]) -> torch.Tensor | None:
@@ -375,7 +414,7 @@ class MultiSceneTrainer:
         save_every_epochs: int = 10,
         best_val_metric_name: str = "pseudo_official_AP50_mean",
         output_dir: Path | str,
-        score_threshold: float = 0.3,
+        score_threshold: float | dict[str, float] = 0.3,
         class_score_threshold: float | None = None,
         mask_threshold: float = 0.5,
         min_points_per_proposal: int = 30,
@@ -412,6 +451,7 @@ class MultiSceneTrainer:
         prompt_target_granularity: str | None = None,
         anchor_refinement_warmup_epochs: int = 0,
         anchor_refinement_warmup_start_scale: float = 0.0,
+        delta_disable_epochs: int = 0,
     ) -> None:
         self.device = device
         self.lr = lr
@@ -478,7 +518,10 @@ class MultiSceneTrainer:
         )
         self.anchor_refinement_warmup_epochs = max(int(anchor_refinement_warmup_epochs), 0)
         self.anchor_refinement_warmup_start_scale = float(anchor_refinement_warmup_start_scale)
+        self.delta_disable_epochs = max(int(delta_disable_epochs), 0)
         self._last_anchor_refinement_scale: float | None = None
+        self._grad_norm_pre_clip_recent: list[float] = []
+        self._grad_norm_post_clip_recent: list[float] = []
 
         # Detect continuous decoder mode
         base_decoder = getattr(_unwrap_prompt_model(model), "decoder", None)
@@ -650,9 +693,13 @@ class MultiSceneTrainer:
 
     def _set_anchor_refinement_scale(self, epoch: int) -> float:
         scale = 1.0
-        if self.anchor_refinement_warmup_epochs > 0:
+        epoch_i = int(epoch)
+        if self.delta_disable_epochs > 0 and epoch_i <= self.delta_disable_epochs:
+            scale = 0.0
+        elif self.anchor_refinement_warmup_epochs > 0:
+            warmup_epoch = epoch_i - self.delta_disable_epochs
             progress = min(
-                max((int(epoch) - 1) / float(self.anchor_refinement_warmup_epochs), 0.0),
+                max((warmup_epoch - 1) / float(self.anchor_refinement_warmup_epochs), 0.0),
                 1.0,
             )
             start = self.anchor_refinement_warmup_start_scale
@@ -1516,6 +1563,8 @@ class MultiSceneTrainer:
                 grad_norm_pre_clip = self._grad_norm(trainable_params)
             grad_norm_post_clip = self._grad_norm(trainable_params)
             grad_norm = grad_norm_pre_clip
+            self._grad_norm_pre_clip_recent.append(float(grad_norm_pre_clip))
+            self._grad_norm_post_clip_recent.append(float(grad_norm_post_clip))
             self.optimizer.step()
             if profile_this_step:
                 self._sync_device()
@@ -1528,11 +1577,19 @@ class MultiSceneTrainer:
             metrics_sync_ms = 0.0
             should_log_step = self.global_step % self.log_every_steps == 0
             if should_log_step:
+                grad_pre_stats = _rolling_grad_stats(self._grad_norm_pre_clip_recent)
+                grad_post_stats = _rolling_grad_stats(self._grad_norm_post_clip_recent)
                 step_metrics: dict[str, float] = {
                     "loss_total": loss_total,
                     "grad_norm": grad_norm,
                     "grad_norm_pre_clip": grad_norm_pre_clip,
                     "grad_norm_post_clip": grad_norm_post_clip,
+                    "grad_norm_pre_clip_p50": grad_pre_stats["p50"],
+                    "grad_norm_pre_clip_p95": grad_pre_stats["p95"],
+                    "grad_norm_pre_clip_max": grad_pre_stats["max"],
+                    "grad_norm_post_clip_p50": grad_post_stats["p50"],
+                    "grad_norm_post_clip_p95": grad_post_stats["p95"],
+                    "grad_norm_post_clip_max": grad_post_stats["max"],
                     "step_ms": step_total_ms,
                     "num_scenes": float(len(scene_ids_local)),
                     "num_points_total": float(num_points_total),
@@ -1590,7 +1647,8 @@ class MultiSceneTrainer:
                         scene_label = ",".join(scene_ids_local)
                     log.info(
                         "  epoch %d  step %d  scenes=%s  loss=%.4f  [%s]  "
-                        "gnorm=%.3f->%.3f  %.0fms  pts=%d  max_scene_pts=%d",
+                        "gnorm=%.3f->%.3f  gp95=%.3f->%.3f  gmax=%.3f->%.3f  "
+                        "%.0fms  pts=%d  max_scene_pts=%d",
                         epoch,
                         self.global_step,
                         scene_label,
@@ -1598,6 +1656,10 @@ class MultiSceneTrainer:
                         per_head_str,
                         step_metrics["grad_norm_pre_clip"],
                         step_metrics["grad_norm_post_clip"],
+                        step_metrics["grad_norm_pre_clip_p95"],
+                        step_metrics["grad_norm_post_clip_p95"],
+                        step_metrics["grad_norm_pre_clip_max"],
+                        step_metrics["grad_norm_post_clip_max"],
                         step_metrics["step_ms"],
                         int(step_metrics["num_points_total"]),
                         int(step_metrics["num_points_max_scene"]),
@@ -1611,6 +1673,12 @@ class MultiSceneTrainer:
                         "grad_norm": step_metrics["grad_norm"],
                         "grad_norm_pre_clip": step_metrics["grad_norm_pre_clip"],
                         "grad_norm_post_clip": step_metrics["grad_norm_post_clip"],
+                        "grad_norm_pre_clip_p50": step_metrics["grad_norm_pre_clip_p50"],
+                        "grad_norm_pre_clip_p95": step_metrics["grad_norm_pre_clip_p95"],
+                        "grad_norm_pre_clip_max": step_metrics["grad_norm_pre_clip_max"],
+                        "grad_norm_post_clip_p50": step_metrics["grad_norm_post_clip_p50"],
+                        "grad_norm_post_clip_p95": step_metrics["grad_norm_post_clip_p95"],
+                        "grad_norm_post_clip_max": step_metrics["grad_norm_post_clip_max"],
                         "step_ms": step_metrics["step_ms"],
                         "num_scenes": int(step_metrics["num_scenes"]),
                         "num_points_total": int(step_metrics["num_points_total"]),
@@ -1654,6 +1722,12 @@ class MultiSceneTrainer:
                             "train_step/grad_norm": step_metrics["grad_norm"],
                             "train_step/grad_norm_pre_clip": step_metrics["grad_norm_pre_clip"],
                             "train_step/grad_norm_post_clip": step_metrics["grad_norm_post_clip"],
+                            "train_step/grad_norm_pre_clip_p50": step_metrics["grad_norm_pre_clip_p50"],
+                            "train_step/grad_norm_pre_clip_p95": step_metrics["grad_norm_pre_clip_p95"],
+                            "train_step/grad_norm_pre_clip_max": step_metrics["grad_norm_pre_clip_max"],
+                            "train_step/grad_norm_post_clip_p50": step_metrics["grad_norm_post_clip_p50"],
+                            "train_step/grad_norm_post_clip_p95": step_metrics["grad_norm_post_clip_p95"],
+                            "train_step/grad_norm_post_clip_max": step_metrics["grad_norm_post_clip_max"],
                             "train_step/step_ms": step_metrics["step_ms"],
                             "train_step/num_scenes": step_metrics["num_scenes"],
                             "train_step/num_points_total": step_metrics["num_points_total"],
@@ -1662,6 +1736,12 @@ class MultiSceneTrainer:
                             "train_scene/grad_norm": step_metrics["grad_norm"],
                             "train_scene/grad_norm_pre_clip": step_metrics["grad_norm_pre_clip"],
                             "train_scene/grad_norm_post_clip": step_metrics["grad_norm_post_clip"],
+                            "train_scene/grad_norm_pre_clip_p50": step_metrics["grad_norm_pre_clip_p50"],
+                            "train_scene/grad_norm_pre_clip_p95": step_metrics["grad_norm_pre_clip_p95"],
+                            "train_scene/grad_norm_pre_clip_max": step_metrics["grad_norm_pre_clip_max"],
+                            "train_scene/grad_norm_post_clip_p50": step_metrics["grad_norm_post_clip_p50"],
+                            "train_scene/grad_norm_post_clip_p95": step_metrics["grad_norm_post_clip_p95"],
+                            "train_scene/grad_norm_post_clip_max": step_metrics["grad_norm_post_clip_max"],
                             "train_scene/step_ms": step_metrics["step_ms"],
                         }
                         for g in active_grans:
@@ -1685,6 +1765,8 @@ class MultiSceneTrainer:
                         if "loss_aux" in step_metrics:
                             wb["train_scene/loss_aux"] = step_metrics["loss_aux"]
                         wandb.log(wb)
+                self._grad_norm_pre_clip_recent.clear()
+                self._grad_norm_post_clip_recent.clear()
 
             if profile_this_step:
                 profile_rows.append({
