@@ -100,6 +100,7 @@ class FineTuningWrapper(nn.Module):
         *,
         point_offsets: torch.Tensor | None = None,
         target_g: torch.Tensor | float | None = None,
+        return_debug: bool = False,
     ) -> dict | list[dict]:
         """Forward pass using the learned granularity prompt.
 
@@ -109,4 +110,7 @@ class FineTuningWrapper(nn.Module):
         prompt fine-tuning must use the learned prompt consistently.
         """
         g = torch.sigmoid(self.g_ft_logit)  # always in (0, 1), smooth gradients
-        return self.model(points, features, target_g=g, point_offsets=point_offsets)
+        kwargs = {"target_g": g, "point_offsets": point_offsets}
+        if return_debug:
+            kwargs["return_debug"] = True
+        return self.model(points, features, **kwargs)

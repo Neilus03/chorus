@@ -380,10 +380,15 @@ class MultiSceneDataset(Dataset):
         sup_t = torch.from_numpy(sup_np).bool()
 
         n = points_t.shape[0]
+        original_num_points = int(n)
         vertex_indices: torch.Tensor | None = None
         if subsample and self._should_subsample():
             idx_t = self._subsample_indices(n, np.asarray(points_np, dtype=np.float32))
-            vertex_indices = idx_t.clone()
+            is_identity = (
+                int(idx_t.numel()) == n
+                and torch.equal(idx_t.cpu(), torch.arange(n, dtype=torch.long))
+            )
+            vertex_indices = None if is_identity else idx_t.clone()
             points_t = points_t[idx_t]
             features_t = features_t[idx_t]
             valid_t = valid_t[idx_t]
@@ -403,6 +408,10 @@ class MultiSceneDataset(Dataset):
             "supervision_mask": sup_t,
             "scene_meta": scene.scene_meta,
             "granularities": self._granularities,
+            "original_num_points": original_num_points,
+            "eval_input_points": int(points_t.shape[0]),
+            "full_scene": vertex_indices is None and int(points_t.shape[0]) == original_num_points,
+            "subsampling_mode": self._subsampling_mode,
         }
         if vertex_indices is not None:
             out["vertex_indices"] = vertex_indices

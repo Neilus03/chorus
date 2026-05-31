@@ -53,7 +53,7 @@ export LITEPT_ROOT="/cluster/work/igp_psr/nedela/LitePT"
 # PointROPE CUDA extension may be compiled for a different SM; force torch fallback.
 export POINTROPE_FORCE_TORCH=1
 
-CONFIG_ARG="${1:-configs/scannet_full_aug_ddp4_batch_pointcept_ft100_gt.yaml}"
+CONFIG_ARG="${1:-configs/scannet_full_continuous_v2_ft_gt_scannet20_classagnostic.yaml}"
 shift || true
 
 # Normalize config paths: this script `cd`s into the student root, so allow
@@ -69,4 +69,3 @@ echo "  NPROC_PER_NODE=${NPROC_PER_NODE}"
 echo "  EXTRA_ARGS=$*"
 
 torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC_PER_NODE}" scripts/run_multi_scene.py --config "${CONFIG_ARG}" "$@"
-

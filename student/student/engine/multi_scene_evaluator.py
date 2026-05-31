@@ -516,6 +516,7 @@ def evaluate_multi_scene(
     fragment_merge_seed: int = 0,
     prompt_finetune: bool = False,
     prompt_target_granularity: str | None = None,
+    require_full_scene: bool = False,
 ) -> dict[str, Any]:
     """Evaluate model on all scenes in a dataset.
 
@@ -573,6 +574,23 @@ def evaluate_multi_scene(
         sample = dataset[idx]
         scene_id = sample["scene_id"]
         t0 = time.time()
+        eval_input_points = int(sample.get("eval_input_points", sample["points"].shape[0]))
+        original_points = int(sample.get("original_num_points", eval_input_points))
+        full_scene = bool(sample.get("full_scene", "vertex_indices" not in sample))
+        log.info(
+            "  [eval input %s] eval_input_points=%d original_points=%d full_scene=%s",
+            scene_id,
+            eval_input_points,
+            original_points,
+            str(full_scene).lower(),
+        )
+        if require_full_scene and not fragment_merge_eval and not full_scene:
+            raise RuntimeError(
+                f"Eval-only requested full-scene validation, but {scene_id} is cropped "
+                f"(eval_input_points={eval_input_points}, original_points={original_points}). "
+                "Set eval.subsampling_mode=none/eval.max_points=null or enable "
+                "eval.fragment_merge_eval=true."
+            )
 
         points = sample["points"].to(device)
         features = sample["features"].to(device)
@@ -657,6 +675,9 @@ def evaluate_multi_scene(
             "loss": loss_val,
             "pseudo_metrics": pseudo_metrics,
             "eval": eval_result,
+            "eval_input_points": eval_input_points,
+            "original_points": original_points,
+            "full_scene": full_scene,
         }
 
     return {

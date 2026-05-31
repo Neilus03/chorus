@@ -26,6 +26,7 @@ if str(_STUDENT_ROOT) not in sys.path:
     sys.path.insert(0, str(_STUDENT_ROOT))
 
 from student.config_utils import load_config, parse_granularities, resolve_num_queries, set_seed
+from student.data.eval_sampling import resolve_eval_sampling_config
 from student.data.multi_scene_dataset import MultiSceneDataset, build_scene_list
 from student.engine.evaluator import (
     _ensure_chorus_importable,
@@ -172,6 +173,7 @@ def _build_val_dataset(cfg: dict[str, Any], granularities: tuple[str, ...]) -> M
     val_split = _STUDENT_ROOT / data_cfg["val_split"]
     val_dirs = build_scene_list(val_split, scans_root)
     use_normals = bool(data_cfg.get("use_normals", False))
+    eval_sampling = resolve_eval_sampling_config(data_cfg, eval_cfg)
     return MultiSceneDataset(
         val_dirs,
         granularities,
@@ -179,9 +181,9 @@ def _build_val_dataset(cfg: dict[str, Any], granularities: tuple[str, ...]) -> M
         append_xyz=data_cfg.get("append_xyz_to_features", False),
         use_normals=use_normals,
         preload=data_cfg.get("preload", True),
-        max_points=data_cfg.get("val_max_points", None),
-        subsampling_mode=data_cfg.get("val_subsampling_mode", data_cfg.get("subsampling_mode", "sphere_crop")),
-        sphere_point_max=data_cfg.get("val_sphere_point_max", data_cfg.get("sphere_point_max", None)),
+        max_points=eval_sampling["max_points"],
+        subsampling_mode=eval_sampling["subsampling_mode"],
+        sphere_point_max=eval_sampling["sphere_point_max"],
         train_augmentations=False,
         label_source=data_cfg.get("label_source", "pack"),
         scannet_eval_benchmark=eval_cfg.get("scannet_benchmark", "all"),

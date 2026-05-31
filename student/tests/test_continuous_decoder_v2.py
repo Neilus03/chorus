@@ -11,6 +11,7 @@ from student.models.continuous_decoder_v2 import (
     GranularityScaleSelector,
     RelationAwareQuerySelfAttention,
 )
+from student.models.finetune_wrapper import FineTuningWrapper
 
 
 def _decoder(**kwargs) -> ContinuousGeometryQueryDecoderV2:
@@ -224,3 +225,55 @@ def test_v2_feature_switches_disable_relation_local_and_head_film() -> None:
 
     assert out["mask_logits"].shape == (8, 24)
     assert out["diagnostics"]["local_gate_mean_layer_0"].item() == 0.0
+
+
+class _TinyV2Student(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.backbone = nn.Linear(8, 8)
+        self.decoder = _decoder(num_queries=8, num_layers=1)
+        self.num_queries = self.decoder.num_queries
+
+    def forward(
+        self,
+        points: torch.Tensor,
+        features: torch.Tensor,
+        *,
+        point_offsets: torch.Tensor | None = None,
+        target_g: torch.Tensor | float | None = None,
+    ) -> dict:
+        del point_offsets
+        feat = self.backbone(features)
+        return self.decoder(
+            feat,
+            point_xyz=points,
+            scene_tokens=feat[:16],
+            scene_xyz=points[:16],
+            target_g=0.5 if target_g is None else target_g,
+        )
+
+
+def test_finetune_wrapper_learned_prompt_with_v2_gets_gradient() -> None:
+    torch.manual_seed(4)
+    wrapper = FineTuningWrapper(_TinyV2Student(), init_g=0.5, mode="learned")
+    out = wrapper(torch.randn(32, 3), torch.randn(32, 8), target_g=0.2)
+
+    loss = out["mask_logits"].mean() + out["score_logits"].mean()
+    loss.backward()
+
+    assert isinstance(wrapper.g_ft_logit, nn.Parameter)
+    assert wrapper.g_ft_logit.grad is not None
+    groups = wrapper.parameter_groups(backbone_lr_scale=0.01)
+    assert len(groups) == 3
+    assert groups[0]["lr_scale"] == 0.01
+
+
+def test_finetune_wrapper_fixed_prompt_with_v2_is_frozen() -> None:
+    torch.manual_seed(5)
+    wrapper = FineTuningWrapper(_TinyV2Student(), init_g=0.5, mode="fixed")
+    out = wrapper(torch.randn(24, 3), torch.randn(24, 8))
+    (out["mask_logits"].mean() + out["score_logits"].mean()).backward()
+
+    assert not isinstance(wrapper.g_ft_logit, nn.Parameter)
+    assert getattr(wrapper.g_ft_logit, "grad", None) is None
+    assert len(wrapper.parameter_groups()) == 2

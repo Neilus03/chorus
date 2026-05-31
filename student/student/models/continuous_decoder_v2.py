@@ -805,6 +805,7 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
         target_g: torch.Tensor | float,
         multi_scale_tokens: list[torch.Tensor] | None = None,
         multi_scale_xyz: list[torch.Tensor] | None = None,
+        return_debug: bool = False,
     ) -> dict:
         assert point_feat.ndim == 2 and point_feat.shape[1] == self.in_channels
         assert scene_tokens.ndim == 2 and scene_tokens.shape[1] == self.in_channels
@@ -827,7 +828,7 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
 
         init_mem = mems[-1]
         init_xyz = xyzs[-1]
-        q_feat, q_xyz, q_radius, _ = self.initializer(init_mem, init_xyz, target_g_t)
+        q_feat, q_xyz, q_radius, q_source = self.initializer(init_mem, init_xyz, target_g_t)
         g_float = _as_granularity_float(target_g_t)
         local_radius = self.local_radius_min + (
             self.local_radius_max - self.local_radius_min
@@ -848,6 +849,12 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
         delta_step_norm_layer_means: list[torch.Tensor] = []
         local_gate_layer_means: list[torch.Tensor] = []
         anchor_in_scene_ratios: list[torch.Tensor] = []
+        debug_q_initial = q_xyz if return_debug else None
+        debug_q_layers: list[torch.Tensor] = []
+        debug_delta_steps: list[torch.Tensor] = []
+        debug_radii_layers: list[torch.Tensor] = []
+        debug_neighbor_counts: list[torch.Tensor] = []
+        debug_neighbor_zero: list[torch.Tensor] = []
         xyz_min = scene_xyz.min(dim=0, keepdim=True).values
         xyz_max = scene_xyz.max(dim=0, keepdim=True).values
 
@@ -879,6 +886,9 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
                 }
                 local_gate_layer_means.append(point_feat.new_tensor(0.0))
             local_stats_accum.append(local_stats)
+            if return_debug:
+                debug_neighbor_counts.append(local_stats["neighbor_count_mean"])
+                debug_neighbor_zero.append(local_stats["neighbor_zero_frac"])
 
             q_layer = self.layer_query_films[layer_idx](q_b.squeeze(0), g_emb)
             q_b = q_layer.unsqueeze(0)
@@ -907,6 +917,8 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
             delta_step_norm = torch.linalg.norm(delta_step, dim=-1)
             delta_step_norms.append(delta_step_norm.detach())
             delta_step_norm_layer_means.append(delta_step_norm.detach().mean())
+            if return_debug:
+                debug_delta_steps.append(delta_step)
             q_xyz_pre_clamp = q_xyz + delta_step
             anchor_in_scene_ratios.append(
                 ((q_xyz_pre_clamp >= xyz_min) & (q_xyz_pre_clamp <= xyz_max))
@@ -918,6 +930,9 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
             q_xyz = q_xyz_pre_clamp
             if self.clamp_to_scene_bounds:
                 q_xyz = torch.minimum(torch.maximum(q_xyz, xyz_min), xyz_max)
+            if return_debug:
+                debug_q_layers.append(q_xyz)
+                debug_radii_layers.append(q_radius)
             q_pos = self._position_encoding(q_xyz, q_b.squeeze(0))
             q_pos_b = q_pos.unsqueeze(0)
 
@@ -1018,6 +1033,37 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
         for i, value in enumerate(local_gate_layer_means):
             diagnostics[f"local_gate_mean_layer_{i}"] = value.detach()
         out["diagnostics"] = diagnostics
+        if return_debug:
+            out["debug"] = {
+                "query_anchors_initial": debug_q_initial,
+                "query_anchors_by_layer": (
+                    torch.stack(debug_q_layers, dim=0)
+                    if debug_q_layers
+                    else q_xyz.new_zeros((0, q_xyz.shape[0], 3))
+                ),
+                "query_delta_steps_by_layer": (
+                    torch.stack(debug_delta_steps, dim=0)
+                    if debug_delta_steps
+                    else q_xyz.new_zeros((0, q_xyz.shape[0], 3))
+                ),
+                "query_radii_by_layer": (
+                    torch.stack(debug_radii_layers, dim=0)
+                    if debug_radii_layers
+                    else q_radius.view(1, -1)
+                ),
+                "query_source_type": q_source,
+                "scale_weights": scale_weights,
+                "local_neighbor_count_by_layer": (
+                    torch.stack(debug_neighbor_counts, dim=0)
+                    if debug_neighbor_counts
+                    else q_radius.new_zeros((0,))
+                ),
+                "local_neighbor_zero_fraction_by_layer": (
+                    torch.stack(debug_neighbor_zero, dim=0)
+                    if debug_neighbor_zero
+                    else q_radius.new_zeros((0,))
+                ),
+            }
 
         return out
 
@@ -1031,6 +1077,7 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
         scene_xyz: torch.Tensor | None = None,
         multi_scale_tokens: list[torch.Tensor] | None = None,
         multi_scale_xyz: list[torch.Tensor] | None = None,
+        return_debug: bool = False,
     ) -> dict:
         if scene_tokens is None or scene_xyz is None:
             raise ValueError(
@@ -1048,6 +1095,7 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
                 scene_tokens,
                 scene_xyz,
                 target_g,
+                return_debug=return_debug,
                 **ms_kw,
             )
 
@@ -1062,6 +1110,7 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
                 scene_tokens,
                 scene_xyz,
                 target_g,
+                return_debug=return_debug,
                 **ms_kw,
             )
             batched: dict = {
@@ -1075,6 +1124,8 @@ class ContinuousGeometryQueryDecoderV2(ContinuousDecoderMixin, nn.Module):
                 ]
             if "diagnostics" in out:
                 batched["diagnostics"] = out["diagnostics"]
+            if "debug" in out:
+                batched["debug"] = out["debug"]
             return batched
 
         raise ValueError(

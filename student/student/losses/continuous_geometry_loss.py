@@ -145,6 +145,7 @@ class ContinuousGeometryCriterion(nn.Module):
                     targets,
                     aux_result,
                 )
+                result[f"loss_aux_layer_{aux_idx}"] = aux_result["loss_total"].detach()
                 aux_center_terms.append(weighted_center.detach())
                 if aux_loss_sum is None:
                     aux_loss_sum = aux_result["loss_total"]

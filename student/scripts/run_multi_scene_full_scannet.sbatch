@@ -48,15 +48,19 @@ export WANDB_MODE=offline
 export CHORUS_OUTPUT_ROOT="/cluster/work/igp_psr/nedela/student_runs"
 export SCANNET_SCANS_ROOT="/cluster/work/igp_psr/nedela/chorus_poc/scans"
 export LITEPT_ROOT="/cluster/work/igp_psr/nedela/LitePT"
+export CHORUS_SCANNET_METADATA_ROOT="${LITEPT_ROOT}/datasets/preprocessing/scannet/meta_data"
 
 
-CONFIG_ARG="${1:-full_scannet_ddp4}"
+CONFIG_ARG="${1:-configs/scannet_full_continuous_v2_pseudo_pretrain.yaml}"
 shift || true
 
 # Allow either a short name or a direct path
 case "${CONFIG_ARG}" in
   full_scannet|scannet_full|full_scannet_ddp4|scannet_full_ddp4|full_scannet_4gpu)
-    CONFIG_PATH="configs/scannet_full_ddp4.yaml"
+    CONFIG_PATH="configs/scannet_full_continuous_v2_pseudo_pretrain.yaml"
+    ;;
+  v2_pseudo_pretrain|continuous_v2_pseudo_pretrain|scannet_v2_pseudo_pretrain)
+    CONFIG_PATH="configs/scannet_full_continuous_v2_pseudo_pretrain.yaml"
     ;;
   full_scannet_ddp4_batched|scannet_full_ddp4_batched|full_scannet_4gpu_batched)
     CONFIG_PATH="configs/scannet_full_ddp4_batched.yaml"

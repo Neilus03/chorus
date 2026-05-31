@@ -74,6 +74,7 @@ class StudentInstanceSegModel(nn.Module):
         *,
         target_g: torch.Tensor | float | None = None,
         point_offsets: torch.Tensor | None = None,
+        return_debug: bool = False,
     ) -> dict | list[dict]:
         """
         Parameters
@@ -97,6 +98,8 @@ class StudentInstanceSegModel(nn.Module):
         decoder_kw: dict = {}
         if self._continuous and target_g is not None:
             decoder_kw["target_g"] = target_g
+        if return_debug and self._continuous:
+            decoder_kw["return_debug"] = True
 
         if bb.point_offsets.numel() <= 1:
             return self.decoder(

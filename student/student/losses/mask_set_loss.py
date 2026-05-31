@@ -403,6 +403,10 @@ class MaskSetCriterion(nn.Module):
         if len(pred_idx) > 0:
             matched_pred = mask_logits[pred_idx_t][:, supervised]   # [M', K]
             matched_gt = gt_masks[gt_idx_t][:, supervised].float()  # [M', K]
+            matched_ious = soft_iou_score_target(
+                matched_pred,
+                matched_gt,
+            ).detach().to(dtype=score_logits.dtype)
 
             bce_per_pair = torch.stack([
                 masked_bce_with_logits(matched_pred[i], matched_gt[i])
@@ -418,6 +422,7 @@ class MaskSetCriterion(nn.Module):
         else:
             loss_mask_bce = mask_logits.sum() * 0.0
             loss_mask_dice = mask_logits.sum() * 0.0
+            matched_ious = score_logits.new_zeros((0,))
 
         # ── score loss ──
         score_targets = torch.zeros(
@@ -434,10 +439,7 @@ class MaskSetCriterion(nn.Module):
                     dtype=score_logits.dtype,
                 )
             else:
-                matched_score_targets = soft_iou_score_target(
-                    matched_pred,
-                    matched_gt,
-                ).detach().to(dtype=score_logits.dtype)
+                matched_score_targets = matched_ious
             score_targets[pred_idx_t] = matched_score_targets
             score_positive_mask[pred_idx_t] = True
         else:
@@ -571,6 +573,8 @@ class MaskSetCriterion(nn.Module):
             "num_matches": len(pred_idx),
             "matched_pred_indices": pred_idx,
             "matched_gt_indices": gt_idx,
+            "matched_target_indices": gt_idx,
+            "matched_ious": matched_ious.detach(),
             "cost_matrix_shape": tuple(cost_matrix.shape),
         }
 

@@ -36,6 +36,7 @@ from student.config_utils import (
     set_seed,
 )
 from student.data.multi_scene_dataset import MultiSceneDataset, build_scene_list
+from student.data.eval_sampling import resolve_eval_sampling_config
 from student.losses import (
     ContinuousGeometryCriterion,
     MaskSetCriterion,
@@ -441,16 +442,22 @@ def main() -> None:
                 data_cfg.get("scannet_gt_supervise_all_points", False)
             ),
         )
-        val_max_pts = data_cfg.get("val_max_points", None)
+        eval_sampling = resolve_eval_sampling_config(data_cfg, eval_cfg)
+        log.info(
+            "Validation sampling: subsampling_mode=%s max_points=%s sphere_point_max=%s",
+            eval_sampling["subsampling_mode"],
+            eval_sampling["max_points"],
+            eval_sampling["sphere_point_max"],
+        )
         val_ds = MultiSceneDataset(
             val_dirs, granularities,
             use_colors=data_cfg.get("use_colors", True),
             append_xyz=data_cfg.get("append_xyz_to_features", False),
             use_normals=use_normals,
             preload=data_cfg.get("preload", True),
-            max_points=val_max_pts,
-            subsampling_mode=data_cfg.get("val_subsampling_mode", data_cfg.get("subsampling_mode", "sphere_crop")),
-            sphere_point_max=data_cfg.get("val_sphere_point_max", data_cfg.get("sphere_point_max", None)),
+            max_points=eval_sampling["max_points"],
+            subsampling_mode=eval_sampling["subsampling_mode"],
+            sphere_point_max=eval_sampling["sphere_point_max"],
             train_augmentations=False,
             label_source=data_cfg.get("label_source", "pack"),
             scannet_eval_benchmark=eval_cfg.get("scannet_benchmark", "all"),
@@ -723,6 +730,8 @@ def main() -> None:
             fragment_merge_num=int(eval_cfg.get("fragment_merge_num", 4)),
             fragment_merge_point_max=eval_cfg.get("fragment_merge_point_max", None),
             fragment_merge_seed=int(eval_cfg.get("fragment_merge_seed", seed)),
+            require_full_scene_eval=bool(args.eval_only)
+            and not bool(eval_cfg.get("fragment_merge_eval", False)),
             prompt_finetune=prompt_ft_enabled,
             prompt_target_granularity=granularities[0] if prompt_ft_enabled else None,
             anchor_refinement_warmup_epochs=int(
@@ -732,6 +741,7 @@ def main() -> None:
                 train_cfg.get("anchor_refinement_warmup_start_scale", 0.0)
             ),
             delta_disable_epochs=int(train_cfg.get("delta_disable_epochs", 0)),
+            debug_config=cfg.get("debug", None),
             num_workers=int(train_cfg.get("num_workers", 0)),
             log_every_steps=int(train_cfg.get("log_every_steps", 1)),
             batch_scenes_per_step=int(train_cfg.get("batch_scenes_per_step", 1)),
@@ -805,9 +815,14 @@ def main() -> None:
                         f"Checkpoint appears to have {signature}. "
                         "Use a continuous_v2 checkpoint or initialize V2 fresh."
                     )
+            allow_partial_load = bool(model_cfg.get("allow_partial_decoder_load", False))
             trainer.load_weights_only(
                 loaded_checkpoint_path,
-                strict=not bool(model_cfg.get("class_aware_instance", False)),
+                strict=not (
+                    allow_partial_load
+                    or bool(model_cfg.get("class_aware_instance", False))
+                ),
+                report_path=out_dir / "checkpoint_load_report.json",
             )
             _dist_barrier()
         elif args.resume:
@@ -840,6 +855,8 @@ def main() -> None:
                     json.dump(eval_summary, f, indent=2)
                 log.info("Saved eval-only summary to %s", out_dir / "eval_only_summary.json")
             _dist_barrier()
+            if getattr(trainer, "debug_observer", None) is not None:
+                trainer.debug_observer.close()
             return
 
         if args.eval_before_train:

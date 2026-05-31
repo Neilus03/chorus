@@ -45,6 +45,7 @@ from student.engine.multi_scene_evaluator import (
     aggregate_multi_scene_results,
     evaluate_multi_scene,
 )
+from student.engine.debug_observability import DebugObserver
 from student.losses.mask_set_loss import MultiGranCriterion, SingleGranCriterion
 from student.models.continuous_base import is_continuous_decoder
 from student.models.finetune_wrapper import FineTuningWrapper
@@ -126,6 +127,16 @@ _DECODER_DIAGNOSTIC_KEYS = (
     "local_gate_mean_layer_3",
 )
 
+_TRAIN_STEP_EXTRA_PREFIXES = (
+    "active_granularity",
+    "lr_group_",
+    "target_",
+    "score_logits_",
+    "score_prob_",
+    "mask_logits_",
+    "mask_prob_",
+)
+
 
 def _canonical_best_metric_name(name: str) -> str:
     """Map old ambiguous AP config keys to new official keys for new runs."""
@@ -195,6 +206,102 @@ def _copy_geometry_diagnostics(dst: dict[str, Any], src: dict[str, Any]) -> None
             value = decoder_diagnostics.get(key)
             if isinstance(value, torch.Tensor) and value.numel() == 1:
                 dst[key] = value.detach()
+
+
+def _stat_tensor(prefix: str, tensor: torch.Tensor) -> dict[str, float]:
+    tensor = tensor.detach().float()
+    if tensor.numel() == 0:
+        return {
+            f"{prefix}_mean": float("nan"),
+            f"{prefix}_std": float("nan"),
+            f"{prefix}_min": float("nan"),
+            f"{prefix}_max": float("nan"),
+        }
+    return {
+        f"{prefix}_mean": float(tensor.mean().item()),
+        f"{prefix}_std": float(tensor.std(unbiased=False).item()),
+        f"{prefix}_min": float(tensor.min().item()),
+        f"{prefix}_max": float(tensor.max().item()),
+    }
+
+
+def _prediction_head_for_granularity(
+    scene_pred: dict[str, Any],
+    granularity: str,
+) -> dict[str, torch.Tensor] | None:
+    heads = scene_pred.get("heads")
+    if isinstance(heads, dict):
+        head = heads.get(granularity)
+        return head if isinstance(head, dict) else None
+    return scene_pred
+
+
+def _collect_prediction_diagnostics(
+    pred: dict[str, Any] | list[dict[str, Any]],
+    active_grans: list[str],
+) -> dict[str, float]:
+    preds = pred if isinstance(pred, list) else [pred]
+    metrics: dict[str, float] = {}
+    for granularity in active_grans:
+        score_parts: list[torch.Tensor] = []
+        mask_parts: list[torch.Tensor] = []
+        for scene_pred in preds:
+            if not isinstance(scene_pred, dict):
+                continue
+            head = _prediction_head_for_granularity(scene_pred, granularity)
+            if not isinstance(head, dict):
+                continue
+            if isinstance(head.get("score_logits"), torch.Tensor):
+                score_parts.append(head["score_logits"].detach().flatten())
+            if isinstance(head.get("mask_logits"), torch.Tensor):
+                mask_parts.append(head["mask_logits"].detach().flatten())
+        if score_parts:
+            score_logits = torch.cat(score_parts)
+            score_probs = score_logits.sigmoid()
+            metrics.update(_stat_tensor(f"score_logits_{granularity}", score_logits))
+            metrics.update(_stat_tensor(f"score_prob_{granularity}", score_probs))
+            for threshold in (0.0, 0.01, 0.05, 0.1):
+                key = str(threshold).replace(".", "p")
+                metrics[f"score_prob_frac_gt_{key}_{granularity}"] = float(
+                    (score_probs > threshold).float().mean().item()
+                )
+        if mask_parts:
+            mask_logits = torch.cat(mask_parts)
+            mask_probs = mask_logits.sigmoid()
+            metrics.update(_stat_tensor(f"mask_logits_{granularity}", mask_logits))
+            metrics[f"mask_prob_frac_ge_0p5_{granularity}"] = float(
+                (mask_probs >= 0.5).float().mean().item()
+            )
+    return metrics
+
+
+def _collect_target_diagnostics(
+    targets_by_scene: list[dict[str, Any]],
+    active_grans: list[str],
+) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for granularity in active_grans:
+        targets = [
+            scene_targets[granularity]
+            for scene_targets in targets_by_scene
+            if granularity in scene_targets
+        ]
+        if not targets:
+            continue
+        metrics[f"target_num_instances_{granularity}"] = float(
+            sum(int(t.num_instances) for t in targets)
+        )
+        metrics[f"target_supervised_points_{granularity}"] = float(
+            sum(int(t.supervision_mask.sum().item()) for t in targets)
+        )
+        metrics[f"target_valid_points_{granularity}"] = float(
+            sum(int(t.gt_masks.any(dim=0).sum().item()) if t.gt_masks.numel() else 0 for t in targets)
+        )
+    return metrics
+
+
+def _is_extra_train_step_metric(key: str) -> bool:
+    return key.startswith(_TRAIN_STEP_EXTRA_PREFIXES)
 
 
 def _format_aggregate_bits(
@@ -319,6 +426,12 @@ def sample_granularity_ddp(
     else:
         idx = torch.randint(n, (1,)).item()
 
+    if idx < 0 or idx >= n:
+        raise RuntimeError(
+            "Distributed granularity broadcast returned an out-of-range index "
+            f"{idx} for {n} granularities. This usually means DDP ranks executed "
+            "different collective paths before sampling."
+        )
     return granularity_keys[idx], granularity_vals[idx]
 
 try:
@@ -447,11 +560,13 @@ class MultiSceneTrainer:
         fragment_merge_num: int = 4,
         fragment_merge_point_max: int | None = None,
         fragment_merge_seed: int = 0,
+        require_full_scene_eval: bool = False,
         prompt_finetune: bool = False,
         prompt_target_granularity: str | None = None,
         anchor_refinement_warmup_epochs: int = 0,
         anchor_refinement_warmup_start_scale: float = 0.0,
         delta_disable_epochs: int = 0,
+        debug_config: dict[str, Any] | None = None,
     ) -> None:
         self.device = device
         self.lr = lr
@@ -510,6 +625,7 @@ class MultiSceneTrainer:
         self.fragment_merge_num = int(fragment_merge_num)
         self.fragment_merge_point_max = fragment_merge_point_max
         self.fragment_merge_seed = int(fragment_merge_seed)
+        self.require_full_scene_eval = bool(require_full_scene_eval)
         self.prompt_finetune = bool(prompt_finetune)
         self.prompt_target_granularity = (
             str(prompt_target_granularity)
@@ -522,6 +638,12 @@ class MultiSceneTrainer:
         self._last_anchor_refinement_scale: float | None = None
         self._grad_norm_pre_clip_recent: list[float] = []
         self._grad_norm_post_clip_recent: list[float] = []
+        self.debug_enabled = bool((debug_config or {}).get("enabled", False))
+        self.debug_observer = DebugObserver(
+            output_dir=self.output_dir,
+            debug_config=debug_config,
+            is_main_process=self.is_main_process,
+        )
 
         # Detect continuous decoder mode
         base_decoder = getattr(_unwrap_prompt_model(model), "decoder", None)
@@ -851,6 +973,7 @@ class MultiSceneTrainer:
             fragment_merge_num=self.fragment_merge_num,
             fragment_merge_point_max=self.fragment_merge_point_max,
             fragment_merge_seed=self.fragment_merge_seed,
+            require_full_scene=self.require_full_scene_eval,
             prompt_finetune=self.prompt_finetune,
             prompt_target_granularity=self.prompt_target_granularity,
         )
@@ -1107,6 +1230,9 @@ class MultiSceneTrainer:
                 "loss_score": result["loss_score"],
                 "loss_class": result.get("loss_class", result["loss_score"] * 0.0),
             }}
+            for key, value in result.items():
+                if key.startswith("loss_aux_layer_"):
+                    result["heads"][sampled_g_key][key] = value
             _copy_score_target_diagnostics(result["heads"][sampled_g_key], result)
             _copy_geometry_diagnostics(result["heads"][sampled_g_key], result)
             return result
@@ -1118,6 +1244,7 @@ class MultiSceneTrainer:
             "scene_loss_totals": [
                 float(r["loss_total"].detach().item()) for r in scene_results
             ],
+            "debug_scene_losses": scene_results,
             "heads": {
                 sampled_g_key: {
                     "loss_total": torch.stack([
@@ -1151,6 +1278,12 @@ class MultiSceneTrainer:
                     result["heads"][sampled_g_key][key] = value
                     break
         for key in _GEOMETRY_DIAGNOSTIC_KEYS:
+            values = [r[key] for r in scene_results if key in r]
+            mean_value = _maybe_stack_mean(values)
+            if mean_value is not None:
+                result["heads"][sampled_g_key][key] = mean_value
+        for aux_idx in range(8):
+            key = f"loss_aux_layer_{aux_idx}"
             values = [r[key] for r in scene_results if key in r]
             mean_value = _maybe_stack_mean(values)
             if mean_value is not None:
@@ -1385,7 +1518,13 @@ class MultiSceneTrainer:
             self.best_epoch,
         )
 
-    def load_weights_only(self, path: Path | str, *, strict: bool = True) -> None:
+    def load_weights_only(
+        self,
+        path: Path | str,
+        *,
+        strict: bool = True,
+        report_path: Path | str | None = None,
+    ) -> dict[str, Any]:
         """Load model weights from a checkpoint but reset training state.
 
         Intended for finetuning: initialize the model from a prior run while
@@ -1420,9 +1559,23 @@ class MultiSceneTrainer:
             load_result = target_model.model.load_state_dict(model_state_dict, strict=strict)
         else:
             load_result = target_model.load_state_dict(model_state_dict, strict=strict)
+        missing = list(getattr(load_result, "missing_keys", []))
+        unexpected = list(getattr(load_result, "unexpected_keys", []))
+        report = {
+            "checkpoint": str(ckpt_path),
+            "strict": bool(strict),
+            "loading_base_into_prompt": bool(loading_base_into_prompt),
+            "missing_keys": missing,
+            "unexpected_keys": unexpected,
+        }
+        if (not strict or report_path is not None) and self.is_main_process:
+            report_dest = Path(report_path) if report_path is not None else (
+                self.output_dir / "checkpoint_load_report.json"
+            )
+            with report_dest.open("w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2)
+            log.info("Checkpoint load report saved: %s", report_dest)
         if not strict:
-            missing = list(getattr(load_result, "missing_keys", []))
-            unexpected = list(getattr(load_result, "unexpected_keys", []))
             log.info(
                 "Weights-only non-strict load: missing=%d unexpected=%d",
                 len(missing),
@@ -1443,6 +1596,7 @@ class MultiSceneTrainer:
             ckpt_path,
             strict,
         )
+        return report
 
     # ------------------------------------------------------------------ #
 
@@ -1521,6 +1675,12 @@ class MultiSceneTrainer:
             }
             if self._continuous and not self.prompt_finetune and sampled_g_val is not None:
                 forward_kwargs["target_g"] = sampled_g_val
+            debug_this_step = (
+                self.debug_observer is not None
+                and self.debug_observer.should_return_debug_for_step(self.global_step)
+            )
+            if debug_this_step:
+                forward_kwargs["return_debug"] = True
 
             pred = self.model(
                 points,
@@ -1575,8 +1735,40 @@ class MultiSceneTrainer:
             step_total_ms = (time.perf_counter() - step_start) * 1000.0
 
             metrics_sync_ms = 0.0
+            debug_metrics: dict[str, Any] = {}
+            if (
+                self.debug_observer is not None
+                and self.debug_observer.should_log_step(self.global_step)
+            ):
+                active_grans_for_debug = (
+                    [sampled_g_key] if sampled_g_key is not None else list(self.granularities)
+                )
+                debug_metrics = self.debug_observer.collect_step_scalars(
+                    epoch=epoch,
+                    global_step=self.global_step,
+                    model=self._model_module(),
+                    pred=pred,
+                    loss_result=loss_result,
+                    targets_by_scene=targets_by_scene,
+                    batch=batch,
+                    active_granularities=active_grans_for_debug,
+                    sampled_g_key=sampled_g_key,
+                    sampled_g_val=sampled_g_val,
+                    optimizer=self.optimizer,
+                    grad_norm_pre_clip=grad_norm_pre_clip,
+                    grad_norm_post_clip=grad_norm_post_clip,
+                    device=self.device,
+                )
+                self.debug_observer.log_scalars(debug_metrics, step=self.global_step)
+                if self.is_main_process and self.debug_observer.scalars_cfg.get("log_to_jsonl", True):
+                    self._log_row({"debug_scalars": True, **debug_metrics})
+
             should_log_step = self.global_step % self.log_every_steps == 0
             if should_log_step:
+                active_grans = (
+                    [sampled_g_key] if sampled_g_key is not None
+                    else list(self.granularities)
+                )
                 grad_pre_stats = _rolling_grad_stats(self._grad_norm_pre_clip_recent)
                 grad_post_stats = _rolling_grad_stats(self._grad_norm_post_clip_recent)
                 step_metrics: dict[str, float] = {
@@ -1595,15 +1787,20 @@ class MultiSceneTrainer:
                     "num_points_total": float(num_points_total),
                     "num_points_max_scene": float(num_points_max_scene),
                 }
+                for group_idx, group in enumerate(self.optimizer.param_groups):
+                    step_metrics[f"lr_group_{group_idx}"] = float(group["lr"])
+                if sampled_g_val is not None:
+                    step_metrics["active_granularity_value"] = float(sampled_g_val)
                 if self.prompt_finetune:
                     prompt_model = self._model_module()
                     if isinstance(prompt_model, FineTuningWrapper):
                         step_metrics["learned_granularity"] = prompt_model.learned_granularity
-                # Collect per-head metrics from loss_result["heads"]
-                active_grans = (
-                    [sampled_g_key] if sampled_g_key is not None
-                    else list(self.granularities)
+                        step_metrics["active_granularity_value"] = prompt_model.learned_granularity
+                step_metrics.update(
+                    _collect_target_diagnostics(targets_by_scene, active_grans)
                 )
+                step_metrics.update(_collect_prediction_diagnostics(pred, active_grans))
+                # Collect per-head metrics from loss_result["heads"]
                 for g in active_grans:
                     if g in loss_result.get("heads", {}):
                         ld_g = loss_result["heads"][g]
@@ -1646,12 +1843,13 @@ class MultiSceneTrainer:
                     else:
                         scene_label = ",".join(scene_ids_local)
                     log.info(
-                        "  epoch %d  step %d  scenes=%s  loss=%.4f  [%s]  "
+                        "  epoch %d  step %d  scenes=%s  active=%s  loss=%.4f  [%s]  "
                         "gnorm=%.3f->%.3f  gp95=%.3f->%.3f  gmax=%.3f->%.3f  "
                         "%.0fms  pts=%d  max_scene_pts=%d",
                         epoch,
                         self.global_step,
                         scene_label,
+                        ",".join(active_grans),
                         step_metrics["loss_total"],
                         per_head_str,
                         step_metrics["grad_norm_pre_clip"],
@@ -1664,6 +1862,18 @@ class MultiSceneTrainer:
                         int(step_metrics["num_points_total"]),
                         int(step_metrics["num_points_max_scene"]),
                     )
+                    if debug_metrics:
+                        dbg_g = active_grans[0] if active_grans else ""
+                        log.info(
+                            "    debug %s matched=%.2f score_gap=%.3f dup_iou=%.3f "
+                            "mask_p50=%.1f grad_dec=%.3f",
+                            dbg_g,
+                            float(debug_metrics.get(f"debug/matching/matched_query_fraction_{dbg_g}", 0.0) or 0.0),
+                            float(debug_metrics.get(f"debug/calibration/score_gap_matched_minus_unmatched_{dbg_g}", 0.0) or 0.0),
+                            float(debug_metrics.get(f"debug/query/duplicate_iou_topk_mean_{dbg_g}", 0.0) or 0.0),
+                            float(debug_metrics.get(f"debug/mask/area_p50_{dbg_g}", 0.0) or 0.0),
+                            float(debug_metrics.get("debug/grad/decoder", 0.0) or 0.0),
+                        )
 
                     row: dict[str, Any] = {
                         "epoch": epoch,
@@ -1685,7 +1895,11 @@ class MultiSceneTrainer:
                         "num_points_max_scene": int(step_metrics["num_points_max_scene"]),
                         "metrics_synced": self.distributed and self.sync_step_metrics,
                         "world_size": self.world_size,
+                        "active_granularities": active_grans,
                     }
+                    for key, value in step_metrics.items():
+                        if key not in row and _is_extra_train_step_metric(key):
+                            row[key] = value
                     if self.distributed and self.log_scene_ids:
                         row["scene_ids_by_rank"] = scene_ids_by_rank
                     if "learned_granularity" in step_metrics:
@@ -1764,6 +1978,9 @@ class MultiSceneTrainer:
                             wb["train_scene/learned_granularity"] = step_metrics["learned_granularity"]
                         if "loss_aux" in step_metrics:
                             wb["train_scene/loss_aux"] = step_metrics["loss_aux"]
+                        for key, value in step_metrics.items():
+                            if _is_extra_train_step_metric(key):
+                                wb[f"train_scene/{key}"] = value
                         wandb.log(wb)
                 self._grad_norm_pre_clip_recent.clear()
                 self._grad_norm_post_clip_recent.clear()
@@ -2150,6 +2367,36 @@ class MultiSceneTrainer:
 
             self._train_one_epoch(epoch)
             self.scheduler.step()
+            if self.debug_enabled:
+                self._dist_barrier()
+                if (
+                    self.is_main_process
+                    and self.debug_observer is not None
+                    and self.debug_observer.enabled
+                ):
+                    self.debug_observer.run_micro_eval_if_due(
+                        epoch=epoch,
+                        model=self._model_module(),
+                        train_dataset=self.train_dataset,
+                        val_dataset=self.val_dataset,
+                        criterion=self.criterion,
+                        device=self.device,
+                        granularities=self.granularities,
+                        min_instance_points=self.min_instance_points,
+                        dense_instance_ids=self.dense_instance_ids,
+                    )
+                    self.debug_observer.write_rich_snapshots_if_due(
+                        epoch=epoch,
+                        model=self._model_module(),
+                        train_dataset=self.train_dataset,
+                        val_dataset=self.val_dataset,
+                        criterion=self.criterion,
+                        device=self.device,
+                        granularities=self.granularities,
+                        min_instance_points=self.min_instance_points,
+                        dense_instance_ids=self.dense_instance_ids,
+                    )
+                self._dist_barrier()
 
             epoch_times.append(time.time() - t_epoch)
 
@@ -2204,6 +2451,8 @@ class MultiSceneTrainer:
                 self.max_epochs, total_time,
                 total_time / max(self.max_epochs, 1),
             )
+        if self.debug_observer is not None:
+            self.debug_observer.close()
 
         return {
             "final_val_metrics": last_val_metrics,

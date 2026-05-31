@@ -171,6 +171,21 @@ def test_class_agnostic_mapping_ignores_semantic_class_ids() -> None:
     assert _eval(records)["AP50"] == 1.0
 
 
+def test_class_agnostic_predictions_do_not_require_predicted_class_ids() -> None:
+    records = _records(
+        "scene0000_00",
+        [1, 1, 2, 2],
+        [[True, True, False, False], [False, False, True, True]],
+        [0.8, 0.7],
+        class_agnostic=True,
+        gt_instance_class_ids={1: 4, 2: 17},
+        pred_class_ids=np.asarray([999, 998], dtype=np.int64),
+    )
+
+    assert {pred["class_id"] for pred in records["predictions"]} == {"object"}
+    assert _eval(records)["AP50"] == 1.0
+
+
 def test_class_aware_wrong_class_does_not_match() -> None:
     records = _records(
         "scene0000_00",
