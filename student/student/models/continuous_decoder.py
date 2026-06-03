@@ -168,6 +168,7 @@ class ContinuousQueryInstanceDecoder(ContinuousDecoderMixin, nn.Module):
         target_g: torch.Tensor | float,
         multi_scale_tokens: list[torch.Tensor] | None = None,
         multi_scale_xyz: list[torch.Tensor] | None = None,
+        return_debug: bool = False,
     ) -> dict:
         """Core forward on unbatched tensors.
 
@@ -290,6 +291,11 @@ class ContinuousQueryInstanceDecoder(ContinuousDecoderMixin, nn.Module):
             "score_logits": self.head.score_head(refined_q).squeeze(-1),  # [Q]
             "query_embed": refined_q,
         }
+        if return_debug:
+            out["debug"] = {
+                "query_anchors_initial": q_xyz.detach(),
+                "query_anchors_by_layer": q_xyz.detach().unsqueeze(0).expand(num_layers, -1, -1),
+            }
         class_logits = self.head.class_logits(refined_q)
         if class_logits is not None:
             out["class_logits"] = class_logits
@@ -310,6 +316,7 @@ class ContinuousQueryInstanceDecoder(ContinuousDecoderMixin, nn.Module):
         scene_xyz: torch.Tensor | None = None,
         multi_scale_tokens: list[torch.Tensor] | None = None,
         multi_scale_xyz: list[torch.Tensor] | None = None,
+        return_debug: bool = False,
     ) -> dict:
         """
         Parameters
@@ -340,7 +347,12 @@ class ContinuousQueryInstanceDecoder(ContinuousDecoderMixin, nn.Module):
 
         if point_feat.ndim == 2:
             return self._forward_unbatched(
-                point_feat, scene_tokens, scene_xyz, target_g, **ms_kw,
+                point_feat,
+                scene_tokens,
+                scene_xyz,
+                target_g,
+                return_debug=return_debug,
+                **ms_kw,
             )
 
         if point_feat.ndim == 3:
@@ -348,7 +360,12 @@ class ContinuousQueryInstanceDecoder(ContinuousDecoderMixin, nn.Module):
                 f"Only batch_size=1 supported, got {tuple(point_feat.shape)}"
             )
             out = self._forward_unbatched(
-                point_feat[0], scene_tokens, scene_xyz, target_g, **ms_kw,
+                point_feat[0],
+                scene_tokens,
+                scene_xyz,
+                target_g,
+                return_debug=return_debug,
+                **ms_kw,
             )
             batched: dict = {
                 k: v.unsqueeze(0) for k, v in out.items()
@@ -359,6 +376,8 @@ class ContinuousQueryInstanceDecoder(ContinuousDecoderMixin, nn.Module):
                     {k: v.unsqueeze(0) for k, v in aux.items()}
                     for aux in out["aux_outputs"]
                 ]
+            if "debug" in out:
+                batched["debug"] = out["debug"]
             return batched
 
         raise ValueError(
