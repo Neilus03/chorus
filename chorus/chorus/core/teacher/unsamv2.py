@@ -10,7 +10,7 @@ import numpy as np
 from PIL import Image
 import torch
 
-from chorus.common.types import TeacherOutput
+from chorus.common.types import FrameRecord, TeacherOutput
 from chorus.core.teacher.base import TeacherModel
 from chorus.datasets.base import SceneAdapter
 
@@ -189,9 +189,30 @@ class UnSAMv2Teacher(TeacherModel):
         self._ensure_loaded()
 
         output_dir = adapter.scene_root / f"unsam_masks_g{granularity}"
-        output_dir.mkdir(parents=True, exist_ok=True)
-
         frames = adapter.list_frames()[::frame_skip]
+        return self.run_on_frames(
+            adapter=adapter,
+            granularity=granularity,
+            frames=frames,
+            output_dir=output_dir,
+            overwrite=self.overwrite,
+        )
+
+    def run_on_frames(
+        self,
+        adapter: SceneAdapter,
+        granularity: float,
+        frames: list[FrameRecord],
+        output_dir: Path,
+        overwrite: bool | None = None,
+        mask_dtype: np.dtype | str = np.int32,
+    ) -> TeacherOutput:
+        self._ensure_loaded()
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        should_overwrite = self.overwrite if overwrite is None else bool(overwrite)
+        mask_dtype = np.dtype(mask_dtype)
         print(
             f"Teacher UnSAMv2: dataset={adapter.dataset_name}, scene={adapter.scene_id}, "
             f"granularity={granularity}, frames={len(frames)}"
@@ -203,7 +224,7 @@ class UnSAMv2Teacher(TeacherModel):
         for frame_idx, frame in enumerate(frames):
             mask_path = output_dir / f"{frame.frame_id}.npy"
 
-            if mask_path.exists() and not self.overwrite:
+            if mask_path.exists() and not should_overwrite:
                 frame_mask = np.load(mask_path)
                 saved_count = int(np.max(frame_mask)) if frame_mask.size > 0 else 0
                 total_masks += saved_count
@@ -220,7 +241,7 @@ class UnSAMv2Teacher(TeacherModel):
                     masks_data = self._relaxed_mask_generator.generate(image, gra=granularity)
                     used_fallback = True
 
-            frame_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.int32)
+            frame_mask = np.zeros((image.shape[0], image.shape[1]), dtype=mask_dtype)
             local_mask_id = 1
 
             masks_sorted = sorted(masks_data, key=lambda m: m.get("area", 0), reverse=True)
@@ -229,6 +250,10 @@ class UnSAMv2Teacher(TeacherModel):
                 if bool_mask is None:
                     continue
 
+                if local_mask_id > np.iinfo(mask_dtype).max:
+                    raise RuntimeError(
+                        f"Too many masks for dtype={mask_dtype}: local_mask_id={local_mask_id}"
+                    )
                 fill_region = bool_mask & (frame_mask == 0)
                 if np.any(fill_region):
                     frame_mask[fill_region] = local_mask_id

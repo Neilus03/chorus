@@ -373,6 +373,8 @@ def evaluate_and_save_scannet_oracle(
     eval_benchmark: str | None = SCANNET_EVAL_BENCHMARK_20,
     min_iou_for_ply: float = 0.1,
     save_artifacts: bool = True,
+    output_dir: Path | None = None,
+    gt_scene_root: Path | None = None,
 ) -> dict:
     if adapter.dataset_name == "scannet":
         resolved_benchmark = normalize_scannet_eval_benchmark(eval_benchmark)
@@ -382,7 +384,7 @@ def evaluate_and_save_scannet_oracle(
             else f"_{resolved_benchmark}"
         )
         gt_ids = load_scannet_gt_instance_ids(
-            adapter.scene_root,
+            Path(gt_scene_root) if gt_scene_root is not None else adapter.scene_root,
             adapter.scene_id,
             eval_benchmark=resolved_benchmark,
         )
@@ -423,7 +425,9 @@ def evaluate_and_save_scannet_oracle(
     )
     clustering_metrics = compute_clustering_metrics(gt_ids, oracle_best_labels)
 
-    scene_root = adapter.scene_root
+    scene_root = Path(output_dir) if output_dir is not None else adapter.scene_root
+    if save_artifacts:
+        scene_root.mkdir(parents=True, exist_ok=True)
     metrics_path = scene_root / f"oracle_metrics{suffix}.json"
     labels_path = scene_root / f"chorus_oracle_best_combined_labels{suffix}.npy"
     ply_path = scene_root / f"chorus_oracle_best_combined{suffix}.ply"
