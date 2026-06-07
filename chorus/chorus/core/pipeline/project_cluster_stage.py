@@ -385,6 +385,7 @@ def run_project_cluster_stage(
     cluster_selection_epsilon: float = 0.1,
     save_outputs: bool = True,
     hdbscan_max_samples: int | None = None,
+    hdbscan_subsample_fraction: float | None = None,
     hdbscan_subsample_seed: int = 0,
 ) -> ClusterOutput:
     svd_stage, feature_artifacts = compute_project_cluster_svd_stage(
@@ -396,12 +397,24 @@ def run_project_cluster_stage(
         min_samples=min_samples,
         cluster_selection_epsilon=cluster_selection_epsilon,
     )
+    hdbscan_max_samples_effective = hdbscan_max_samples
+    if hdbscan_subsample_fraction is not None:
+        fraction_cap = _hdbscan_cap_from_seen_fraction(
+            svd_stage.num_seen_points,
+            hdbscan_subsample_fraction,
+            min_cluster_size,
+        )
+        if hdbscan_max_samples_effective is None:
+            hdbscan_max_samples_effective = fraction_cap
+        else:
+            hdbscan_max_samples_effective = min(int(hdbscan_max_samples_effective), int(fraction_cap))
+
     labels_seen, clustering_stats = _dispatch_hdbscan(
         svd_stage.features_seen,
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
         cluster_selection_epsilon=cluster_selection_epsilon,
-        hdbscan_max_samples=hdbscan_max_samples,
+        hdbscan_max_samples=hdbscan_max_samples_effective,
         hdbscan_subsample_seed=hdbscan_subsample_seed,
     )
     return finalize_project_cluster_output(
@@ -412,7 +425,12 @@ def run_project_cluster_stage(
         labels_seen=labels_seen,
         clustering_stats=clustering_stats,
         save_outputs=save_outputs,
-        stats_overlay=None,
+        stats_overlay={
+            "hdbscan_max_samples_requested": hdbscan_max_samples,
+            "hdbscan_subsample_fraction": hdbscan_subsample_fraction,
+            "hdbscan_max_samples_effective": hdbscan_max_samples_effective,
+            "hdbscan_subsample_seed": int(hdbscan_subsample_seed),
+        },
     )
 
 
