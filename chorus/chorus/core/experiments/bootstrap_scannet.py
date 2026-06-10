@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
@@ -236,6 +237,52 @@ def _save_cluster_artifacts(
     )
 
 
+def _load_saved_cluster_artifacts(
+    *,
+    granularity: float,
+    output_dir: Path,
+    labels_name: str,
+    diagnostics_name: str,
+) -> ClusterOutput | None:
+    labels_path = output_dir / labels_name
+    diagnostics_path = output_dir / diagnostics_name
+    if not labels_path.exists():
+        return None
+
+    labels = np.load(labels_path).astype(np.int32, copy=False)
+    stats: dict[str, Any] = {}
+    if diagnostics_path.exists():
+        try:
+            with diagnostics_path.open("r", encoding="utf-8") as f:
+                diagnostics = json.load(f)
+            raw_stats = diagnostics.get("stats") if isinstance(diagnostics, dict) else None
+            if isinstance(raw_stats, dict):
+                stats.update(raw_stats)
+        except Exception as exc:
+            stats["resume_diagnostics_load_error"] = f"{type(exc).__name__}: {exc}"
+
+    seen_mask = labels >= 0
+    stats.update(
+        {
+            "granularity": float(granularity),
+            "num_points": int(labels.shape[0]),
+            "num_labeled_points": int(np.count_nonzero(seen_mask)),
+            "labeled_points_fraction": float(np.count_nonzero(seen_mask) / max(labels.shape[0], 1)),
+            "resumed_from_existing_artifacts": True,
+            "diagnostics_path": str(diagnostics_path) if diagnostics_path.exists() else None,
+        }
+    )
+    return ClusterOutput(
+        granularity=float(granularity),
+        labels=labels,
+        features=np.zeros((labels.shape[0], 1), dtype=np.float32),
+        seen_mask=seen_mask,
+        ply_path=None,
+        labels_path=labels_path,
+        stats=stats,
+    )
+
+
 def _make_fused_cluster_output(
     *,
     granularity: float,
@@ -307,13 +354,18 @@ def run_bootstrap_adapter_experiment(
     )
 
     scene_start = time.perf_counter()
+    print(f"[bootstrap {adapter.scene_id}] adapter.prepare start", flush=True)
     adapter.prepare()
+    print(f"[bootstrap {adapter.scene_id}] adapter.prepare done", flush=True)
 
     output_scene_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[bootstrap {adapter.scene_id}] list_frames start", flush=True)
     frames_all = adapter.list_frames()
+    print(f"[bootstrap {adapter.scene_id}] list_frames done: {len(frames_all)} frames", flush=True)
     if config.frame_skip <= 0:
         raise ValueError(f"frame_skip must be positive, got {config.frame_skip}")
     frames = frames_all[:: int(config.frame_skip)]
+    print(f"[bootstrap {adapter.scene_id}] frame skip done: {len(frames)} candidate frames", flush=True)
     frame_subsets = split_frames_for_bootstraps(
         frames,
         num_bootstraps=config.num_bootstraps,
@@ -321,6 +373,10 @@ def run_bootstrap_adapter_experiment(
         frame_sampling=config.frame_sampling,
         seed=frame_seed,
         max_frames_per_bootstrap=config.max_frames_per_bootstrap,
+    )
+    print(
+        f"[bootstrap {adapter.scene_id}] split done: {[len(s) for s in frame_subsets]} frames/subset",
+        flush=True,
     )
 
     fused_outputs: list[ClusterOutput] = []
@@ -333,6 +389,7 @@ def run_bootstrap_adapter_experiment(
 
     for granularity in config.granularities:
         g_key = f"g{granularity}"
+        print(f"[bootstrap {adapter.scene_id}] granularity {g_key} start", flush=True)
         bootstrap_outputs: list[ClusterOutput] = []
         bootstrap_rows: list[dict[str, Any]] = []
 
@@ -430,8 +487,47 @@ def run_bootstrap_adapter_experiment(
             for boot_idx, subset in enumerate(frame_subsets):
                 boot_root = output_scene_dir / "bootstraps" / f"b{boot_idx}"
                 mask_dir = boot_root / f"unsam_masks_g{granularity}"
+                existing_output = _load_saved_cluster_artifacts(
+                    granularity=float(granularity),
+                    output_dir=boot_root / g_key,
+                    labels_name="labels.npy",
+                    diagnostics_name="diagnostics.json",
+                )
+                if existing_output is not None:
+                    print(
+                        f"[bootstrap {adapter.scene_id}] {g_key} b{boot_idx} resume existing labels: "
+                        f"{existing_output.labels_path}",
+                        flush=True,
+                    )
+                    bootstrap_outputs.append(existing_output)
+                    bootstrap_rows.append(
+                        {
+                            "bootstrap_index": int(boot_idx),
+                            "num_frames": int(len(subset)),
+                            "frame_ids": [f.frame_id for f in subset],
+                            "teacher_seconds": 0.0,
+                            "project_svd_seconds": 0.0,
+                            "hdbscan_seconds": 0.0,
+                            "project_cluster_seconds": 0.0,
+                            "total_masks": existing_output.stats.get("total_masks"),
+                            "mask_dir": str(mask_dir),
+                            "shared_teacher_masks": False,
+                            "shared_projection_svd": False,
+                            "hdbscan_subsample_seed": int(config.hdbscan_subsample_seed + boot_idx),
+                            "num_clusters": existing_output.stats.get("num_clusters"),
+                            "labels_path": str(existing_output.labels_path),
+                            "diagnostics_path": existing_output.stats.get("diagnostics_path"),
+                            "resumed_from_existing_artifacts": True,
+                        }
+                    )
+                    continue
 
                 t0 = time.perf_counter()
+                print(
+                    f"[bootstrap {adapter.scene_id}] {g_key} b{boot_idx} teacher start: "
+                    f"{len(subset)} frames",
+                    flush=True,
+                )
                 teacher_output = teacher.run_on_frames(
                     adapter=adapter,
                     granularity=float(granularity),
@@ -442,8 +538,14 @@ def run_bootstrap_adapter_experiment(
                 )
                 teacher_s = time.perf_counter() - t0
                 total_teacher_s += teacher_s
+                print(
+                    f"[bootstrap {adapter.scene_id}] {g_key} b{boot_idx} teacher done in "
+                    f"{teacher_s:.1f}s",
+                    flush=True,
+                )
 
                 t0 = time.perf_counter()
+                print(f"[bootstrap {adapter.scene_id}] {g_key} b{boot_idx} cluster start", flush=True)
                 cluster_output = run_project_cluster_stage(
                     adapter=adapter,
                     teacher_output=teacher_output,
@@ -462,6 +564,11 @@ def run_bootstrap_adapter_experiment(
                 total_cluster_s += cluster_s
                 total_projection_svd_s += projection_svd_s
                 total_hdbscan_s += hdbscan_s
+                print(
+                    f"[bootstrap {adapter.scene_id}] {g_key} b{boot_idx} cluster done in "
+                    f"{cluster_s:.1f}s",
+                    flush=True,
+                )
 
                 saved_output = _save_cluster_artifacts(
                     source_adapter=adapter,

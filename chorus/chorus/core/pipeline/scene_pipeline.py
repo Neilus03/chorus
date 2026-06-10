@@ -19,6 +19,9 @@ def run_scene_pipeline(
     min_cluster_size: int = 100,
     min_samples: int = 5,
     cluster_selection_epsilon: float = 0.1,
+    hdbscan_max_samples: int | None = None,
+    hdbscan_subsample_fraction: float | None = None,
+    hdbscan_subsample_seed: int = 0,
     run_oracle_eval: bool = True,
     export_training_pack: bool = True,
 ) -> dict:
@@ -46,6 +49,9 @@ def run_scene_pipeline(
                 min_cluster_size=min_cluster_size,
                 min_samples=min_samples,
                 cluster_selection_epsilon=cluster_selection_epsilon,
+                hdbscan_max_samples=hdbscan_max_samples,
+                hdbscan_subsample_fraction=hdbscan_subsample_fraction,
+                hdbscan_subsample_seed=hdbscan_subsample_seed,
                 save_outputs=True,
             )
         cluster_outputs.append(cluster_output)
