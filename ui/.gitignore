@@ -1,0 +1,13 @@
+node_modules/
+dist/
+test-results/
+playwright-report/
+.cache/
+*.tsbuildinfo
+__pycache__/
+*.pyc
+
+!package.json
+!package-lock.json
+!tsconfig.json
+!tsconfig.*.json
