@@ -14,9 +14,11 @@ const modes: Array<[LayerMode, string]> = [
 
 type Props = {
   onRunPrediction: () => void;
+  predictionBackendAvailable: boolean | null;
+  predictionBackendReason?: string | null;
 };
 
-export default function LayerPanel({ onRunPrediction }: Props) {
+export default function LayerPanel({ onRunPrediction, predictionBackendAvailable, predictionBackendReason }: Props) {
   const scene = useStore(s => s.scene);
   const mode = useStore(s => s.layerMode);
   const setMode = useStore(s => s.setLayerMode);
@@ -51,6 +53,7 @@ export default function LayerPanel({ onRunPrediction }: Props) {
   const hasScores = scene ? Object.values(scene.predictions).some(p => Boolean(p.scores)) : false;
   const currentFeatureLoaded = Boolean(scene && featureSource && scene.loadedFeatures[featureSource]);
   const thresholdForDisplay = similarityMetric === 'distance' ? 1 - similarityThreshold : similarityThreshold;
+  const liveExportAvailable = predictionBackendAvailable === true;
 
   const isolateCurrent = (kind: 'pseudo' | 'prediction' | 'gt', key: string) => {
     if (!scene || !selected) return;
@@ -127,14 +130,32 @@ export default function LayerPanel({ onRunPrediction }: Props) {
           <label>Checkpoint</label>
           <input className="path-mini" value={checkpointPath} onChange={e => setCheckpointPath(e.target.value)} />
         </div>
-        <button className="button" style={{ width: '100%' }} disabled={!scene || predictionRunning} onClick={onRunPrediction}>
+        <button
+          className="button"
+          style={{ width: '100%' }}
+          disabled={!scene || predictionRunning || !liveExportAvailable}
+          title={!liveExportAvailable ? (predictionBackendReason ?? 'Live prediction export is unavailable') : undefined}
+          onClick={onRunPrediction}
+        >
           {predictionRunning ? 'Running model...' : `Run/load ${granularity}`}
         </button>
         <p className="small">
-          {!hasPredictions
-            ? 'Predictions and decoder features are generated into a local cache.'
-            : 'Cached predictions are loaded.'}
+          {hasPredictions
+            ? 'Cached predictions are loaded.'
+            : liveExportAvailable
+              ? 'Predictions and decoder features are generated into a local cache.'
+              : 'Open an exported inspection bundle to enable Pred, Score, and Feature.'}
         </p>
+        {!hasPredictions && !liveExportAvailable ? (
+          <p className="small">
+            {predictionBackendReason ?? 'Live prediction export is unavailable for this server.'}
+          </p>
+        ) : null}
+        {!hasPredictions ? (
+          <p className="small">
+            Bundle path: /cluster/work/igp_psr/nedela/chorus_ui_bundles/scene0000_00/inspection_bundle.json
+          </p>
+        ) : null}
       </section>
 
       <section className="section">

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import './App.css';
 import { composePointColors } from './lib/colors';
 import { loadFeatureSource, loadSceneFromPath } from './lib/loadScene';
@@ -13,6 +13,24 @@ function initialPathFromUrl(): string {
   const params = new URLSearchParams(window.location.search);
   return params.get('bundle') ?? params.get('pack') ?? '';
 }
+
+function pathFromUserInput(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  try {
+    const url = new URL(trimmed);
+    return url.searchParams.get('bundle') ?? url.searchParams.get('pack') ?? trimmed;
+  } catch {
+    return trimmed;
+  }
+}
+
+type RuntimeInfo = {
+  prediction_backend?: {
+    available?: boolean;
+    reason?: string | null;
+  };
+};
 
 export default function App() {
   const scene = useStore(s => s.scene);
@@ -42,10 +60,12 @@ export default function App() {
   const setPredictionRunning = useStore(s => s.setPredictionRunning);
   const workerRef = useRef<Worker | null>(null);
   const workerFeatureSourceRef = useRef<string | null>(null);
+  const [runtimeInfo, setRuntimeInfo] = useState<RuntimeInfo | null>(null);
 
   const handleLoad = useCallback(async () => {
-    const path = loadPath.trim();
+    const path = pathFromUserInput(loadPath);
     if (!path) return;
+    if (path !== loadPath) setLoadPath(path);
     setLoading(true);
     setError(null);
     try {
@@ -64,6 +84,10 @@ export default function App() {
 
   const handleRunPrediction = useCallback(async () => {
     if (!scene || predictionRunning) return;
+    if (runtimeInfo?.prediction_backend?.available !== true) {
+      setError(runtimeInfo?.prediction_backend?.reason ?? 'Live prediction export is unavailable for this server.');
+      return;
+    }
     setPredictionRunning(true);
     setError(null);
     try {
@@ -90,7 +114,28 @@ export default function App() {
     } finally {
       setPredictionRunning(false);
     }
-  }, [checkpointPath, configPath, granularity, predictionRunning, scene, setError, setPredictionRunning, setScene]);
+  }, [checkpointPath, configPath, granularity, predictionRunning, runtimeInfo, scene, setError, setPredictionRunning, setScene]);
+
+  useEffect(() => {
+    fetch('/_chorus/runtime')
+      .then(res => (res.ok ? res.json() : null))
+      .then((payload: RuntimeInfo | null) => {
+        setRuntimeInfo(payload ?? {
+          prediction_backend: {
+            available: false,
+            reason: 'Live prediction export is unavailable for this server.',
+          },
+        });
+      })
+      .catch(() => {
+        setRuntimeInfo({
+          prediction_backend: {
+            available: false,
+            reason: 'Live prediction export is unavailable for this server.',
+          },
+        });
+      });
+  }, []);
 
   useEffect(() => {
     const initial = initialPathFromUrl();
@@ -200,7 +245,11 @@ export default function App() {
     <div className="app">
       <TopToolbar onLoad={handleLoad} />
       <main className="main">
-        <LayerPanel onRunPrediction={handleRunPrediction} />
+        <LayerPanel
+          onRunPrediction={handleRunPrediction}
+          predictionBackendAvailable={runtimeInfo?.prediction_backend?.available ?? null}
+          predictionBackendReason={runtimeInfo?.prediction_backend?.reason ?? null}
+        />
         <div className="viewport-shell">
           <Viewport sourceIndices={sourceIndices} colors={renderColors} />
           {loading ? <div className="status">Loading...</div> : null}

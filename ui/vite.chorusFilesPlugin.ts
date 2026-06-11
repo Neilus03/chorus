@@ -248,6 +248,21 @@ function defaultCheckpointPath(): string {
   return process.env.CHORUS_UI_DEFAULT_CHECKPOINT || '/cluster/work/igp_psr/nedela/student_runs/scannet_full_continuous_v2_pseudo_pretrain/checkpoints/best.pt';
 }
 
+function runtimePayload(): Record<string, unknown> {
+  const python = process.env.CHORUS_UI_PYTHON || 'python3';
+  const liveExportRequested = process.env.CHORUS_UI_ENABLE_LIVE_EXPORT === '1';
+  const hasExplicitPython = Boolean(process.env.CHORUS_UI_PYTHON);
+  return {
+    prediction_backend: {
+      available: liveExportRequested && hasExplicitPython,
+      python,
+      reason: liveExportRequested
+        ? (hasExplicitPython ? null : 'CHORUS_UI_PYTHON is not set')
+        : 'Live export is disabled for this Vite server; export with Slurm and open the bundle.',
+    },
+  };
+}
+
 function hashPayload(payload: unknown): string {
   return crypto.createHash('sha1').update(JSON.stringify(payload)).digest('hex').slice(0, 16);
 }
@@ -397,6 +412,10 @@ export function chorusFilesPlugin(): Plugin {
             .then(body => runExporter(JSON.parse(body || '{}')))
             .then(result => sendJson(res, result))
             .catch(err => sendText(res, 500, err instanceof Error ? err.message : String(err)));
+          return;
+        }
+        if (url.pathname === '/_chorus/runtime') {
+          sendJson(res, runtimePayload());
           return;
         }
         if (url.pathname === '/_chorus/resolve') {
