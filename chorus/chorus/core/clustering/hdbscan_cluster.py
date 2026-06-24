@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import traceback
 
 import numpy as np
 from sklearn.cluster import HDBSCAN
@@ -36,8 +37,35 @@ def cluster_features(
         f"backend={estimator_meta['hdbscan_backend']}"
     )
     fit_start = time.perf_counter()
-    with heartbeat("HDBSCAN fit_predict"):
-        labels = np.asarray(clusterer.fit_predict(features), dtype=np.int32).reshape(-1)
+    try:
+        with heartbeat("HDBSCAN fit_predict"):
+            labels = np.asarray(clusterer.fit_predict(features), dtype=np.int32).reshape(-1)
+    except Exception:
+        finite = np.isfinite(features)
+        diagnostics = {
+            "shape": tuple(int(x) for x in features.shape),
+            "dtype": str(features.dtype),
+            "ndim": int(features.ndim),
+            "c_contiguous": bool(features.flags.c_contiguous),
+            "f_contiguous": bool(features.flags.f_contiguous),
+            "finite_fraction": float(np.count_nonzero(finite) / max(features.size, 1)),
+            "nan_count": int(np.count_nonzero(np.isnan(features))),
+            "posinf_count": int(np.count_nonzero(np.isposinf(features))),
+            "neginf_count": int(np.count_nonzero(np.isneginf(features))),
+        }
+        if np.any(finite):
+            finite_values = features[finite]
+            diagnostics.update(
+                {
+                    "finite_min": float(np.min(finite_values)),
+                    "finite_max": float(np.max(finite_values)),
+                    "finite_mean": float(np.mean(finite_values)),
+                    "finite_std": float(np.std(finite_values)),
+                }
+            )
+        log_progress(f"HDBSCAN fit_predict exception diagnostics: {diagnostics}")
+        traceback.print_exc()
+        raise
     fit_elapsed_s = float(time.perf_counter() - fit_start)
 
     num_noise = int(np.sum(labels < 0))
