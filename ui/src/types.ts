@@ -12,6 +12,7 @@ export type PredictionRef = {
   pred_scores?: ArtifactRef;
   pred_query_ids?: ArtifactRef;
   query_table?: ArtifactRef;
+  query_embed?: ArtifactRef;
 };
 
 export type GtRef = {

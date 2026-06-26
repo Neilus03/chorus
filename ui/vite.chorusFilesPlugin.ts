@@ -302,7 +302,7 @@ function runExporter(payload: any): Promise<{ manifestPath: string; stdout: stri
     '--scene-dir', sceneDir,
     '--out-dir', outRoot,
     '--granularities', ...granularities,
-    '--feature-sources', 'decoder_mask_feat',
+    '--feature-sources', 'decoder_mask_feat', 'decoder_query_embed',
   ];
 
   return new Promise((resolve, reject) => {
